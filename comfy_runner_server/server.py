@@ -450,6 +450,13 @@ def create_app() -> Any:
                     result["restarted"] = True
                     result["port"] = start_result.get("port")
                     result["pid"] = start_result.get("pid")
+                    if _tailscale_mode and start_result.get("port"):
+                        try:
+                            from comfy_runner.tunnel import start_tailscale_serve_port
+                            ts_url = start_tailscale_serve_port(start_result["port"], send_output=out)
+                            result["tailscale_url"] = ts_url
+                        except Exception as e:
+                            out(f"⚠ Tailscale serve failed: {e}\n")
                 else:
                     result["restarted"] = False
 
@@ -499,6 +506,13 @@ def create_app() -> Any:
                     pass
 
                 result = start_installation(name, port_override=running_port, send_output=out)
+                if _tailscale_mode and result.get("port"):
+                    try:
+                        from comfy_runner.tunnel import start_tailscale_serve_port
+                        ts_url = start_tailscale_serve_port(result["port"], send_output=out)
+                        result["tailscale_url"] = ts_url
+                    except Exception as e:
+                        out(f"⚠ Tailscale serve failed: {e}\n")
                 if install_path:
                     _capture_and_track(name, install_path, "restart", out=out)
                 _jobs.finish(job_id, result, lines)
@@ -527,6 +541,12 @@ def create_app() -> Any:
             status = get_status(name)
             if not status.get("running"):
                 return jsonify({"ok": True, "was_running": False, "output": lines})
+            if _tailscale_mode and status.get("port"):
+                try:
+                    from comfy_runner.tunnel import stop_tailscale_serve_port
+                    stop_tailscale_serve_port(status["port"], send_output=out)
+                except Exception:
+                    pass
             stop_installation(name, send_output=out)
             return jsonify({"ok": True, "was_running": True, "output": lines})
         except Exception as e:
