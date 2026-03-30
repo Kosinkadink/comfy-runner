@@ -82,11 +82,10 @@ def generate_extra_model_paths_yaml(
         "comfy_runner_shared:",
         f"    base_path: {models_dir}",
         "    is_default: true",
-        "    all_model_folders: true",
     ]
 
-    # Explicit entries for compatibility with ComfyUI versions
-    # that don't support all_model_folders (includes extras from custom nodes)
+    # Explicit entries for each model folder type
+    # (ComfyUI iterates remaining keys as folder_name: relative_path)
     for folder in all_folders:
         lines.append(f"    {folder}: {folder}/")
 
