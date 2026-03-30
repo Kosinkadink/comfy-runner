@@ -704,24 +704,6 @@ def cmd_server(args: argparse.Namespace) -> None:
             console.print(f"[red]Tailscale setup failed: {e}[/red]")
             console.print("[dim]Continuing with local-only server...[/dim]\n")
 
-    # In tailscale mode with tunnels, register serves for already-running instances
-    if tailscale_active and tunnels_active:
-        from comfy_runner.installations import show_list
-        from comfy_runner.process import get_status
-        from comfy_runner.tunnel import start_tailscale_serve_port
-        for inst in show_list():
-            try:
-                status = get_status(inst["name"])
-                if status.get("running") and status.get("port"):
-                    inst_port = status["port"]
-                    ts_url = start_tailscale_serve_port(inst_port, send_output=_output)
-                    console.print(
-                        f"  [dim]Registered running instance "
-                        f"'{inst['name']}' → {ts_url}[/dim]"
-                    )
-            except Exception:
-                pass
-
     def _shutdown() -> None:
         if tailscale_active:
             if not args.keep_instances:
