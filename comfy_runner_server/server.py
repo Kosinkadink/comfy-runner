@@ -433,7 +433,7 @@ def create_app() -> Any:
                     rec["deployed_pr"] = int(pr)
                     rec["deployed_repo"] = body.get("repo", "")
                     rec["deployed_title"] = body.get("title", "")
-                elif reset:
+                else:
                     rec.pop("deployed_pr", None)
                     rec.pop("deployed_repo", None)
                     rec.pop("deployed_title", None)

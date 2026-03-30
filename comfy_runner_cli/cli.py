@@ -467,10 +467,16 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             if out and changed_files:
                 out("Requirements unchanged — skipping pip install.\n")
 
-        # Update config with new HEAD
+        # Update config with new HEAD and deploy tracking
         if result.get("new_head"):
             record["head_commit"] = result["new_head"]
-            set_installation(name, record)
+        if args.pr:
+            record["deployed_pr"] = args.pr
+        else:
+            record.pop("deployed_pr", None)
+            record.pop("deployed_repo", None)
+            record.pop("deployed_title", None)
+        set_installation(name, record)
 
         # Restart if it was running
         if was_running:
