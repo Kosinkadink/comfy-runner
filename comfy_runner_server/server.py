@@ -852,6 +852,27 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # GET /<name>/snapshot/<id>/diff/<other_id>  — diff two snapshots
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/<snapshot_id>/diff/<other_id>", methods=["GET"])
+    def route_snapshot_diff_pair(name: str, snapshot_id: str, other_id: str) -> Any:
+        from comfy_runner.snapshot import diff_snapshots, load_snapshot, resolve_snapshot_id
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            fn_a = resolve_snapshot_id(record["path"], snapshot_id)
+            fn_b = resolve_snapshot_id(record["path"], other_id)
+            snap_a = load_snapshot(record["path"], fn_a)
+            snap_b = load_snapshot(record["path"], fn_b)
+            diff = diff_snapshots(snap_a, snap_b)
+            return jsonify({"ok": True, "diff": diff})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # GET /<name>/snapshot/<id>/export  — export snapshot to JSON
     # ------------------------------------------------------------------
     @app.route("/<name>/snapshot/<snapshot_id>/export", methods=["GET"])
