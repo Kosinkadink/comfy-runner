@@ -432,9 +432,11 @@ def create_app() -> Any:
                 if pr:
                     rec["deployed_pr"] = int(pr)
                     rec["deployed_repo"] = body.get("repo", "")
+                    rec["deployed_title"] = body.get("title", "")
                 elif reset:
                     rec.pop("deployed_pr", None)
                     rec.pop("deployed_repo", None)
+                    rec.pop("deployed_title", None)
                 # Apply launch_args if provided in the request
                 if "launch_args" in body:
                     rec["launch_args"] = body["launch_args"]
