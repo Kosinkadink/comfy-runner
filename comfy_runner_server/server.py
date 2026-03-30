@@ -741,19 +741,34 @@ def create_app() -> Any:
         if not _tunnels_enabled:
             return _err("Tunnels are not enabled on this server (start with --tunnels)")
 
-        from comfy_runner.tunnel import start_tunnel
+        from comfy_runner.process import get_status
 
         record, err = _get_record(name)
         if not record:
             return _err(err, 404)
 
-        body = request.get_json(silent=True) or {}
-        provider = body.get("provider", "tailscale")
         out, lines = _make_collector()
 
-        log.info("Starting %s tunnel for '%s'…", provider, name)
+        log.info("Starting tunnel for '%s'…", name)
         try:
-            result = start_tunnel(name, provider=provider, send_output=out)
+            status = get_status(name)
+            if not status.get("running") or not status.get("port"):
+                return _err(f"Installation '{name}' is not running")
+
+            port = status["port"]
+
+            if _tailscale_mode:
+                # Use tailscale serve (tailnet-private, same as runner server)
+                from comfy_runner.tunnel import start_tailscale_serve_port
+                url = start_tailscale_serve_port(port, send_output=out)
+                result = {"name": name, "port": port, "provider": "tailscale-serve", "url": url}
+            else:
+                # Use the generic tunnel provider (ngrok/funnel)
+                from comfy_runner.tunnel import start_tunnel
+                body = request.get_json(silent=True) or {}
+                provider = body.get("provider", "tailscale")
+                result = start_tunnel(name, provider=provider, send_output=out)
+
             log.info("Tunnel started for '%s': %s", name, result.get("url", "?"))
             return jsonify({"ok": True, **result, "output": lines})
         except Exception as e:
@@ -768,7 +783,7 @@ def create_app() -> Any:
         if not _tunnels_enabled:
             return _err("Tunnels are not enabled on this server (start with --tunnels)")
 
-        from comfy_runner.tunnel import stop_tunnel
+        from comfy_runner.process import get_status
 
         record, err = _get_record(name)
         if not record:
@@ -778,7 +793,16 @@ def create_app() -> Any:
 
         log.info("Stopping tunnel for '%s'…", name)
         try:
-            stop_tunnel(name, send_output=out)
+            status = get_status(name)
+            port = status.get("port")
+
+            if _tailscale_mode and port:
+                from comfy_runner.tunnel import stop_tailscale_serve_port
+                stop_tailscale_serve_port(port, send_output=out)
+            else:
+                from comfy_runner.tunnel import stop_tunnel
+                stop_tunnel(name, send_output=out)
+
             log.info("Tunnel stopped for '%s'", name)
             return jsonify({"ok": True, "output": lines})
         except Exception as e:
