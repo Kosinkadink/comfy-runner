@@ -41,6 +41,29 @@ def _maybe_tailscale_unserve(port: int, send_output=None) -> None:
         pass
 
 
+def _capture_snapshot(name: str, trigger: str, send_output=None) -> None:
+    """Capture a snapshot and update the installation record (mirrors server behavior)."""
+    from comfy_runner.config import get_installation, set_installation
+    from comfy_runner.snapshot import capture_snapshot_if_changed, get_snapshot_count
+
+    rec = get_installation(name)
+    if not rec:
+        return
+    last = rec.get("last_snapshot")
+    try:
+        result = capture_snapshot_if_changed(rec["path"], trigger=trigger, last_snapshot=last)
+        if result.get("saved") and result.get("filename"):
+            rec = get_installation(name) or rec
+            rec["last_snapshot"] = result["filename"]
+            rec["snapshot_count"] = get_snapshot_count(rec["path"])
+            set_installation(name, rec)
+            if send_output:
+                send_output(f"Snapshot saved: {result['filename']} (trigger: {trigger})\n")
+    except Exception as e:
+        if send_output:
+            send_output(f"Snapshot capture failed: {e}\n")
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -122,12 +145,21 @@ def cmd_list(args: argparse.Namespace) -> None:
 def cmd_rm(args: argparse.Namespace) -> None:
     """Remove an installation."""
     from comfy_runner.installations import remove
+    from comfy_runner.process import get_status
 
+    out = None if args.json else _output
     try:
+        # Unserve Tailscale before removing
+        try:
+            status = get_status(args.name)
+            if status.get("port"):
+                _maybe_tailscale_unserve(status["port"], send_output=out)
+        except Exception:
+            pass
         remove(
             name=args.name,
             delete_files=not args.keep_files,
-            send_output=None if args.json else _output,
+            send_output=out,
         )
         if args.json:
             print(json.dumps({"ok": True}))
@@ -365,6 +397,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
         )
         if result.get("port"):
             _maybe_tailscale_serve(result["port"], send_output=out)
+        _capture_snapshot(name, "restart", send_output=out)
         if args.json:
             print(json.dumps({"ok": True, **result}, indent=2))
     except Exception as e:
@@ -451,6 +484,8 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         running_port = status.get("port")
 
         if was_running:
+            if running_port:
+                _maybe_tailscale_unserve(running_port, send_output=out)
             if out:
                 out(f"Stopping '{name}' before deploy...\n")
             stop_installation(name, send_output=out)
@@ -527,8 +562,12 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             result["restarted"] = True
             result["port"] = start_result.get("port")
             result["pid"] = start_result.get("pid")
+            if start_result.get("port"):
+                _maybe_tailscale_serve(start_result["port"], send_output=out)
         else:
             result["restarted"] = False
+
+        _capture_snapshot(name, "post-update", send_output=out)
 
         if out:
             out(f"\n✓ Deploy complete.\n")

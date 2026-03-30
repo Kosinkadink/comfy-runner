@@ -619,6 +619,12 @@ def create_app() -> Any:
             # Stop if running
             status = get_status(name)
             if status.get("running"):
+                if _tailscale_mode and status.get("port"):
+                    try:
+                        from comfy_runner.tunnel import stop_tailscale_serve_port
+                        stop_tailscale_serve_port(status["port"], send_output=out)
+                    except Exception:
+                        pass
                 stop_installation(name, send_output=out)
 
             # Remove from config (does not delete files on disk)
