@@ -18,6 +18,29 @@ def _output(text: str) -> None:
     console.print(text, end="", highlight=False)
 
 
+def _maybe_tailscale_serve(port: int, send_output=None) -> None:
+    """If Tailscale serve is active (registry non-empty), register this port."""
+    from comfy_runner.tunnel import _load_serve_registry, start_tailscale_serve_port
+    if not _load_serve_registry():
+        return
+    try:
+        start_tailscale_serve_port(port, send_output=send_output)
+    except Exception as e:
+        if send_output:
+            send_output(f"⚠ Tailscale serve failed: {e}\n")
+
+
+def _maybe_tailscale_unserve(port: int, send_output=None) -> None:
+    """If this port is in the Tailscale serve registry, remove it."""
+    from comfy_runner.tunnel import _load_serve_registry, stop_tailscale_serve_port
+    if port not in _load_serve_registry():
+        return
+    try:
+        stop_tailscale_serve_port(port, send_output=send_output)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -250,6 +273,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     extra = args.extra_args
     pc = args.port_conflict
 
+    out = None if args.json else _output
     try:
         if args.background:
             result = start_installation(
@@ -257,8 +281,10 @@ def cmd_start(args: argparse.Namespace) -> None:
                 port_override=port,
                 port_conflict=pc,
                 extra_args=extra,
-                send_output=None if args.json else _output,
+                send_output=out,
             )
+            if result.get("port"):
+                _maybe_tailscale_serve(result["port"], send_output=out)
             if args.json:
                 print(json.dumps({"ok": True, **result}, indent=2))
         else:
@@ -271,6 +297,8 @@ def cmd_start(args: argparse.Namespace) -> None:
                     extra_args=extra,
                     send_output=None,
                 )
+                if result.get("port"):
+                    _maybe_tailscale_serve(result["port"])
                 print(json.dumps({"ok": True, **result}, indent=2))
             else:
                 start_foreground(
@@ -290,12 +318,16 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 def cmd_stop(args: argparse.Namespace) -> None:
     """Stop a running ComfyUI installation."""
-    from comfy_runner.process import stop_installation
+    from comfy_runner.process import get_status, stop_installation
 
+    out = None if args.json else _output
     try:
+        status = get_status(args.name)
+        if status.get("port"):
+            _maybe_tailscale_unserve(status["port"], send_output=out)
         stop_installation(
             name=args.name,
-            send_output=None if args.json else _output,
+            send_output=out,
         )
         if args.json:
             print(json.dumps({"ok": True}))
@@ -309,16 +341,19 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
 def cmd_restart(args: argparse.Namespace) -> None:
     """Restart a running ComfyUI installation."""
-    from comfy_runner.process import start_installation, stop_installation
+    from comfy_runner.process import get_status, start_installation, stop_installation
 
     name = args.name
+    out = None if args.json else _output
     try:
+        # Unserve old port before stopping
+        status = get_status(name)
+        if status.get("port"):
+            _maybe_tailscale_unserve(status["port"], send_output=out)
+
         # Stop (ignore errors if not running)
         try:
-            stop_installation(
-                name=name,
-                send_output=None if args.json else _output,
-            )
+            stop_installation(name=name, send_output=out)
         except RuntimeError:
             if not args.json:
                 _output("(was not running)\n")
@@ -326,8 +361,10 @@ def cmd_restart(args: argparse.Namespace) -> None:
         result = start_installation(
             name=name,
             port_override=args.port,
-            send_output=None if args.json else _output,
+            send_output=out,
         )
+        if result.get("port"):
+            _maybe_tailscale_serve(result["port"], send_output=out)
         if args.json:
             print(json.dumps({"ok": True, **result}, indent=2))
     except Exception as e:
