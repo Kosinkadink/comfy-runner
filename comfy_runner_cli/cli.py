@@ -675,7 +675,7 @@ def cmd_server(args: argparse.Namespace) -> None:
         print(json.dumps({"ok": False, "error": "Server cannot run in JSON mode"}))
         sys.exit(1)
 
-    host = args.host
+    host = "0.0.0.0" if args.listen else args.host
     port = args.port
     tailscale_active = False
 
@@ -1438,6 +1438,8 @@ def main(argv: list[str] | None = None) -> None:
     # server
     p_server = sub.add_parser("server", help="Start HTTP control API server")
     p_server.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    p_server.add_argument("--listen", action="store_true",
+                          help="Listen on all interfaces (shorthand for --host 0.0.0.0)")
     p_server.add_argument("--port", "-p", type=int, default=9189, help="Server port (default: 9189)")
     p_server.add_argument("--tailscale", action="store_true",
                           help="Expose via tailscale serve (tailnet-private)")
