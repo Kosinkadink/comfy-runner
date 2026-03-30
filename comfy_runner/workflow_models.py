@@ -193,107 +193,106 @@ def download_models(
     staging_tmpdir = tempfile.mkdtemp(prefix="comfy-dl-staging-")
     staging_dir = Path(staging_tmpdir)
 
-    for idx, model in enumerate(models, 1):
-        rel = f"{model['directory']}/{model['name']}"
-        dest_dir = models_dir / model["directory"]
-        dest_file = dest_dir / model["name"]
+    try:
+        for idx, model in enumerate(models, 1):
+            rel = f"{model['directory']}/{model['name']}"
+            dest_dir = models_dir / model["directory"]
+            dest_file = dest_dir / model["name"]
 
-        # Check cancellation before starting a new model
-        if cancel_event is not None and cancel_event.is_set():
-            shutil.rmtree(staging_tmpdir, ignore_errors=True)
-            result["cancelled"] = True
-            return result
+            # Check cancellation before starting a new model
+            if cancel_event is not None and cancel_event.is_set():
+                result["cancelled"] = True
+                return result
 
-        # Skip if already exists
-        if dest_file.is_file():
-            result["skipped"].append(rel)
-            out(f"  [{idx}/{total}] {rel}  skipped (exists)\n")
-            continue
+            # Skip if already exists
+            if dest_file.is_file():
+                result["skipped"].append(rel)
+                out(f"  [{idx}/{total}] {rel}  skipped (exists)\n")
+                continue
 
-        try:
-            resp = requests.get(model["url"], stream=True, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            result["failed"].append(rel)
-            result["errors"].append(f"{rel}: {e}")
-            out(f"  [{idx}/{total}] {rel}  FAILED ({e})\n")
-            continue
+            try:
+                resp = requests.get(model["url"], stream=True, timeout=30)
+                resp.raise_for_status()
+            except Exception as e:
+                result["failed"].append(rel)
+                result["errors"].append(f"{rel}: {e}")
+                out(f"  [{idx}/{total}] {rel}  FAILED ({e})\n")
+                continue
 
-        content_length = resp.headers.get("Content-Length")
-        total_size = int(content_length) if content_length else None
+            content_length = resp.headers.get("Content-Length")
+            total_size = int(content_length) if content_length else None
 
-        # Determine progress thresholds
-        pct_step = (total_size // 10) if total_size else None
+            # Determine progress thresholds
+            pct_step = (total_size // 10) if total_size else None
 
-        downloaded = 0
-        last_report = 0
-        chunk_count = 0
-        cancelled = False
+            downloaded = 0
+            last_report = 0
+            chunk_count = 0
+            cancelled = False
 
-        # Write to staging file, then move to final destination
-        staging_name = f"{model['directory']}--{model['name']}.part"
-        tmp_path = staging_dir / staging_name
-        try:
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    chunk_count += 1
+            # Write to staging file, then move to final destination
+            staging_name = f"{model['directory']}--{model['name']}.part"
+            tmp_path = staging_dir / staging_name
+            try:
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        chunk_count += 1
 
-                    # Check cancellation every 100 chunks (~800 KB)
-                    if cancel_event is not None and chunk_count % 100 == 0:
-                        if cancel_event.is_set():
-                            cancelled = True
-                            break
+                        # Check cancellation every 100 chunks (~800 KB)
+                        if cancel_event is not None and chunk_count % 100 == 0:
+                            if cancel_event.is_set():
+                                cancelled = True
+                                break
 
-                    # Report progress
-                    should_report = False
-                    if pct_step and pct_step > 0:
-                        if downloaded - last_report >= pct_step:
+                        # Report progress
+                        should_report = False
+                        if pct_step and pct_step > 0:
+                            if downloaded - last_report >= pct_step:
+                                should_report = True
+                        if downloaded - last_report >= _PROGRESS_BYTES:
                             should_report = True
-                    if downloaded - last_report >= _PROGRESS_BYTES:
-                        should_report = True
 
-                    if should_report:
-                        last_report = downloaded
-                        if total_size:
-                            pct = int(downloaded * 100 / total_size)
-                            out(
-                                f"  [{idx}/{total}] {rel}"
-                                f"  {pct}%"
-                                f" ({_format_size(downloaded)} / {_format_size(total_size)})\n"
-                            )
-                        else:
-                            out(
-                                f"  [{idx}/{total}] {rel}"
-                                f"  {_format_size(downloaded)}\n"
-                            )
+                        if should_report:
+                            last_report = downloaded
+                            if total_size:
+                                pct = int(downloaded * 100 / total_size)
+                                out(
+                                    f"  [{idx}/{total}] {rel}"
+                                    f"  {pct}%"
+                                    f" ({_format_size(downloaded)} / {_format_size(total_size)})\n"
+                                )
+                            else:
+                                out(
+                                    f"  [{idx}/{total}] {rel}"
+                                    f"  {_format_size(downloaded)}\n"
+                                )
 
-            if cancelled:
+                if cancelled:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    result["cancelled"] = True
+                    return result
+
+                # Move from staging to final destination
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(tmp_path), str(dest_file))
+                result["downloaded"].append(rel)
+                out(f"  [{idx}/{total}] {rel}  done ({_format_size(downloaded)})\n")
+
+            except Exception as e:
+                result["failed"].append(rel)
+                result["errors"].append(f"{rel}: {e}")
+                out(f"  [{idx}/{total}] {rel}  FAILED ({e})\n")
+                # Clean up temp file
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-                shutil.rmtree(staging_tmpdir, ignore_errors=True)
-                result["cancelled"] = True
-                return result
 
-            # Move from staging to final destination
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(tmp_path), str(dest_file))
-            result["downloaded"].append(rel)
-            out(f"  [{idx}/{total}] {rel}  done ({_format_size(downloaded)})\n")
-
-        except Exception as e:
-            result["failed"].append(rel)
-            result["errors"].append(f"{rel}: {e}")
-            out(f"  [{idx}/{total}] {rel}  FAILED ({e})\n")
-            # Clean up temp file
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
-    shutil.rmtree(staging_tmpdir, ignore_errors=True)
-    return result
+        return result
+    finally:
+        shutil.rmtree(staging_tmpdir, ignore_errors=True)

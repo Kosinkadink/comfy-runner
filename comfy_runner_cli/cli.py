@@ -18,50 +18,7 @@ def _output(text: str) -> None:
     console.print(text, end="", highlight=False)
 
 
-def _maybe_tailscale_serve(port: int, send_output=None) -> None:
-    """If Tailscale serve is active (registry non-empty), register this port."""
-    from comfy_runner.tunnel import _load_serve_registry, start_tailscale_serve_port
-    if not _load_serve_registry():
-        return
-    try:
-        start_tailscale_serve_port(port, send_output=send_output)
-    except Exception as e:
-        if send_output:
-            send_output(f"⚠ Tailscale serve failed: {e}\n")
-
-
-def _maybe_tailscale_unserve(port: int, send_output=None) -> None:
-    """If this port is in the Tailscale serve registry, remove it."""
-    from comfy_runner.tunnel import _load_serve_registry, stop_tailscale_serve_port
-    if port not in _load_serve_registry():
-        return
-    try:
-        stop_tailscale_serve_port(port, send_output=send_output)
-    except Exception:
-        pass
-
-
-def _capture_snapshot(name: str, trigger: str, send_output=None) -> None:
-    """Capture a snapshot and update the installation record (mirrors server behavior)."""
-    from comfy_runner.config import get_installation, set_installation
-    from comfy_runner.snapshot import capture_snapshot_if_changed, get_snapshot_count
-
-    rec = get_installation(name)
-    if not rec:
-        return
-    last = rec.get("last_snapshot")
-    try:
-        result = capture_snapshot_if_changed(rec["path"], trigger=trigger, last_snapshot=last)
-        if result.get("saved") and result.get("filename"):
-            rec = get_installation(name) or rec
-            rec["last_snapshot"] = result["filename"]
-            rec["snapshot_count"] = get_snapshot_count(rec["path"])
-            set_installation(name, rec)
-            if send_output:
-                send_output(f"Snapshot saved: {result['filename']} (trigger: {trigger})\n")
-    except Exception as e:
-        if send_output:
-            send_output(f"Snapshot capture failed: {e}\n")
+from comfy_runner.lifecycle import maybe_tailscale_serve, maybe_tailscale_unserve, capture_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +110,7 @@ def cmd_rm(args: argparse.Namespace) -> None:
         try:
             status = get_status(args.name)
             if status.get("port"):
-                _maybe_tailscale_unserve(status["port"], send_output=out)
+                maybe_tailscale_unserve(status["port"], send_output=out)
         except Exception:
             pass
         remove(
@@ -316,7 +273,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 send_output=out,
             )
             if result.get("port"):
-                _maybe_tailscale_serve(result["port"], send_output=out)
+                maybe_tailscale_serve(result["port"], send_output=out)
             if args.json:
                 print(json.dumps({"ok": True, **result}, indent=2))
         else:
@@ -330,7 +287,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                     send_output=None,
                 )
                 if result.get("port"):
-                    _maybe_tailscale_serve(result["port"])
+                    maybe_tailscale_serve(result["port"])
                 print(json.dumps({"ok": True, **result}, indent=2))
             else:
                 start_foreground(
@@ -356,7 +313,7 @@ def cmd_stop(args: argparse.Namespace) -> None:
     try:
         status = get_status(args.name)
         if status.get("port"):
-            _maybe_tailscale_unserve(status["port"], send_output=out)
+            maybe_tailscale_unserve(status["port"], send_output=out)
         stop_installation(
             name=args.name,
             send_output=out,
@@ -381,7 +338,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
         # Unserve old port before stopping
         status = get_status(name)
         if status.get("port"):
-            _maybe_tailscale_unserve(status["port"], send_output=out)
+            maybe_tailscale_unserve(status["port"], send_output=out)
 
         # Stop (ignore errors if not running)
         try:
@@ -396,8 +353,8 @@ def cmd_restart(args: argparse.Namespace) -> None:
             send_output=out,
         )
         if result.get("port"):
-            _maybe_tailscale_serve(result["port"], send_output=out)
-        _capture_snapshot(name, "restart", send_output=out)
+            maybe_tailscale_serve(result["port"], send_output=out)
+        capture_snapshot(name, "restart", send_output=out)
         if args.json:
             print(json.dumps({"ok": True, **result}, indent=2))
     except Exception as e:
