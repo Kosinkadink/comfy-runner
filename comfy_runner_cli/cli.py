@@ -691,12 +691,15 @@ def cmd_server(args: argparse.Namespace) -> None:
         from comfy_runner_server.server import set_tunnels_enabled
         set_tunnels_enabled(True)
 
+    # Always clean up stale tailscale serves from previous sessions
+    # (tailscale serve --bg persists across reboots in Tailscale's own config)
+    from comfy_runner.tunnel import cleanup_stale_serves
+    cleanup_stale_serves(send_output=_output)
+
     # --tailscale: tailscale serve handles external access, server binds localhost
     if args.tailscale:
-        from comfy_runner.tunnel import cleanup_stale_serves, start_tailscale_serve
+        from comfy_runner.tunnel import start_tailscale_serve
         from comfy_runner_server.server import set_tailscale_mode
-        # Clean up any stale serves from a previous crash
-        cleanup_stale_serves(send_output=_output)
         try:
             ts_url = start_tailscale_serve(port=port, send_output=_output)
             host = "127.0.0.1"
