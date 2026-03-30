@@ -224,8 +224,8 @@ def capture_snapshot_if_changed(
     with lock:
         current = capture_state(install_path)
 
-        # For boot triggers, compare against last snapshot
-        if last_snapshot and trigger == "boot":
+        # Skip save if state unchanged (all auto triggers, not manual)
+        if last_snapshot and trigger != "manual":
             try:
                 last = load_snapshot(install_path, last_snapshot)
                 if _states_match(last, current):
