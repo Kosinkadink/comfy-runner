@@ -487,20 +487,33 @@ def cleanup_stale_serves(
     """Stop all tailscale serves from the registry and clear it.
 
     Called on server startup to clean up after a previous crash.
+    Also removes any stale tunnel state files (from ngrok/funnel).
     """
     ports = _load_serve_registry()
-    if not ports:
-        return
-    if send_output:
-        send_output(f"Cleaning up {len(ports)} stale tailscale serve(s)...\n")
-    for port in ports:
-        try:
-            _run_tailscale(["serve", f"--https={port}", "off"])
-            if send_output:
-                send_output(f"  Stopped serve on port {port}\n")
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-    _save_serve_registry(set())
+    if ports:
+        if send_output:
+            send_output(f"Cleaning up {len(ports)} stale tailscale serve(s)...\n")
+        for port in ports:
+            try:
+                _run_tailscale(["serve", f"--https={port}", "off"])
+                if send_output:
+                    send_output(f"  Stopped serve on port {port}\n")
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        _save_serve_registry(set())
+
+    # Remove stale tunnel state files (ngrok processes that died, tailscale
+    # funnel sessions from previous runs with pid=0, etc.)
+    for state in _all_tunnel_states():
+        port = state.get("port")
+        if not port:
+            continue
+        pid = state.get("pid", 0)
+        if pid and is_process_alive(pid):
+            continue  # still running
+        _remove_tunnel_state(port)
+        if send_output:
+            send_output(f"  Removed stale tunnel state for port {port}\n")
 
 
 def start_tailscale_serve_port(
