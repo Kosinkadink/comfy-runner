@@ -294,6 +294,15 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 - Poll `GET /job/<job_id>` to check job status.
 - All responses are JSON: `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
 
+### OpenAPI Spec
+
+The server auto-serves an OpenAPI 3.0.3 spec at `GET /openapi.json`. The spec is generated at runtime from route metadata in `comfy_runner_server/openapi.py` — no manual YAML to maintain. When routes change, update the `_ROUTES` list in that file and the spec updates automatically.
+
+```bash
+# Fetch the spec from a running server
+curl http://localhost:9189/openapi.json | python -m json.tool
+```
+
 ## Testing
 
 ```bash

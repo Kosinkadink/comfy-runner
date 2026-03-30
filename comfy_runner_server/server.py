@@ -246,6 +246,14 @@ def create_app() -> Any:
             log.debug("%s %s → %s", request.method, request.path, response.status_code)
         return response
 
+    # ------------------------------------------------------------------
+    # GET /openapi.json — auto-generated OpenAPI spec
+    # ------------------------------------------------------------------
+    @app.route("/openapi.json", methods=["GET"])
+    def route_openapi() -> Any:
+        from comfy_runner_server.openapi import build_spec
+        return jsonify(build_spec())
+
     # Disable Flask's default HTML error pages — return JSON always
     @app.errorhandler(404)
     def not_found(_e: Any) -> Any:
