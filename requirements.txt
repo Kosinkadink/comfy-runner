@@ -1,0 +1,3 @@
+-r comfy_runner/requirements.txt
+-r comfy_runner_cli/requirements.txt
+-r comfy_runner_server/requirements.txt
