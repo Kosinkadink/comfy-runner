@@ -1,0 +1,1110 @@
+"""HTTP control API for remote management.
+
+Thin wrapper over existing CLI modules. Each endpoint delegates to the same
+functions that cli.py uses. All responses use the --json format:
+  {"ok": true, ...} on success
+  {"ok": false, "error": "..."} on failure
+
+Routes are prefixed with /<name>/ where name is the installation name.
+Top-level routes (e.g. GET /installations) operate across all installations.
+
+Long-running operations (deploy, restart, snapshot restore, node add/rm)
+run in background threads and return immediately with a job_id.  Poll
+GET /job/<job_id> to check status and retrieve results.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+log = logging.getLogger("comfy-runner-server")
+
+_tailscale_mode = False
+_tunnels_enabled = False
+
+
+def set_tailscale_mode(enabled: bool) -> None:
+    global _tailscale_mode
+    _tailscale_mode = enabled
+
+
+def set_tunnels_enabled(enabled: bool) -> None:
+    global _tunnels_enabled
+    _tunnels_enabled = enabled
+
+
+# ---------------------------------------------------------------------------
+# Output collector — captures send_output calls into a list
+# ---------------------------------------------------------------------------
+
+def _make_collector() -> tuple[Callable[[str], None], list[str]]:
+    """Return (send_output, lines) — thread-safe output collector."""
+    lines: list[str] = []
+    lock = threading.Lock()
+
+    def collect(text: str) -> None:
+        with lock:
+            lines.append(text)
+
+    return collect, lines
+
+
+def _err(msg: str, status: int = 400) -> tuple[Any, int]:
+    from flask import jsonify
+    return jsonify({"ok": False, "error": msg}), status
+
+
+def _get_record(name: str) -> tuple[dict | None, str]:
+    """Get an installation record, returning (record, error_msg)."""
+    from comfy_runner.config import get_installation
+    record = get_installation(name)
+    if not record:
+        return None, f"Installation '{name}' not found."
+    return record, ""
+
+
+# ---------------------------------------------------------------------------
+# Background job tracker
+# ---------------------------------------------------------------------------
+
+class _JobTracker:
+    """Thread-safe store for background jobs.
+
+    Jobs expire after ``ttl`` seconds once completed.
+    """
+
+    def __init__(self, ttl: int = 600) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._ttl = ttl
+
+    def create(self, label: str = "") -> str:
+        job_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._jobs[job_id] = {
+                "id": job_id,
+                "label": label,
+                "status": "running",
+                "result": None,
+                "error": None,
+                "output": [],
+                "started_at": time.time(),
+                "finished_at": None,
+            }
+        log.info("[job %s] started: %s", job_id, label)
+        return job_id
+
+    def finish(self, job_id: str, result: dict[str, Any], output: list[str]) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job["status"] = "done"
+                job["result"] = result
+                job["output"] = output
+                job["finished_at"] = time.time()
+                elapsed = job["finished_at"] - job["started_at"]
+                log.info("[job %s] done: %s (%.1fs)", job_id, job["label"], elapsed)
+
+    def fail(self, job_id: str, error: str, output: list[str]) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = error
+                job["output"] = output
+                job["finished_at"] = time.time()
+                elapsed = job["finished_at"] - job["started_at"]
+                log.error("[job %s] FAILED: %s — %s (%.1fs)", job_id, job["label"], error, elapsed)
+                if output:
+                    # Log last few output lines for context
+                    for line in output[-5:]:
+                        log.error("[job %s]   %s", job_id, line.rstrip())
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._gc()
+            return self._jobs.get(job_id)
+
+    def list_active(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._gc()
+            return [
+                {k: v for k, v in j.items() if k != "output"}
+                for j in self._jobs.values()
+            ]
+
+    def _gc(self) -> None:
+        """Remove expired completed jobs (caller must hold lock)."""
+        now = time.time()
+        expired = [
+            jid for jid, j in self._jobs.items()
+            if j["finished_at"] and now - j["finished_at"] > self._ttl
+        ]
+        for jid in expired:
+            del self._jobs[jid]
+
+
+_jobs = _JobTracker()
+
+
+def _capture_and_track(
+    name: str,
+    install_path: str,
+    trigger: str,
+    out: Callable[[str], None] | None = None,
+    label: str | None = None,
+) -> str | None:
+    """Capture a snapshot and update last_snapshot/snapshot_count on the record.
+
+    Mirrors Desktop 2.0's pattern: every boot, restart, deploy, and restore
+    captures a snapshot and stores the filename on the installation record.
+    Returns the saved filename, or None if unchanged.
+    """
+    from comfy_runner.config import get_installation, set_installation
+    from comfy_runner.snapshot import capture_snapshot_if_changed, get_snapshot_count
+
+    rec = get_installation(name)
+    if not rec:
+        return None
+
+    last = rec.get("last_snapshot")
+    try:
+        result = capture_snapshot_if_changed(
+            install_path, trigger=trigger, last_snapshot=last,
+        )
+        if result.get("saved") and result.get("filename"):
+            filename = result["filename"]
+            rec = get_installation(name) or rec
+            rec["last_snapshot"] = filename
+            rec["snapshot_count"] = get_snapshot_count(install_path)
+            set_installation(name, rec)
+            if out:
+                out(f"Snapshot saved: {filename} (trigger: {trigger})\n")
+            return filename
+    except Exception as e:
+        if out:
+            out(f"Snapshot capture failed: {e}\n")
+    return None
+
+
+# Per-installation locks — prevent concurrent operations on the same install
+_install_locks: dict[str, threading.Lock] = {}
+_install_locks_guard = threading.Lock()
+
+
+def _get_install_lock(name: str) -> threading.Lock:
+    """Return a per-installation lock, creating one if needed."""
+    with _install_locks_guard:
+        if name not in _install_locks:
+            _install_locks[name] = threading.Lock()
+        return _install_locks[name]
+
+
+# ---------------------------------------------------------------------------
+# Flask app factory
+# ---------------------------------------------------------------------------
+
+def create_app() -> Any:
+    """Create and return a Flask app that manages all installations."""
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    @app.after_request
+    def _log_request(response: Any) -> Any:
+        if request.method != "GET":
+            log.info("%s %s → %s", request.method, request.path, response.status_code)
+        else:
+            log.debug("%s %s → %s", request.method, request.path, response.status_code)
+        return response
+
+    # Disable Flask's default HTML error pages — return JSON always
+    @app.errorhandler(404)
+    def not_found(_e: Any) -> Any:
+        return jsonify({"ok": False, "error": "Not found"}), 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(_e: Any) -> Any:
+        return jsonify({"ok": False, "error": "Method not allowed"}), 405
+
+    @app.errorhandler(500)
+    def internal_error(_e: Any) -> Any:
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
+
+    # ------------------------------------------------------------------
+    # GET /jobs — list active/recent jobs
+    # ------------------------------------------------------------------
+    @app.route("/jobs", methods=["GET"])
+    def route_jobs() -> Any:
+        return jsonify({"ok": True, "jobs": _jobs.list_active()})
+
+    # ------------------------------------------------------------------
+    # GET /job/<job_id> — poll a background job
+    # ------------------------------------------------------------------
+    @app.route("/job/<job_id>", methods=["GET"])
+    def route_job(job_id: str) -> Any:
+        job = _jobs.get(job_id)
+        if not job:
+            return _err("Job not found", 404)
+        return jsonify({"ok": True, **job})
+
+    # ------------------------------------------------------------------
+    # GET /installations — list all installations with status
+    # ------------------------------------------------------------------
+    @app.route("/installations", methods=["GET"])
+    def route_installations() -> Any:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from comfy_runner.installations import show_list
+        from comfy_runner.process import get_status
+        from comfy_runner.tunnel import get_tunnel_url
+
+        def _fetch_inst_status(inst: dict) -> None:
+            try:
+                status = get_status(inst["name"])
+                tunnel_url = get_tunnel_url(inst["name"])
+                if tunnel_url:
+                    status["tunnel_url"] = tunnel_url
+                inst["_status"] = status
+            except Exception:
+                inst["_status"] = {"running": False}
+
+        try:
+            installs = show_list()
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futs = [pool.submit(_fetch_inst_status, inst) for inst in installs]
+                for f in as_completed(futs):
+                    f.result()  # propagate exceptions
+            return jsonify({"ok": True, "installations": installs})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /status — aggregate status (all installations)
+    # ------------------------------------------------------------------
+    @app.route("/status", methods=["GET"])
+    def route_status_all() -> Any:
+        from comfy_runner.installations import show_list
+        from comfy_runner.process import get_status
+
+        try:
+            installs = show_list()
+            results = []
+            for inst in installs:
+                try:
+                    status = get_status(inst["name"])
+                    status["name"] = inst["name"]
+                    results.append(status)
+                except Exception:
+                    results.append({"name": inst["name"], "running": False})
+            # For backwards compat: if any installation is running, report as running
+            first_running = next((r for r in results if r.get("running")), None)
+            resp: dict[str, Any] = {"ok": True, "installations": results}
+            if first_running:
+                resp.update(first_running)
+            else:
+                resp["running"] = False
+            return jsonify(resp)
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/status
+    # ------------------------------------------------------------------
+    @app.route("/<name>/status", methods=["GET"])
+    def route_status(name: str) -> Any:
+        from comfy_runner.process import get_status
+        from comfy_runner.tunnel import get_tunnel_url
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            status = get_status(name)
+            tunnel_url = get_tunnel_url(name)
+            if tunnel_url:
+                status["tunnel_url"] = tunnel_url
+            return jsonify({"ok": True, **status})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/deploy  (async — returns job_id)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/deploy", methods=["POST"])
+    def route_deploy(name: str) -> Any:
+        record, _ = _get_record(name)
+
+        body = request.get_json(silent=True) or {}
+
+        # Validate before spawning thread
+        pr = body.get("pr")
+        branch = body.get("branch")
+        tag = body.get("tag")
+        commit = body.get("commit")
+        reset = body.get("reset", False)
+        if not any([pr, branch, tag, commit, reset]):
+            return _err("Specify one of: pr, branch, tag, commit, or reset")
+
+        needs_init = record is None
+        job_id = _jobs.create(label=f"{'init + ' if needs_init else ''}deploy {name}")
+
+        def _run() -> None:
+            from comfy_runner.comfyui import deploy_pr, deploy_ref, deploy_reset
+            from comfy_runner.config import get_installation, set_installation
+            from comfy_runner.installations import init_installation
+            from comfy_runner.pip_utils import install_filtered_requirements
+            from comfy_runner.process import get_status, start_installation, stop_installation
+
+            out, lines = _make_collector()
+            lock = _get_install_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                return
+            try:
+                # Auto-init if the installation doesn't exist yet
+                rec = get_installation(name)
+                if not rec:
+                    out(f"Installation '{name}' not found — initializing...\n")
+                    try:
+                        init_installation(name=name, send_output=out)
+                    except Exception as e:
+                        _jobs.fail(job_id, f"Auto-init failed: {e}", lines)
+                        return
+                    rec = get_installation(name)
+                    if not rec:
+                        _jobs.fail(job_id, "Installation record missing after init", lines)
+                        return
+                    out(f"\n{'='*50}\nProceeding with deploy...\n{'='*50}\n\n")
+
+                install_path = rec["path"]
+
+                status = get_status(name)
+                was_running = status.get("running", False)
+                running_port = status.get("port")
+
+                if was_running:
+                    try:
+                        stop_installation(name, send_output=out)
+                    except RuntimeError:
+                        pass
+
+                if reset:
+                    original_ref = rec.get("comfyui_ref")
+                    if not original_ref:
+                        _jobs.fail(job_id, "No original comfyui_ref recorded.", lines)
+                        return
+                    result = deploy_reset(install_path, original_ref, send_output=out)
+                elif pr:
+                    result = deploy_pr(install_path, int(pr), send_output=out)
+                elif branch:
+                    result = deploy_ref(install_path, branch, send_output=out)
+                elif tag:
+                    result = deploy_ref(install_path, tag, send_output=out)
+                elif commit:
+                    result = deploy_ref(install_path, commit, fetch_first=False, send_output=out)
+                else:
+                    _jobs.fail(job_id, "No deploy mode specified", lines)
+                    return
+
+                # Install requirements if changed
+                changed_files = result.get("changed_files", [])
+                req_changed = any(
+                    f in ("requirements.txt", "manager_requirements.txt")
+                    for f in changed_files
+                )
+                if req_changed:
+                    req_path = Path(install_path) / "ComfyUI" / "requirements.txt"
+                    rc = install_filtered_requirements(
+                        install_path, req_path, send_output=out
+                    )
+                    result["requirements_installed"] = rc == 0
+                else:
+                    result["requirements_installed"] = False
+
+                if result.get("new_head"):
+                    rec["head_commit"] = result["new_head"]
+                if pr:
+                    rec["deployed_pr"] = int(pr)
+                    rec["deployed_repo"] = body.get("repo", "")
+                elif reset:
+                    rec.pop("deployed_pr", None)
+                    rec.pop("deployed_repo", None)
+                # Apply launch_args if provided in the request
+                if "launch_args" in body:
+                    rec["launch_args"] = body["launch_args"]
+                set_installation(name, rec)
+
+                should_start = was_running or body.get("start", False)
+                if should_start:
+                    start_result = start_installation(
+                        name, port_override=running_port, send_output=out
+                    )
+                    result["restarted"] = True
+                    result["port"] = start_result.get("port")
+                    result["pid"] = start_result.get("pid")
+                    if _tailscale_mode and _tunnels_enabled and start_result.get("port"):
+                        try:
+                            from comfy_runner.tunnel import start_tailscale_serve_port
+                            ts_url = start_tailscale_serve_port(start_result["port"], send_output=out)
+                            result["tailscale_url"] = ts_url
+                        except Exception as e:
+                            out(f"Warning: tailscale serve registration failed: {e}\n")
+                else:
+                    result["restarted"] = False
+
+                _capture_and_track(
+                    name, install_path, "post-update", out=out,
+                )
+                _jobs.finish(job_id, result, lines)
+
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # POST /<name>/restart  (async — returns job_id)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/restart", methods=["POST"])
+    def route_restart(name: str) -> Any:
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        job_id = _jobs.create(label=f"restart {name}")
+
+        def _run() -> None:
+            from comfy_runner.config import get_installation
+            from comfy_runner.process import get_status, start_installation, stop_installation
+
+            out, lines = _make_collector()
+            lock = _get_install_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                return
+            try:
+                rec = get_installation(name)
+                install_path = rec["path"] if rec else ""
+
+                status = get_status(name)
+                running_port = status.get("port")
+
+                try:
+                    stop_installation(name, send_output=out)
+                except RuntimeError:
+                    pass
+
+                result = start_installation(name, port_override=running_port, send_output=out)
+                if _tailscale_mode and _tunnels_enabled and result.get("port"):
+                    try:
+                        from comfy_runner.tunnel import start_tailscale_serve_port
+                        ts_url = start_tailscale_serve_port(result["port"], send_output=out)
+                        result["tailscale_url"] = ts_url
+                    except Exception as e:
+                        out(f"Warning: tailscale serve registration failed: {e}\n")
+                if install_path:
+                    _capture_and_track(name, install_path, "restart", out=out)
+                _jobs.finish(job_id, result, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # POST /<name>/stop
+    # ------------------------------------------------------------------
+    @app.route("/<name>/stop", methods=["POST"])
+    def route_stop(name: str) -> Any:
+        from comfy_runner.process import get_status, stop_installation
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        out, lines = _make_collector()
+
+        try:
+            status = get_status(name)
+            if not status.get("running"):
+                return jsonify({"ok": True, "was_running": False, "output": lines})
+            stop_installation(name, send_output=out)
+            if _tailscale_mode and _tunnels_enabled and status.get("port"):
+                try:
+                    from comfy_runner.tunnel import stop_tailscale_serve_port
+                    stop_tailscale_serve_port(status["port"], send_output=out)
+                except Exception:
+                    pass
+            return jsonify({"ok": True, "was_running": True, "output": lines})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # DELETE /<name>
+    # ------------------------------------------------------------------
+    @app.route("/<name>", methods=["DELETE"])
+    def route_remove(name: str) -> Any:
+        from comfy_runner.config import remove_installation
+        from comfy_runner.process import get_status, stop_installation
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        out, lines = _make_collector()
+
+        try:
+            # Stop if running
+            status = get_status(name)
+            if status.get("running"):
+                stop_installation(name, send_output=out)
+
+            # Remove from config (does not delete files on disk)
+            removed = remove_installation(name)
+            return jsonify({"ok": True, "removed": removed, "output": lines})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # PUT /<name>/config — update installation config (e.g. launch_args)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/config", methods=["PUT"])
+    def route_config(name: str) -> Any:
+        from comfy_runner.config import get_installation, set_installation
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        allowed_keys = {"launch_args"}
+        updated = {}
+        for key in allowed_keys:
+            if key in body:
+                record[key] = body[key]
+                updated[key] = body[key]
+
+        if not updated:
+            return _err(f"No valid keys. Allowed: {', '.join(sorted(allowed_keys))}")
+
+        set_installation(name, record)
+        return jsonify({"ok": True, "updated": updated})
+
+    # ------------------------------------------------------------------
+    # GET /<name>/nodes
+    # ------------------------------------------------------------------
+    @app.route("/<name>/nodes", methods=["GET"])
+    def route_nodes_list(name: str) -> Any:
+        from comfy_runner.nodes import scan_custom_nodes
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            nodes = scan_custom_nodes(record["path"])
+            return jsonify({"ok": True, "nodes": nodes})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/nodes  {"action": "add|rm|enable|disable", ...}
+    #   add/rm are async (slow), enable/disable are sync (fast)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/nodes", methods=["POST"])
+    def route_nodes_action(name: str) -> Any:
+        from comfy_runner.nodes import disable_node, enable_node
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        action = body.get("action", "")
+
+        # Fast sync actions
+        if action == "enable":
+            node_name = body.get("node_name", "")
+            if not node_name:
+                return _err("Missing 'node_name' field")
+            out, lines = _make_collector()
+            try:
+                enable_node(record["path"], node_name, send_output=out)
+                return jsonify({"ok": True, "output": lines})
+            except Exception as e:
+                return _err(str(e))
+
+        if action == "disable":
+            node_name = body.get("node_name", "")
+            if not node_name:
+                return _err("Missing 'node_name' field")
+            out, lines = _make_collector()
+            try:
+                disable_node(record["path"], node_name, send_output=out)
+                return jsonify({"ok": True, "output": lines})
+            except Exception as e:
+                return _err(str(e))
+
+        # Slow async actions (use per-installation lock)
+        install_path = record["path"]
+
+        if action == "add":
+            source = body.get("source", "")
+            if not source:
+                return _err("Missing 'source' field")
+            version = body.get("version")
+            job_id = _jobs.create(label=f"node add {source}")
+
+            def _run() -> None:
+                from comfy_runner.nodes import add_cnr_node, add_git_node
+                out, lines = _make_collector()
+                lock = _get_install_lock(name)
+                if not lock.acquire(timeout=5):
+                    _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                    return
+                try:
+                    if source.startswith(("http://", "https://", "git@", "git://")):
+                        node = add_git_node(install_path, source, send_output=out)
+                    else:
+                        node = add_cnr_node(install_path, source, version=version, send_output=out)
+                    _jobs.finish(job_id, {"node": node}, lines)
+                except Exception as e:
+                    _jobs.fail(job_id, str(e), lines)
+                finally:
+                    lock.release()
+
+            threading.Thread(target=_run, daemon=True).start()
+            return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+        if action == "rm":
+            node_name = body.get("node_name", "")
+            if not node_name:
+                return _err("Missing 'node_name' field")
+            job_id = _jobs.create(label=f"node rm {node_name}")
+
+            def _run() -> None:
+                from comfy_runner.nodes import remove_node
+                out, lines = _make_collector()
+                lock = _get_install_lock(name)
+                if not lock.acquire(timeout=5):
+                    _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                    return
+                try:
+                    remove_node(install_path, node_name, send_output=out)
+                    _jobs.finish(job_id, {}, lines)
+                except Exception as e:
+                    _jobs.fail(job_id, str(e), lines)
+                finally:
+                    lock.release()
+
+            threading.Thread(target=_run, daemon=True).start()
+            return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+        return _err(f"Unknown action: {action!r}. Use add|rm|enable|disable")
+
+    # ------------------------------------------------------------------
+    # GET /<name>/logs — current session log (or tail with ?lines=N)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/logs", methods=["GET"])
+    def route_logs(name: str) -> Any:
+        from comfy_runner.log_utils import read_current_log, read_log_after
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        after = request.args.get("after", type=int)
+        lines = request.args.get("lines", type=int)
+
+        try:
+            if after is not None:
+                result = read_log_after(record["path"], after)
+            else:
+                result = read_current_log(record["path"], max_lines=lines)
+            return jsonify({"ok": True, **result})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/logs/sessions — list all log sessions
+    # ------------------------------------------------------------------
+    @app.route("/<name>/logs/sessions", methods=["GET"])
+    def route_log_sessions(name: str) -> Any:
+        from comfy_runner.log_utils import list_log_sessions
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            sessions = list_log_sessions(record["path"])
+            return jsonify({"ok": True, "sessions": sessions})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/tunnel/start
+    # ------------------------------------------------------------------
+    @app.route("/<name>/tunnel/start", methods=["POST"])
+    def route_tunnel_start(name: str) -> Any:
+        if not _tunnels_enabled:
+            return _err("Tunnels are not enabled on this server (start with --tunnels)")
+
+        from comfy_runner.tunnel import start_tunnel
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        provider = body.get("provider", "tailscale")
+        out, lines = _make_collector()
+
+        log.info("Starting %s tunnel for '%s'…", provider, name)
+        try:
+            result = start_tunnel(name, provider=provider, send_output=out)
+            log.info("Tunnel started for '%s': %s", name, result.get("url", "?"))
+            return jsonify({"ok": True, **result, "output": lines})
+        except Exception as e:
+            log.error("Tunnel start failed for '%s': %s", name, e)
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/tunnel/stop
+    # ------------------------------------------------------------------
+    @app.route("/<name>/tunnel/stop", methods=["POST"])
+    def route_tunnel_stop(name: str) -> Any:
+        if not _tunnels_enabled:
+            return _err("Tunnels are not enabled on this server (start with --tunnels)")
+
+        from comfy_runner.tunnel import stop_tunnel
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        out, lines = _make_collector()
+
+        log.info("Stopping tunnel for '%s'…", name)
+        try:
+            stop_tunnel(name, send_output=out)
+            log.info("Tunnel stopped for '%s'", name)
+            return jsonify({"ok": True, "output": lines})
+        except Exception as e:
+            log.error("Tunnel stop failed for '%s': %s", name, e)
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/snapshot  — list snapshots
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot", methods=["GET"])
+    def route_snapshot_list(name: str) -> Any:
+        from comfy_runner.snapshot import list_snapshots
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            entries = list_snapshots(record["path"])
+            return jsonify({"ok": True, "snapshots": [
+                {
+                    "filename": e["filename"],
+                    "createdAt": e["snapshot"]["createdAt"],
+                    "trigger": e["snapshot"]["trigger"],
+                    "label": e["snapshot"].get("label"),
+                    "nodeCount": len(e["snapshot"].get("customNodes", [])),
+                    "pipPackageCount": len(e["snapshot"].get("pipPackages", {})),
+                }
+                for e in entries
+            ], "totalCount": len(entries)})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/snapshot/<id>  — show snapshot details
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/<snapshot_id>", methods=["GET"])
+    def route_snapshot_show(name: str, snapshot_id: str) -> Any:
+        from comfy_runner.snapshot import load_snapshot, resolve_snapshot_id
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            filename = resolve_snapshot_id(record["path"], snapshot_id)
+            data = load_snapshot(record["path"], filename)
+            return jsonify({"ok": True, "filename": filename, "snapshot": data})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/snapshot/<id>/diff  — diff against current
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/<snapshot_id>/diff", methods=["GET"])
+    def route_snapshot_diff(name: str, snapshot_id: str) -> Any:
+        from comfy_runner.snapshot import diff_against_current, load_snapshot, resolve_snapshot_id
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            filename = resolve_snapshot_id(record["path"], snapshot_id)
+            target = load_snapshot(record["path"], filename)
+            diff = diff_against_current(record["path"], target)
+            return jsonify({"ok": True, "diff": diff})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/snapshot/<id>/export  — export snapshot to JSON
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/<snapshot_id>/export", methods=["GET"])
+    def route_snapshot_export(name: str, snapshot_id: str) -> Any:
+        from comfy_runner.snapshot import build_export_envelope, load_snapshot, resolve_snapshot_id
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            filename = resolve_snapshot_id(record["path"], snapshot_id)
+            snapshot = load_snapshot(record["path"], filename)
+            envelope = build_export_envelope(name, [{"filename": filename, "snapshot": snapshot}])
+            return jsonify({"ok": True, "envelope": envelope})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/snapshot/save
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/save", methods=["POST"])
+    def route_snapshot_save(name: str) -> Any:
+        from comfy_runner.config import get_installation, set_installation
+        from comfy_runner.snapshot import get_snapshot_count, save_snapshot
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        label = body.get("label")
+
+        try:
+            filename = save_snapshot(record["path"], trigger="manual", label=label)
+            rec = get_installation(name) or record
+            rec["last_snapshot"] = filename
+            rec["snapshot_count"] = get_snapshot_count(record["path"])
+            set_installation(name, rec)
+            return jsonify({"ok": True, "filename": filename})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/snapshot/restore  (async — returns job_id)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/restore", methods=["POST"])
+    def route_snapshot_restore(name: str) -> Any:
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        snapshot_id = body.get("id", "")
+        if not snapshot_id:
+            return _err("Missing 'id' field")
+
+        job_id = _jobs.create(label=f"snapshot restore {name}")
+
+        def _run() -> None:
+            from comfy_runner.config import get_installation, set_installation
+            from comfy_runner.process import get_status, stop_installation
+            from comfy_runner.snapshot import resolve_snapshot_id, restore_snapshot
+
+            out, lines = _make_collector()
+            lock = _get_install_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                return
+            try:
+                rec = get_installation(name)
+                if not rec:
+                    _jobs.fail(job_id, f"Installation '{name}' not found", lines)
+                    return
+
+                status = get_status(name)
+                if status.get("running"):
+                    stop_installation(name, send_output=out)
+
+                filename = resolve_snapshot_id(rec["path"], snapshot_id)
+                result = restore_snapshot(rec["path"], filename, send_output=out)
+                # Track the restored snapshot and capture post-restore state
+                rec = get_installation(name) or rec
+                rec["last_snapshot"] = filename
+                set_installation(name, rec)
+                _capture_and_track(
+                    name, rec["path"], "post-restore", out=out,
+                )
+                _jobs.finish(job_id, {"result": result}, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # POST /<name>/snapshot/import  (auto-restores unless restore=false)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/snapshot/import", methods=["POST"])
+    def route_snapshot_import(name: str) -> Any:
+        from comfy_runner.snapshot import import_snapshots, validate_export_envelope
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            body = request.get_json(silent=True)
+            if not body:
+                return _err("Request body must be JSON")
+
+            # Support envelope at top level or nested under "envelope"
+            envelope_data = body.get("envelope", body)
+            should_restore = body.get("restore", True)
+
+            envelope = validate_export_envelope(envelope_data)
+            import_result = import_snapshots(record["path"], envelope)
+
+            if not should_restore or import_result.get("imported", 0) == 0:
+                return jsonify({"ok": True, **import_result})
+
+            # Auto-restore the first imported snapshot
+            snapshot_filename = None
+            for snap in envelope.get("snapshots", []):
+                fn = snap.get("filename")
+                if fn:
+                    snapshot_filename = fn
+                    break
+
+            if not snapshot_filename:
+                return jsonify({"ok": True, **import_result})
+
+            # Kick off async restore
+            job_id = _jobs.create(label=f"import + restore {name}")
+
+            def _run() -> None:
+                from comfy_runner.config import get_installation, set_installation
+                from comfy_runner.process import get_status, stop_installation
+                from comfy_runner.snapshot import resolve_snapshot_id, restore_snapshot
+
+                out, lines = _make_collector()
+                lock = _get_install_lock(name)
+                if not lock.acquire(timeout=5):
+                    _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                    return
+                try:
+                    rec = get_installation(name)
+                    if not rec:
+                        _jobs.fail(job_id, f"Installation '{name}' not found", lines)
+                        return
+
+                    status = get_status(name)
+                    if status.get("running"):
+                        stop_installation(name, send_output=out)
+
+                    filename = resolve_snapshot_id(rec["path"], snapshot_filename)
+                    result = restore_snapshot(rec["path"], filename, send_output=out)
+                    rec = get_installation(name) or rec
+                    rec["last_snapshot"] = filename
+                    set_installation(name, rec)
+                    _capture_and_track(
+                        name, rec["path"], "post-restore", out=out,
+                    )
+                    _jobs.finish(job_id, {
+                        "import": import_result,
+                        "restore": result,
+                    }, lines)
+                except Exception as e:
+                    _jobs.fail(job_id, str(e), lines)
+                finally:
+                    lock.release()
+
+            threading.Thread(target=_run, daemon=True).start()
+            return jsonify({
+                "ok": True,
+                "job_id": job_id,
+                "async": True,
+                **import_result,
+            })
+
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # Backwards-compat: un-prefixed routes default to first installation
+    # ------------------------------------------------------------------
+    def _default_name() -> str:
+        from comfy_runner.installations import show_list
+        installs = show_list()
+        if installs:
+            return installs[0]["name"]
+        # Generate runner-N name matching local TUI convention
+        n = 1
+        existing = {inst["name"] for inst in installs}
+        while f"runner-{n}" in existing:
+            n += 1
+        return f"runner-{n}"
+
+    @app.route("/deploy", methods=["POST"])
+    def route_deploy_default() -> Any:
+        return route_deploy(_default_name())
+
+    @app.route("/restart", methods=["POST"])
+    def route_restart_default() -> Any:
+        return route_restart(_default_name())
+
+    @app.route("/stop", methods=["POST"])
+    def route_stop_default() -> Any:
+        return route_stop(_default_name())
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Standalone run helper
+# ---------------------------------------------------------------------------
+
+def run_server(
+    host: str = "127.0.0.1",
+    port: int = 9189,
+) -> None:
+    """Start the control server (blocking)."""
+    from waitress import serve
+
+    # Ensure job lifecycle messages appear on the console
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        log.propagate = False  # Prevent duplicate output via root logger
+
+    app = create_app()
+    log.info("Starting comfy-runner control server on %s:%d", host, port)
+    print(f"comfy-runner server listening on http://{host}:{port}")
+    serve(app, host=host, port=port, threads=8)
