@@ -41,11 +41,18 @@ def set_provider_config(provider: str, data: dict[str, Any]) -> None:
     save_config(config)
 
 
+_INT_KEYS = frozenset({"cache_releases"})
+_RESERVED_KEYS = frozenset({"volumes"})
+
+
 def set_provider_value(provider: str, key: str, value: str) -> None:
     """Set a single key within a provider's config.
 
     Supports dotted keys like ``"default_gpu"``—each dot-separated
     segment navigates one level deeper into the nested dict.
+
+    Raises ``ValueError`` if the target key is a reserved namespace
+    (e.g. ``volumes``) that cannot be overwritten with a scalar.
     """
     config = load_config()
     hosted = config.setdefault("hosted", {})
@@ -54,7 +61,20 @@ def set_provider_value(provider: str, key: str, value: str) -> None:
     target = prov
     for part in parts[:-1]:
         target = target.setdefault(part, {})
-    target[parts[-1]] = value
+    final_key = parts[-1]
+    if final_key in _RESERVED_KEYS:
+        raise ValueError(
+            f"Cannot overwrite '{final_key}' — use the dedicated "
+            f"volume commands instead."
+        )
+    # Cast known int keys
+    coerced: str | int = value
+    if final_key in _INT_KEYS:
+        try:
+            coerced = int(value)
+        except ValueError:
+            pass
+    target[final_key] = coerced
     save_config(config)
 
 

@@ -5,10 +5,37 @@ from __future__ import annotations
 from typing import Any
 
 from .config import get_provider_config, get_runpod_api_key
+from .provider import PodInfo, VolumeInfo
 from .runpod_api import RunPodAPI
 
 DEFAULT_IMAGE = "runpod/ubuntu:24.04"
 DEFAULT_PORTS = ["8188/http", "9189/http", "22/tcp"]
+
+
+def _pod_info(data: dict[str, Any]) -> PodInfo:
+    """Map a RunPod pod response to a PodInfo."""
+    gpu = data.get("gpu") or {}
+    return PodInfo(
+        id=data.get("id", ""),
+        name=data.get("name", ""),
+        status=data.get("desiredStatus", "UNKNOWN"),
+        gpu_type=gpu.get("displayName", gpu.get("id", "")),
+        datacenter=data.get("machine", {}).get("dataCenterId", ""),
+        cost_per_hr=float(data.get("costPerHr") or 0),
+        image=data.get("image", ""),
+        raw=data,
+    )
+
+
+def _volume_info(data: dict[str, Any]) -> VolumeInfo:
+    """Map a RunPod volume response to a VolumeInfo."""
+    return VolumeInfo(
+        id=data.get("id", ""),
+        name=data.get("name", ""),
+        size_gb=int(data.get("size") or 0),
+        datacenter=data.get("dataCenterId", ""),
+        raw=data,
+    )
 
 
 class RunPodProvider:
@@ -42,7 +69,7 @@ class RunPodProvider:
         env: dict[str, str] | None = None,
         datacenter: str | None = None,
         cloud_type: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> PodInfo:
         """Create a pod with sensible defaults from config."""
         params: dict[str, Any] = {
             "name": name,
@@ -61,11 +88,11 @@ class RunPodProvider:
             params["volumeInGb"] = volume_size_gb
         if env is not None:
             params["env"] = env
-        return self.api.create_pod(**params)
+        return _pod_info(self.api.create_pod(**params))
 
-    def start_pod(self, pod_id: str) -> dict[str, Any]:
+    def start_pod(self, pod_id: str) -> PodInfo:
         """Start a stopped pod."""
-        return self.api.start_pod(pod_id)
+        return _pod_info(self.api.start_pod(pod_id))
 
     def stop_pod(self, pod_id: str) -> None:
         """Stop a running pod."""
@@ -75,18 +102,19 @@ class RunPodProvider:
         """Permanently terminate a pod."""
         self.api.terminate_pod(pod_id)
 
-    def get_pod(self, pod_id: str) -> dict[str, Any] | None:
+    def get_pod(self, pod_id: str) -> PodInfo | None:
         """Get a single pod by ID."""
-        return self.api.get_pod(pod_id)
+        data = self.api.get_pod(pod_id)
+        return _pod_info(data) if data else None
 
-    def list_pods(self) -> list[dict[str, Any]]:
+    def list_pods(self) -> list[PodInfo]:
         """List all pods."""
-        return self.api.list_pods()
+        return [_pod_info(d) for d in self.api.list_pods()]
 
     def get_pod_url(self, pod_id: str, port: int) -> str | None:
         """Return the proxy URL for a running pod, or ``None``."""
-        pod = self.api.get_pod(pod_id)
-        if pod is None or pod.get("desiredStatus") != "RUNNING":
+        pod = self.get_pod(pod_id)
+        if pod is None or pod.status != "RUNNING":
             return None
         return f"https://{pod_id}-{port}.proxy.runpod.net"
 
@@ -96,19 +124,20 @@ class RunPodProvider:
 
     def create_volume(
         self, name: str, size_gb: int, datacenter: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> VolumeInfo:
         """Create a network volume."""
-        return self.api.create_volume(
+        return _volume_info(self.api.create_volume(
             name, size_gb, datacenter or self.default_datacenter,
-        )
+        ))
 
-    def list_volumes(self) -> list[dict[str, Any]]:
+    def list_volumes(self) -> list[VolumeInfo]:
         """List all network volumes."""
-        return self.api.list_volumes()
+        return [_volume_info(d) for d in self.api.list_volumes()]
 
-    def get_volume(self, volume_id: str) -> dict[str, Any] | None:
+    def get_volume(self, volume_id: str) -> VolumeInfo | None:
         """Get a single volume by ID."""
-        return self.api.get_volume(volume_id)
+        data = self.api.get_volume(volume_id)
+        return _volume_info(data) if data else None
 
     def delete_volume(self, volume_id: str) -> None:
         """Delete a network volume."""

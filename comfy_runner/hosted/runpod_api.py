@@ -40,7 +40,7 @@ class RunPodAPI:
 
         try:
             resp = requests.request(method, url, **kwargs)
-        except requests.ConnectionError as exc:
+        except requests.RequestException as exc:
             raise RuntimeError(
                 f"Failed to connect to RunPod API ({url}): {exc}"
             ) from exc
@@ -49,7 +49,13 @@ class RunPodAPI:
             return None
 
         if resp.ok:
-            return resp.json()
+            try:
+                return resp.json()
+            except requests.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"RunPod API returned invalid JSON on {method} {path}: "
+                    f"{resp.text[:200]}"
+                ) from exc
 
         raise RuntimeError(
             f"RunPod API error {resp.status_code} on {method} {path}: "

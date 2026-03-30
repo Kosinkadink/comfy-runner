@@ -1460,6 +1460,23 @@ def cmd_hosted(args: argparse.Namespace) -> None:
         args._parser_hosted.print_help()
 
 
+_SENSITIVE_SUBSTRINGS = ("key", "secret", "token", "password")
+
+
+def _redact_config(data: dict) -> dict:
+    """Deep-copy a config dict, replacing sensitive values with '***'."""
+    import copy
+    out = copy.deepcopy(data)
+    def _walk(d: dict) -> None:
+        for k, v in d.items():
+            if isinstance(v, dict):
+                _walk(v)
+            elif isinstance(v, str) and v and any(s in k.lower() for s in _SENSITIVE_SUBSTRINGS):
+                d[k] = "***"
+    _walk(out)
+    return out
+
+
 def _hosted_config(args: argparse.Namespace) -> None:
     """Handle hosted config show/set."""
     from comfy_runner.hosted.config import (
@@ -1471,13 +1488,14 @@ def _hosted_config(args: argparse.Namespace) -> None:
 
     if config_action == "show":
         data = get_hosted_config()
+        redacted = _redact_config(data)
         if args.json:
-            print(json.dumps({"ok": True, "config": data}, indent=2))
+            print(json.dumps({"ok": True, "config": redacted}, indent=2))
         else:
-            if not data:
+            if not redacted:
                 console.print("[dim]No hosted config set.[/dim]")
             else:
-                console.print_json(json.dumps(data, indent=2))
+                console.print_json(json.dumps(redacted, indent=2))
 
     elif config_action == "set":
         key = args.key
@@ -1488,7 +1506,14 @@ def _hosted_config(args: argparse.Namespace) -> None:
             console.print("[red]Error: key must be in format provider.key (e.g. runpod.api_key)[/red]")
             sys.exit(1)
         provider, config_key = parts
-        set_provider_value(provider, config_key, value)
+        try:
+            set_provider_value(provider, config_key, value)
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
         if args.json:
             print(json.dumps({"ok": True}))
         else:
@@ -1514,22 +1539,23 @@ def _hosted_volume(args: argparse.Namespace) -> None:
     if volume_action == "create":
         try:
             provider = RunPodProvider()
-            result = provider.create_volume(
+            vol = provider.create_volume(
                 name=args.name,
                 size_gb=args.size,
                 datacenter=args.region,
             )
-            vol_id = result.get("id", "")
-            datacenter = result.get("dataCenterId", args.region or provider.default_datacenter)
             set_volume_config("runpod", args.name, {
-                "id": vol_id,
-                "datacenter": datacenter,
-                "size_gb": args.size,
+                "id": vol.id,
+                "datacenter": vol.datacenter,
+                "size_gb": vol.size_gb,
             })
             if args.json:
-                print(json.dumps({"ok": True, "volume": result}, indent=2))
+                print(json.dumps({"ok": True, "volume": {
+                    "id": vol.id, "name": vol.name,
+                    "datacenter": vol.datacenter, "size_gb": vol.size_gb,
+                }}, indent=2))
             else:
-                console.print(f"✓ Volume [cyan]{args.name}[/cyan] created (id: {vol_id}, {datacenter}, {args.size} GB)")
+                console.print(f"✓ Volume [cyan]{args.name}[/cyan] created (id: {vol.id}, {vol.datacenter}, {vol.size_gb} GB)")
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -1544,7 +1570,10 @@ def _hosted_volume(args: argparse.Namespace) -> None:
                 # Also fetch live data from RunPod API
                 try:
                     provider = RunPodProvider()
-                    remote = provider.list_volumes()
+                    remote = [
+                        {"id": v.id, "name": v.name, "datacenter": v.datacenter, "size_gb": v.size_gb}
+                        for v in provider.list_volumes()
+                    ]
                 except Exception:
                     remote = []
                 print(json.dumps({
@@ -1582,14 +1611,24 @@ def _hosted_volume(args: argparse.Namespace) -> None:
             if not vol_cfg:
                 raise RuntimeError(f"Volume '{args.name}' not found in config.")
             vol_id = vol_cfg["id"]
+            remote_error = None
             if not args.keep_remote:
-                provider = RunPodProvider()
-                provider.delete_volume(vol_id)
-                if not args.json:
-                    console.print(f"Deleted volume [cyan]{vol_id}[/cyan] from RunPod.")
+                try:
+                    provider = RunPodProvider()
+                    provider.delete_volume(vol_id)
+                    if not args.json:
+                        console.print(f"Deleted volume [cyan]{vol_id}[/cyan] from RunPod.")
+                except Exception as e:
+                    remote_error = str(e)
+                    if not args.json:
+                        console.print(f"[yellow]⚠ Remote deletion failed: {e}[/yellow]")
+                        console.print("[dim]Removing local config anyway.[/dim]")
             remove_volume_config("runpod", args.name)
             if args.json:
-                print(json.dumps({"ok": True}))
+                result: dict = {"ok": True}
+                if remote_error:
+                    result["warning"] = f"Remote deletion failed: {remote_error}"
+                print(json.dumps(result, indent=2))
             else:
                 console.print(f"✓ Volume [cyan]{args.name}[/cyan] removed.")
         except Exception as e:
