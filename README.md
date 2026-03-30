@@ -157,8 +157,10 @@ comfy_runner.py deploy [name] --reset    # reset to default state
 
 ### Tunneling
 
+Expose a running ComfyUI instance's port to the internet via ngrok or Tailscale Funnel.
+
 ```bash
-# Start/stop a tunnel
+# Start/stop a tunnel for an installation's ComfyUI port
 comfy_runner.py tunnel start [name] --provider ngrok
 comfy_runner.py tunnel start [name] --provider tailscale
 comfy_runner.py tunnel stop [name]
@@ -170,7 +172,11 @@ comfy_runner.py tunnel config --add-domain example.ngrok.io
 comfy_runner.py tunnel config --rm-domain example.ngrok.io
 ```
 
+These tunnels expose individual ComfyUI instances (their `--port`), not the runner server itself. For exposing the runner server, see **Tailscale Serve** below.
+
 ### Tailscale Serve
+
+Expose the runner server itself over your tailnet (private HTTPS, accessible only to devices on your Tailscale network).
 
 ```bash
 # Expose runner server to tailnet
@@ -189,10 +195,62 @@ Start the server:
 
 ```bash
 comfy_runner.py server --host 127.0.0.1 --port 9189
-comfy_runner.py server --tailscale         # expose via tailscale
-comfy_runner.py server --tunnels           # enable tunnels
+comfy_runner.py server --tailscale         # expose via tailscale serve (HTTPS over tailnet)
+comfy_runner.py server --tunnels           # enable per-instance tunnel start/stop API endpoints
 comfy_runner.py server --keep-instances    # keep instances running on shutdown
 ```
+
+### Remote Access Setup
+
+There are two ways to access the runner server remotely:
+
+#### Tailscale (recommended for private access)
+
+[Tailscale](https://tailscale.com/) creates a private mesh VPN between your devices. The `--tailscale` flag uses `tailscale serve` to expose the runner server over HTTPS on your tailnet.
+
+1. Install Tailscale on both the server machine and your client machine
+2. Start the server with `--tailscale`:
+   ```bash
+   comfy_runner.py server --tailscale --tunnels
+   ```
+3. The server prints a URL like `https://mybox.tailnet-name.ts.net:9189`
+4. Add that URL as a runner server in pr-tracker config or use it directly
+
+The server binds to `127.0.0.1` — Tailscale serve handles HTTPS termination and forwards to localhost. On shutdown, stale tailscale serve registrations are automatically cleaned up.
+
+#### ngrok (for public access)
+
+[ngrok](https://ngrok.com/) creates public HTTPS tunnels. Use it to expose individual ComfyUI instance ports (not the runner server itself).
+
+1. Install ngrok and get an authtoken from [ngrok.com](https://dashboard.ngrok.com/)
+2. Configure the authtoken:
+   ```bash
+   comfy_runner.py tunnel config --provider ngrok --authtoken 2abc...
+   ```
+3. Optionally configure reserved domains (otherwise you get random URLs):
+   ```bash
+   comfy_runner.py tunnel config --add-domain comfy-1.ngrok-free.app
+   ```
+4. Start a tunnel for a running installation:
+   ```bash
+   comfy_runner.py tunnel start myinstall --provider ngrok
+   ```
+5. Start the server with `--tunnels` to enable the tunnel start/stop API:
+   ```bash
+   comfy_runner.py server --tunnels
+   ```
+
+Multiple ngrok tunnels can run simultaneously — each gets a unique local API address. Domains from the pool are automatically allocated and released.
+
+#### Combining Both
+
+A typical remote setup uses Tailscale for the runner server and ngrok for individual ComfyUI instances:
+
+```bash
+comfy_runner.py server --tailscale --tunnels
+```
+
+This gives you private HTTPS access to the control API via Tailscale, with the ability to start public ngrok tunnels for ComfyUI instances via the API (`POST /<name>/tunnel/start`).
 
 ### Key Details
 
