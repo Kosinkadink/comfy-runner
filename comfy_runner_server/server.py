@@ -266,6 +266,12 @@ def create_app() -> Any:
         def _fetch_inst_status(inst: dict) -> None:
             try:
                 status = get_status(inst["name"])
+                if _tailscale_mode and status.get("port"):
+                    from comfy_runner.tunnel import _load_serve_registry, get_tailscale_serve_url
+                    if status["port"] in _load_serve_registry():
+                        serve_url = get_tailscale_serve_url(status["port"])
+                        if serve_url:
+                            status["serve_url"] = serve_url
                 tunnel_url = get_tunnel_url(inst["name"])
                 if tunnel_url:
                     status["tunnel_url"] = tunnel_url
@@ -326,6 +332,14 @@ def create_app() -> Any:
 
         try:
             status = get_status(name)
+            # Tailscale serve URL (private tailnet access)
+            if _tailscale_mode and status.get("port"):
+                from comfy_runner.tunnel import _load_serve_registry, get_tailscale_serve_url
+                if status["port"] in _load_serve_registry():
+                    serve_url = get_tailscale_serve_url(status["port"])
+                    if serve_url:
+                        status["serve_url"] = serve_url
+            # Tunnel URL (ngrok/funnel public access)
             tunnel_url = get_tunnel_url(name)
             if tunnel_url:
                 status["tunnel_url"] = tunnel_url
