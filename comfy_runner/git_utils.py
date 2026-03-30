@@ -2,10 +2,34 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+
+def _git_env() -> dict[str, str]:
+    """Build environment for git commands with optional GitHub token auth.
+
+    Injects GITHUB_TOKEN as HTTPS credentials via git config env vars,
+    enabling clone/fetch from private repos without a credential helper.
+    """
+    from .config import get_github_token
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    token = get_github_token()
+    if token:
+        env["GIT_ASKPASS"] = "echo"
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = (
+            f"url.https://x-access-token:{token}@github.com/.insteadOf"
+        )
+        env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+    return env
 
 
 def is_git_available() -> bool:
@@ -33,7 +57,8 @@ def git_clone(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        env=_git_env(),
+        creationflags=_NO_WINDOW,
     )
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -194,7 +219,7 @@ def git_diff_name_only(
             capture_output=True,
             text=True,
             timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode != 0:
             return []
@@ -215,7 +240,7 @@ def git_rev_parse(
             capture_output=True,
             text=True,
             timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode == 0:
             return result.stdout.strip() or None
@@ -236,7 +261,8 @@ def _run_git(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        env=_git_env(),
+        creationflags=_NO_WINDOW,
     )
     assert proc.stdout is not None
     for line in proc.stdout:

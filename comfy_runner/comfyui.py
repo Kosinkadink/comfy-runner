@@ -138,12 +138,12 @@ def deploy_ref(
     if repo_url and fetch_first:
         # Check if repo_url differs from origin — if so, add a temp remote
         import subprocess as _sp
-        _cf = _sp.CREATE_NO_WINDOW if hasattr(_sp, "CREATE_NO_WINDOW") else 0
+        from .git_utils import _git_env, _NO_WINDOW
         try:
             result = _sp.run(
                 ["git", "remote", "get-url", "origin"],
                 cwd=repo, capture_output=True, text=True, timeout=10,
-                creationflags=_cf,
+                creationflags=_NO_WINDOW,
             )
             origin_url = result.stdout.strip()
         except Exception:
@@ -155,10 +155,11 @@ def deploy_ref(
             remote = "deploy-branch"
             if send_output:
                 send_output(f"Adding remote '{remote}' -> {repo_url}\n")
+            env = _git_env()
             _sp.run(["git", "remote", "remove", remote], cwd=repo,
-                    capture_output=True, creationflags=_cf)  # ignore if absent
+                    capture_output=True, creationflags=_NO_WINDOW)  # ignore if absent
             _sp.run(["git", "remote", "add", remote, repo_url], cwd=repo,
-                    capture_output=True, creationflags=_cf)
+                    capture_output=True, creationflags=_NO_WINDOW)
 
     if fetch_first:
         if send_output:
