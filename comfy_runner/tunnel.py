@@ -263,30 +263,6 @@ class TailscaleTunnel:
 
         self._port = port
 
-        # Fail fast if another funnel is already active on port 443
-        existing = _read_tunnel_state(port)
-        if existing and existing.get("provider") == "tailscale":
-            raise RuntimeError(
-                f"A Tailscale funnel is already active for port {port} "
-                f"(URL: {existing.get('url', '?')}). Stop it first."
-            )
-        # Also check live Tailscale serve status for any funnel handlers
-        serve_status = get_tailscale_serve_status()
-        if serve_status.get("active"):
-            cfg = serve_status.get("config", {})
-            # Check if there's a Funnel config pointing to a different port
-            for handler_port_str, handler in (cfg.get("TCP", {}) or {}).items():
-                try:
-                    handler_port = int(handler_port_str)
-                except (ValueError, TypeError):
-                    continue
-                fwd = handler.get("IncomingPort", 0) or handler_port
-                if fwd != port:
-                    raise RuntimeError(
-                        f"Tailscale funnel is already serving port {fwd}. "
-                        f"Stop it before starting a funnel for port {port}."
-                    )
-
         kwargs: dict[str, Any] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
