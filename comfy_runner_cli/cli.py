@@ -1284,6 +1284,74 @@ def cmd_set(args: argparse.Namespace) -> None:
         console.print(f"✓ [cyan]{args.name}[/cyan] {key} = [bold]{value or '(empty)'}[/bold]")
 
 
+def cmd_workflow_models(args: argparse.Namespace) -> None:
+    """Download models referenced in a workflow template."""
+    from comfy_runner.workflow_models import (
+        check_missing_models,
+        download_models,
+        parse_workflow_models,
+        resolve_models_dir,
+    )
+
+    try:
+        from comfy_runner.config import get_installation
+
+        wf_path = Path(args.file)
+        if not wf_path.exists():
+            raise FileNotFoundError(f"File not found: {wf_path}")
+        workflow = json.loads(wf_path.read_text(encoding="utf-8"))
+
+        record = get_installation(args.name)
+        if not record:
+            raise RuntimeError(f"Installation '{args.name}' not found.")
+
+        models = parse_workflow_models(workflow)
+        models_dir = resolve_models_dir(record["path"])
+        missing, existing = check_missing_models(models, models_dir)
+
+        if args.json:
+            result: dict = {
+                "ok": True,
+                "total": len(models),
+                "missing": len(missing),
+                "existing": len(existing),
+                "models": models,
+                "missing_models": missing,
+            }
+            if args.dry_run:
+                print(json.dumps(result, indent=2))
+                return
+            downloads = download_models(missing, models_dir)
+            result["downloads"] = downloads
+            print(json.dumps(result, indent=2))
+            return
+
+        console.print(f"Found [bold]{len(models)}[/bold] model(s) in workflow")
+        console.print(f"Models dir: [dim]{models_dir}[/dim]")
+
+        if not missing:
+            console.print("[green]All models already present.[/green]")
+            return
+
+        console.print(f"[yellow]{len(missing)} missing:[/yellow]")
+        for m in missing:
+            console.print(f"  • {m['directory']}/{m['name']}")
+
+        if args.dry_run:
+            return
+
+        console.print()
+        download_models(missing, models_dir, send_output=_output)
+        console.print("[green]Done.[/green]")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1474,6 +1542,13 @@ def main(argv: list[str] | None = None) -> None:
     deploy_group.add_argument("--commit", help="Commit SHA to checkout")
     deploy_group.add_argument("--reset", action="store_true", help="Reset to the original release ref")
     p_deploy.set_defaults(func=cmd_deploy)
+
+    # workflow-models
+    p_wfm = sub.add_parser("workflow-models", help="Download models referenced in a workflow template")
+    p_wfm.add_argument("file", help="Path to workflow template JSON")
+    p_wfm.add_argument("name", nargs="?", default="main", help="Installation name")
+    p_wfm.add_argument("--dry-run", action="store_true", help="List models without downloading")
+    p_wfm.set_defaults(func=cmd_workflow_models)
 
     # tunnel
     p_tunnel = sub.add_parser("tunnel", help="Manage tunnel exposure")

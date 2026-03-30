@@ -1093,6 +1093,65 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # POST /<name>/workflow-models  (async — returns job_id)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/workflow-models", methods=["POST"])
+    def route_workflow_models(name: str) -> Any:
+        from comfy_runner.workflow_models import (
+            check_missing_models,
+            download_models,
+            parse_workflow_models,
+            resolve_models_dir,
+        )
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        workflow = body.get("workflow")
+        if not workflow or not isinstance(workflow, dict):
+            return _err("Missing or invalid 'workflow' field")
+
+        try:
+            models = parse_workflow_models(workflow)
+            models_dir = resolve_models_dir(record["path"])
+            missing, _existing = check_missing_models(models, models_dir)
+        except Exception as e:
+            return _err(str(e))
+
+        if not missing:
+            return jsonify({
+                "ok": True,
+                "total": len(models),
+                "missing": 0,
+            })
+
+        job_id = _jobs.create(label=f"workflow-models {name}")
+
+        def _run() -> None:
+            out, lines = _make_collector()
+            try:
+                download_models(missing, models_dir, send_output=out)
+                _jobs.finish(job_id, {
+                    "total": len(models),
+                    "missing": len(missing),
+                    "models": models,
+                    "missing_models": missing,
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "async": True,
+            "total": len(models),
+            "missing": len(missing),
+        })
+
+    # ------------------------------------------------------------------
     # Backwards-compat: un-prefixed routes default to first installation
     # ------------------------------------------------------------------
     def _default_name() -> str:
