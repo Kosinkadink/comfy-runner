@@ -1288,6 +1288,61 @@ def cmd_set(args: argparse.Namespace) -> None:
         console.print(f"✓ [cyan]{args.name}[/cyan] {key} = [bold]{value or '(empty)'}[/bold]")
 
 
+def cmd_download_model(args: argparse.Namespace) -> None:
+    """Download a single model by URL."""
+    from comfy_runner.config import get_installation
+    from comfy_runner.workflow_models import download_models, resolve_models_dir
+    from urllib.parse import urlparse, unquote
+
+    try:
+        record = get_installation(args.name)
+        if not record:
+            raise RuntimeError(f"Installation '{args.name}' not found.")
+
+        url = args.url
+        directory = args.dir
+        filename = args.filename
+        if not filename:
+            # Derive from URL path
+            path = urlparse(url).path
+            filename = unquote(path.rsplit("/", 1)[-1]) or "download"
+            # Strip query params that got included
+            if "?" in filename:
+                filename = filename.split("?")[0]
+
+        models_dir = resolve_models_dir(record["path"])
+        dest = models_dir / directory / filename
+
+        if dest.is_file():
+            if args.json:
+                print(json.dumps({"ok": True, "skipped": True, "path": str(dest)}))
+            else:
+                console.print(f"[dim]Already exists: {dest}[/dim]")
+            return
+
+        if not args.json:
+            console.print(f"Downloading [bold]{filename}[/bold] → {directory}/")
+            console.print(f"Models dir: [dim]{models_dir}[/dim]")
+
+        model = {"name": filename, "url": url, "directory": directory}
+        result = download_models([model], models_dir, send_output=None if args.json else _output)
+
+        if args.json:
+            print(json.dumps({"ok": True, **result}, indent=2))
+        elif result["downloaded"]:
+            console.print("[green]✓ Done[/green]")
+        elif result["failed"]:
+            console.print(f"[red]✗ Failed: {result['errors'][0]}[/red]")
+            sys.exit(1)
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
 def cmd_workflow_models(args: argparse.Namespace) -> None:
     """Download models referenced in a workflow template."""
     from comfy_runner.workflow_models import (
@@ -1546,6 +1601,14 @@ def main(argv: list[str] | None = None) -> None:
     deploy_group.add_argument("--commit", help="Commit SHA to checkout")
     deploy_group.add_argument("--reset", action="store_true", help="Reset to the original release ref")
     p_deploy.set_defaults(func=cmd_deploy)
+
+    # download-model
+    p_dlm = sub.add_parser("download-model", help="Download a model by URL to a specific directory")
+    p_dlm.add_argument("--url", required=True, help="Download URL")
+    p_dlm.add_argument("--dir", required=True, help="Target subdirectory under models/ (e.g. checkpoints, loras)")
+    p_dlm.add_argument("--name", dest="filename", help="Filename to save as (default: derived from URL)")
+    p_dlm.add_argument("name", nargs="?", default="main", help="Installation name")
+    p_dlm.set_defaults(func=cmd_download_model)
 
     # workflow-models
     p_wfm = sub.add_parser("workflow-models", help="Download models referenced in a workflow template")

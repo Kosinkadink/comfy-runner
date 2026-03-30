@@ -1128,6 +1128,78 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # POST /<name>/download-model  (async — returns job_id)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/download-model", methods=["POST"])
+    def route_download_model(name: str) -> Any:
+        from comfy_runner.workflow_models import (
+            check_missing_models,
+            download_models,
+            resolve_models_dir,
+        )
+        from urllib.parse import urlparse, unquote
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        url = body.get("url", "")
+        directory = body.get("directory", "")
+        filename = body.get("name", "")
+
+        if not url:
+            return _err("Missing 'url' field")
+        if not directory:
+            return _err("Missing 'directory' field")
+        if not filename:
+            path = urlparse(url).path
+            filename = unquote(path.rsplit("/", 1)[-1]) or "download"
+            if "?" in filename:
+                filename = filename.split("?")[0]
+
+        try:
+            models_dir = resolve_models_dir(record["path"])
+        except Exception as e:
+            return _err(str(e))
+
+        model = {"name": filename, "url": url, "directory": directory}
+        missing, existing = check_missing_models([model], models_dir)
+
+        if not missing:
+            return jsonify({"ok": True, "skipped": True, "name": filename, "directory": directory})
+
+        job_id = _jobs.create(label=f"download-model {directory}/{filename}")
+        cancel_event = _jobs.get_cancel_event(job_id)
+
+        def _run() -> None:
+            out, lines = _make_collector()
+            try:
+                dl_result = download_models(
+                    missing, models_dir, send_output=out,
+                    cancel_event=cancel_event,
+                )
+                if dl_result.get("cancelled"):
+                    _jobs.fail(job_id, "Cancelled by user", lines)
+                else:
+                    _jobs.finish(job_id, {
+                        "name": filename,
+                        "directory": directory,
+                        **dl_result,
+                    }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "async": True,
+            "name": filename,
+            "directory": directory,
+        })
+
+    # ------------------------------------------------------------------
     # POST /<name>/workflow-models  (async — returns job_id)
     # ------------------------------------------------------------------
     @app.route("/<name>/workflow-models", methods=["POST"])
