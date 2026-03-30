@@ -4,7 +4,7 @@ A Python toolkit for managing ComfyUI instances — installation, snapshot, proc
 
 ## Packages
 
-- **`comfy_runner/`** — Core library (config, environment, process management, tunneling, shared paths, snapshots, nodes, git utilities)
+- **`comfy_runner/`** — Core library (config, environment, process management, tunneling, shared paths, snapshots, nodes, git utilities, hosted providers)
 - **`comfy_runner_cli/`** — CLI interface (`python -m comfy_runner_cli` or `python comfy_runner.py`)
 - **`comfy_runner_server/`** — HTTP API server (`python -m comfy_runner_server`, Flask + Waitress)
 
@@ -174,6 +174,41 @@ comfy_runner.py tunnel config --rm-domain example.ngrok.io
 
 These tunnels expose individual ComfyUI instances (their `--port`), not the runner server itself. For exposing the runner server, see **Tailscale Serve** below.
 
+### Hosted GPU Deployments (RunPod)
+
+Manage cloud GPU pods and network volumes via the RunPod REST API.
+
+```bash
+# Configure RunPod credentials (or set RUNPOD_API_KEY env var)
+comfy_runner.py hosted config set runpod.api_key rk_...
+
+# View hosted config (sensitive values are redacted in output)
+comfy_runner.py hosted config show
+
+# Set provider defaults
+comfy_runner.py hosted config set runpod.default_gpu "NVIDIA A100 80GB"
+comfy_runner.py hosted config set runpod.default_datacenter EU-RO-1
+
+# Create a network volume
+comfy_runner.py hosted volume create --name workspace --size 50 --region US-KS-2
+
+# List configured volumes
+comfy_runner.py hosted volume list
+
+# Remove a volume (deletes from RunPod and local config)
+comfy_runner.py hosted volume rm workspace
+
+# Remove local config only, keep the volume on RunPod
+comfy_runner.py hosted volume rm workspace --keep-remote
+```
+
+The hosted module lives under `comfy_runner/hosted/` and provides:
+
+- **`config.py`** — Provider credentials, volume registry, and API key fallback (`RUNPOD_API_KEY` env → config)
+- **`runpod_api.py`** — Low-level RunPod REST API client (`https://rest.runpod.io/v1/`)
+- **`runpod_provider.py`** — High-level `RunPodProvider` with sensible defaults for pod creation
+- **`provider.py`** — `HostedProvider` protocol and shared dataclasses (`PodInfo`, `VolumeInfo`)
+
 ### Tailscale Serve
 
 Expose the runner server itself over your tailnet (private HTTPS, accessible only to devices on your Tailscale network).
@@ -258,6 +293,20 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 - Long-running operations (deploy, restart, snapshot restore, node add/rm) run in background threads and return a `job_id`.
 - Poll `GET /job/<job_id>` to check job status.
 - All responses are JSON: `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
+
+## Testing
+
+```bash
+# Run all tests
+.venv/bin/python -m pytest tests/ -q
+
+# Run a specific test file
+.venv/bin/python -m pytest tests/test_hosted_config.py -v
+```
+
+Tests use `pytest` with `unittest.mock.patch` for mocking. The `tmp_config_dir` fixture (see `tests/conftest.py`) redirects all config/cache paths to `tmp_path` so tests never touch the real home directory.
+
+Test files follow the naming convention `tests/test_<module>.py` and are organized by class per feature area.
 
 ## Global Flags
 
