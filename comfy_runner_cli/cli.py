@@ -1445,6 +1445,165 @@ def cmd_workflow_models(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Hosted commands
+# ---------------------------------------------------------------------------
+
+def cmd_hosted(args: argparse.Namespace) -> None:
+    """Dispatch hosted subcommands."""
+    action = getattr(args, "hosted_action", None)
+
+    if action == "config":
+        _hosted_config(args)
+    elif action == "volume":
+        _hosted_volume(args)
+    else:
+        args._parser_hosted.print_help()
+
+
+def _hosted_config(args: argparse.Namespace) -> None:
+    """Handle hosted config show/set."""
+    from comfy_runner.hosted.config import (
+        get_hosted_config,
+        set_provider_value,
+    )
+
+    config_action = getattr(args, "hosted_config_action", None)
+
+    if config_action == "show":
+        data = get_hosted_config()
+        if args.json:
+            print(json.dumps({"ok": True, "config": data}, indent=2))
+        else:
+            if not data:
+                console.print("[dim]No hosted config set.[/dim]")
+            else:
+                console.print_json(json.dumps(data, indent=2))
+
+    elif config_action == "set":
+        key = args.key
+        value = args.value
+        # Key format: runpod.api_key → provider=runpod, key=api_key
+        parts = key.split(".", 1)
+        if len(parts) < 2:
+            console.print("[red]Error: key must be in format provider.key (e.g. runpod.api_key)[/red]")
+            sys.exit(1)
+        provider, config_key = parts
+        set_provider_value(provider, config_key, value)
+        if args.json:
+            print(json.dumps({"ok": True}))
+        else:
+            # Redact sensitive values
+            display = "***" if any(s in config_key for s in ("key", "secret", "token")) else value
+            console.print(f"Set [cyan]{provider}[/cyan].[cyan]{config_key}[/cyan] = {display}")
+    else:
+        args._parser_hosted_config.print_help()
+
+
+def _hosted_volume(args: argparse.Namespace) -> None:
+    """Handle hosted volume create/list/rm."""
+    from comfy_runner.hosted.config import (
+        get_volume_config,
+        list_volume_configs,
+        remove_volume_config,
+        set_volume_config,
+    )
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+
+    volume_action = getattr(args, "hosted_volume_action", None)
+
+    if volume_action == "create":
+        try:
+            provider = RunPodProvider()
+            result = provider.create_volume(
+                name=args.name,
+                size_gb=args.size,
+                datacenter=args.region,
+            )
+            vol_id = result.get("id", "")
+            datacenter = result.get("dataCenterId", args.region or provider.default_datacenter)
+            set_volume_config("runpod", args.name, {
+                "id": vol_id,
+                "datacenter": datacenter,
+                "size_gb": args.size,
+            })
+            if args.json:
+                print(json.dumps({"ok": True, "volume": result}, indent=2))
+            else:
+                console.print(f"✓ Volume [cyan]{args.name}[/cyan] created (id: {vol_id}, {datacenter}, {args.size} GB)")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif volume_action == "list":
+        try:
+            local_volumes = list_volume_configs("runpod")
+            if args.json:
+                # Also fetch live data from RunPod API
+                try:
+                    provider = RunPodProvider()
+                    remote = provider.list_volumes()
+                except Exception:
+                    remote = []
+                print(json.dumps({
+                    "ok": True,
+                    "local": local_volumes,
+                    "remote": remote,
+                }, indent=2))
+            else:
+                if not local_volumes:
+                    console.print("[dim]No volumes configured.[/dim]")
+                    return
+                table = Table(title="Hosted Volumes (RunPod)")
+                table.add_column("Name", style="cyan")
+                table.add_column("ID", style="dim")
+                table.add_column("Datacenter", style="green")
+                table.add_column("Size (GB)", style="yellow", justify="right")
+                for vname, vdata in local_volumes.items():
+                    table.add_row(
+                        vname,
+                        vdata.get("id", ""),
+                        vdata.get("datacenter", ""),
+                        str(vdata.get("size_gb", "")),
+                    )
+                console.print(table)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif volume_action == "rm":
+        try:
+            vol_cfg = get_volume_config("runpod", args.name)
+            if not vol_cfg:
+                raise RuntimeError(f"Volume '{args.name}' not found in config.")
+            vol_id = vol_cfg["id"]
+            if not args.keep_remote:
+                provider = RunPodProvider()
+                provider.delete_volume(vol_id)
+                if not args.json:
+                    console.print(f"Deleted volume [cyan]{vol_id}[/cyan] from RunPod.")
+            remove_volume_config("runpod", args.name)
+            if args.json:
+                print(json.dumps({"ok": True}))
+            else:
+                console.print(f"✓ Volume [cyan]{args.name}[/cyan] removed.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    else:
+        args._parser_hosted_volume.print_help()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1649,6 +1808,38 @@ def main(argv: list[str] | None = None) -> None:
     p_wfm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_wfm.add_argument("--dry-run", action="store_true", help="List models without downloading")
     p_wfm.set_defaults(func=cmd_workflow_models)
+
+    # hosted
+    p_hosted = sub.add_parser("hosted", help="Manage hosted GPU deployments (RunPod, etc.)")
+    hosted_sub = p_hosted.add_subparsers(dest="hosted_action")
+
+    # hosted config
+    p_hosted_config = hosted_sub.add_parser("config", help="View or set hosted provider configuration")
+    hosted_config_sub = p_hosted_config.add_subparsers(dest="hosted_config_action")
+    hosted_config_sub.add_parser("show", help="Show hosted configuration")
+    p_hc_set = hosted_config_sub.add_parser("set", help="Set a configuration value")
+    p_hc_set.add_argument("key", help="Config key (e.g. runpod.api_key)")
+    p_hc_set.add_argument("value", help="Value to set")
+    p_hosted_config.set_defaults(_parser_hosted_config=p_hosted_config)
+
+    # hosted volume
+    p_hosted_volume = hosted_sub.add_parser("volume", help="Manage hosted network volumes")
+    hosted_volume_sub = p_hosted_volume.add_subparsers(dest="hosted_volume_action")
+
+    p_hv_create = hosted_volume_sub.add_parser("create", help="Create a network volume")
+    p_hv_create.add_argument("--name", "-n", required=True, help="Volume name (local config label)")
+    p_hv_create.add_argument("--size", "-s", type=int, required=True, help="Volume size in GB")
+    p_hv_create.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
+
+    hosted_volume_sub.add_parser("list", help="List configured volumes")
+
+    p_hv_rm = hosted_volume_sub.add_parser("rm", help="Remove a volume")
+    p_hv_rm.add_argument("name", help="Volume name to remove")
+    p_hv_rm.add_argument("--keep-remote", action="store_true",
+                         help="Remove local config only, keep volume on RunPod")
+
+    p_hosted_volume.set_defaults(_parser_hosted_volume=p_hosted_volume)
+    p_hosted.set_defaults(func=cmd_hosted, _parser_hosted=p_hosted)
 
     # tunnel
     p_tunnel = sub.add_parser("tunnel", help="Manage tunnel exposure")
