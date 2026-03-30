@@ -64,9 +64,12 @@ def generate_extra_model_paths_yaml(
 ) -> str:
     """Generate the YAML content for extra_model_paths.yaml.
 
-    Uses all_model_folders for future-proofing, plus explicit entries
-    for compatibility with older ComfyUI versions.  *extra_folders*
-    are non-canonical folder names discovered from custom nodes.
+    Explicit entries for each model folder type.  ComfyUI's loader
+    pops ``base_path`` and ``is_default``, then iterates remaining keys
+    as ``folder_name: relative_path`` and calls ``add_model_folder_path``.
+
+    All values must be strings — bare YAML booleans (true/false/yes/no)
+    will crash ComfyUI's ``.split("\\n")`` call.
     """
     shared = Path(shared_dir).resolve()
     models_dir = shared / "models"
@@ -80,8 +83,8 @@ def generate_extra_model_paths_yaml(
         "# Shared model paths configuration",
         "",
         "comfy_runner_shared:",
-        f"    base_path: {models_dir}",
-        "    is_default: true",
+        f'    base_path: "{models_dir}"',
+        '    is_default: "true"',
     ]
 
     # Explicit entries for each model folder type
