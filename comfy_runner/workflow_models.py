@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -117,10 +118,10 @@ _PROGRESS_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 def cleanup_staging(models_dir: Path) -> int:
-    """Remove all ``.part`` files from ``{models_dir}/.staging/``.
+    """Remove the legacy ``{models_dir}/.staging/`` directory if present.
 
-    Returns the number of files removed.  Safe to call even if the staging
-    directory does not exist.
+    Returns the number of files removed.  Downloads now use a temp directory
+    outside ``models_dir``, but this cleans up leftovers from older versions.
     """
     staging_dir = models_dir / ".staging"
     if not staging_dir.is_dir():
@@ -132,6 +133,11 @@ def cleanup_staging(models_dir: Path) -> int:
             count += 1
         except OSError:
             pass
+    # Remove the directory itself if empty
+    try:
+        staging_dir.rmdir()
+    except OSError:
+        pass
     return count
 
 
@@ -166,9 +172,9 @@ def download_models(
 ) -> dict[str, Any]:
     """Download models to ``{models_dir}/{directory}/{name}``.
 
-    Downloads are staged in ``{models_dir}/.staging/`` as ``.part`` files and
-    moved to the final location on completion.  Reports progress every ~10%
-    or every 10 MB.
+    Downloads are staged in a temporary directory outside ``models_dir`` as
+    ``.part`` files and moved to the final location on completion.  Reports
+    progress every ~10% or every 10 MB.
 
     If *cancel_event* is provided and becomes set, the current download is
     aborted, its temp file removed, and the result includes
@@ -184,8 +190,8 @@ def download_models(
         "errors": [],
     }
     total = len(models)
-    staging_dir = models_dir / ".staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging_tmpdir = tempfile.mkdtemp(prefix="comfy-dl-staging-")
+    staging_dir = Path(staging_tmpdir)
 
     for idx, model in enumerate(models, 1):
         rel = f"{model['directory']}/{model['name']}"
@@ -194,6 +200,7 @@ def download_models(
 
         # Check cancellation before starting a new model
         if cancel_event is not None and cancel_event.is_set():
+            shutil.rmtree(staging_tmpdir, ignore_errors=True)
             result["cancelled"] = True
             return result
 
@@ -267,6 +274,7 @@ def download_models(
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                shutil.rmtree(staging_tmpdir, ignore_errors=True)
                 result["cancelled"] = True
                 return result
 
@@ -286,4 +294,6 @@ def download_models(
             except OSError:
                 pass
 
+
+    shutil.rmtree(staging_tmpdir, ignore_errors=True)
     return result
