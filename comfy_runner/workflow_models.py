@@ -8,7 +8,8 @@ extracts, deduplicates, checks, and downloads them.
 from __future__ import annotations
 
 import os
-import tempfile
+import shutil
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -115,15 +116,63 @@ _CHUNK_SIZE = 8192
 _PROGRESS_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
+def cleanup_staging(models_dir: Path) -> int:
+    """Remove all ``.part`` files from ``{models_dir}/.staging/``.
+
+    Returns the number of files removed.  Safe to call even if the staging
+    directory does not exist.
+    """
+    staging_dir = models_dir / ".staging"
+    if not staging_dir.is_dir():
+        return 0
+    count = 0
+    for part_file in staging_dir.glob("*.part"):
+        try:
+            part_file.unlink()
+            count += 1
+        except OSError:
+            pass
+    return count
+
+
+def cleanup_staging_all(
+    send_output: Callable[[str], None] | None = None,
+) -> int:
+    """Clean up staging files across all installations.
+
+    Returns total number of files removed.
+    """
+    from .installations import show_list
+
+    out = send_output or (lambda _: None)
+    total_removed = 0
+    for inst in show_list():
+        install_path = inst.get("path")
+        if not install_path:
+            continue
+        models_dir = resolve_models_dir(install_path)
+        count = cleanup_staging(models_dir)
+        if count:
+            out(f"Cleaned up {count} staging file(s) in {inst['name']}\n")
+            total_removed += count
+    return total_removed
+
+
 def download_models(
     models: list[dict[str, str]],
     models_dir: Path,
     send_output: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Download models to ``{models_dir}/{directory}/{name}``.
 
-    Creates target directories as needed.  Uses a temp file during download
-    and renames on completion.  Reports progress every ~10% or every 10 MB.
+    Downloads are staged in ``{models_dir}/.staging/`` as ``.part`` files and
+    moved to the final location on completion.  Reports progress every ~10%
+    or every 10 MB.
+
+    If *cancel_event* is provided and becomes set, the current download is
+    aborted, its temp file removed, and the result includes
+    ``"cancelled": True``.
 
     Returns ``{"downloaded": [...], "skipped": [...], "failed": [...], "errors": [...]}``.
     """
@@ -135,19 +184,24 @@ def download_models(
         "errors": [],
     }
     total = len(models)
+    staging_dir = models_dir / ".staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, model in enumerate(models, 1):
         rel = f"{model['directory']}/{model['name']}"
         dest_dir = models_dir / model["directory"]
         dest_file = dest_dir / model["name"]
 
+        # Check cancellation before starting a new model
+        if cancel_event is not None and cancel_event.is_set():
+            result["cancelled"] = True
+            return result
+
         # Skip if already exists
         if dest_file.is_file():
             result["skipped"].append(rel)
             out(f"  [{idx}/{total}] {rel}  skipped (exists)\n")
             continue
-
-        dest_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             resp = requests.get(model["url"], stream=True, timeout=30)
@@ -166,17 +220,24 @@ def download_models(
 
         downloaded = 0
         last_report = 0
+        chunk_count = 0
+        cancelled = False
 
-        # Write to temp file in the same directory, then rename
-        fd, tmp_path_str = tempfile.mkstemp(
-            dir=str(dest_dir), prefix=f".{model['name']}.", suffix=".tmp"
-        )
-        tmp_path = Path(tmp_path_str)
+        # Write to staging file, then move to final destination
+        staging_name = f"{model['directory']}--{model['name']}.part"
+        tmp_path = staging_dir / staging_name
         try:
-            with os.fdopen(fd, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
                     f.write(chunk)
                     downloaded += len(chunk)
+                    chunk_count += 1
+
+                    # Check cancellation every 100 chunks (~800 KB)
+                    if cancel_event is not None and chunk_count % 100 == 0:
+                        if cancel_event.is_set():
+                            cancelled = True
+                            break
 
                     # Report progress
                     should_report = False
@@ -201,8 +262,17 @@ def download_models(
                                 f"  {_format_size(downloaded)}\n"
                             )
 
-            # Atomic rename
-            tmp_path.replace(dest_file)
+            if cancelled:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                result["cancelled"] = True
+                return result
+
+            # Move from staging to final destination
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(tmp_path), str(dest_file))
             result["downloaded"].append(rel)
             out(f"  [{idx}/{total}] {rel}  done ({_format_size(downloaded)})\n")
 

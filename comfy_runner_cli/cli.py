@@ -696,6 +696,10 @@ def cmd_server(args: argparse.Namespace) -> None:
     from comfy_runner.tunnel import cleanup_stale_serves
     cleanup_stale_serves(send_output=_output)
 
+    # Clean up leftover staging files from interrupted model downloads
+    from comfy_runner.workflow_models import cleanup_staging_all
+    cleanup_staging_all(send_output=_output)
+
     # --tailscale: tailscale serve handles external access, server binds localhost
     if args.tailscale:
         from comfy_runner.tunnel import start_tailscale_serve

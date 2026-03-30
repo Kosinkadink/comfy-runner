@@ -81,6 +81,7 @@ class _JobTracker:
     def __init__(self, ttl: int = 600) -> None:
         self._lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         self._ttl = ttl
 
     def create(self, label: str = "") -> str:
@@ -96,8 +97,29 @@ class _JobTracker:
                 "started_at": time.time(),
                 "finished_at": None,
             }
+            self._cancel_events[job_id] = threading.Event()
         log.info("[job %s] started: %s", job_id, label)
         return job_id
+
+    def cancel(self, job_id: str) -> bool:
+        """Signal cancellation for a running job. Returns True if the job was found."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job["status"] != "running":
+                return False
+            job["status"] = "cancelled"
+            job["finished_at"] = time.time()
+            elapsed = job["finished_at"] - job["started_at"]
+            log.info("[job %s] cancelled: %s (%.1fs)", job_id, job["label"], elapsed)
+        evt = self._cancel_events.get(job_id)
+        if evt:
+            evt.set()
+        return True
+
+    def get_cancel_event(self, job_id: str) -> threading.Event | None:
+        """Return the cancellation Event for a job, or None."""
+        with self._lock:
+            return self._cancel_events.get(job_id)
 
     def finish(self, job_id: str, result: dict[str, Any], output: list[str]) -> None:
         with self._lock:
@@ -147,6 +169,7 @@ class _JobTracker:
         ]
         for jid in expired:
             del self._jobs[jid]
+            self._cancel_events.pop(jid, None)
 
 
 _jobs = _JobTracker()
@@ -252,6 +275,18 @@ def create_app() -> Any:
         if not job:
             return _err("Job not found", 404)
         return jsonify({"ok": True, **job})
+
+    # ------------------------------------------------------------------
+    # POST /job/<job_id>/cancel — cancel a running job
+    # ------------------------------------------------------------------
+    @app.route("/job/<job_id>/cancel", methods=["POST"])
+    def route_job_cancel(job_id: str) -> Any:
+        if _jobs.cancel(job_id):
+            return jsonify({"ok": True})
+        job = _jobs.get(job_id)
+        if not job:
+            return _err("Job not found", 404)
+        return _err(f"Job is not running (status: {job['status']})")
 
     # ------------------------------------------------------------------
     # GET /installations — list all installations with status
@@ -1131,14 +1166,21 @@ def create_app() -> Any:
 
         def _run() -> None:
             out, lines = _make_collector()
+            cancel_event = _jobs.get_cancel_event(job_id)
             try:
-                download_models(missing, models_dir, send_output=out)
-                _jobs.finish(job_id, {
-                    "total": len(models),
-                    "missing": len(missing),
-                    "models": models,
-                    "missing_models": missing,
-                }, lines)
+                dl_result = download_models(
+                    missing, models_dir, send_output=out,
+                    cancel_event=cancel_event,
+                )
+                if dl_result.get("cancelled"):
+                    _jobs.fail(job_id, "Cancelled by user", lines)
+                else:
+                    _jobs.finish(job_id, {
+                        "total": len(models),
+                        "missing": len(missing),
+                        "models": models,
+                        "missing_models": missing,
+                    }, lines)
             except Exception as e:
                 _jobs.fail(job_id, str(e), lines)
 
