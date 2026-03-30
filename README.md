@@ -20,6 +20,20 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+## GitHub Token
+
+comfy-runner calls the GitHub API to fetch releases and manifests. Unauthenticated requests are rate-limited to 60/hour. To avoid hitting the limit, provide a token via either:
+
+```bash
+# Environment variable (recommended)
+export GITHUB_TOKEN=ghp_...
+
+# Or persist in comfy-runner config
+python comfy_runner.py config set github_token ghp_...
+```
+
+The environment variable takes precedence over the config value.
+
 ## CLI Usage
 
 ```bash
