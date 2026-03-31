@@ -457,7 +457,7 @@ def create_app() -> Any:
                 if not rec:
                     out(f"Installation '{name}' not found — initializing...\n")
                     try:
-                        init_installation(name=name, send_output=out)
+                        init_installation(name=name, send_output=out, cuda_compat=True)
                     except Exception as e:
                         _jobs.fail(job_id, f"Auto-init failed: {e}", lines)
                         return
