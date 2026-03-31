@@ -458,7 +458,16 @@ def create_app() -> Any:
                     out(f"Installation '{name}' not found — initializing...\n")
                     try:
                         cuda_compat = body.get("cuda_compat", False)
-                        init_installation(name=name, send_output=out, cuda_compat=cuda_compat)
+                        from comfy_runner.hosted.config import get_provider_config
+                        prov_cfg = get_provider_config("runpod")
+                        cache_releases = prov_cfg.get("cache_releases")
+                        cache_kw: dict = {}
+                        if isinstance(cache_releases, int):
+                            cache_kw["max_cache_entries"] = cache_releases
+                        init_installation(
+                            name=name, send_output=out, cuda_compat=cuda_compat,
+                            **cache_kw,
+                        )
                     except Exception as e:
                         _jobs.fail(job_id, f"Auto-init failed: {e}", lines)
                         return

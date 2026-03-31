@@ -373,6 +373,7 @@ def download_and_extract(
     dest: Path,
     cache_key: str | None = None,
     send_output: Callable[[str], None] | None = None,
+    max_cache_entries: int | None = None,
 ) -> None:
     """Download release archive(s) and extract to dest.
 
@@ -427,7 +428,10 @@ def download_and_extract(
     if cache_key:
         download_cache.touch(cache_key)
         if not all_cached:
-            download_cache.evict()
+            evict_kwargs: dict[str, Any] = {}
+            if max_cache_entries is not None:
+                evict_kwargs["max_entries"] = max_cache_entries
+            download_cache.evict(**evict_kwargs)
 
     # Determine which file to extract
     cached_files = [cache_dir / f["filename"] for f in download_files]

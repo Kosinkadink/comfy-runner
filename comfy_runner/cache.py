@@ -17,6 +17,7 @@ from .config import CONFIG_DIR
 CACHE_DIR = CONFIG_DIR / "cache"
 CACHE_META_FILE = CACHE_DIR / "cache-meta.json"
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024 * 1024  # 20 GB
+DEFAULT_MAX_ENTRIES = 3  # keep only the last N releases
 
 
 def get_cache_path(key: str) -> Path:
@@ -33,8 +34,15 @@ def touch(key: str) -> None:
     _save_meta(meta)
 
 
-def evict(max_bytes: int = DEFAULT_MAX_BYTES) -> None:
-    """Evict oldest cache entries until total size is under max_bytes."""
+def evict(
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_entries: int = DEFAULT_MAX_ENTRIES,
+) -> None:
+    """Evict oldest cache entries until within *max_entries* and *max_bytes*.
+
+    Entries are sorted by last-used time (oldest first).  The entry-count
+    limit is checked first, then the byte-budget limit.
+    """
     if not CACHE_DIR.exists():
         return
 
@@ -51,7 +59,9 @@ def evict(max_bytes: int = DEFAULT_MAX_BYTES) -> None:
         entries.append((key, entry_dir, size, last_used))
 
     total = sum(e[2] for e in entries)
-    if total <= max_bytes:
+    count = len(entries)
+
+    if count <= max_entries and total <= max_bytes:
         return
 
     # Sort by last_used ascending (oldest first)
@@ -59,11 +69,12 @@ def evict(max_bytes: int = DEFAULT_MAX_BYTES) -> None:
 
     import shutil
     for key, dir_path, size, _ in entries:
-        if total <= max_bytes:
+        if count <= max_entries and total <= max_bytes:
             break
         shutil.rmtree(dir_path, ignore_errors=True)
         meta.pop(key, None)
         total -= size
+        count -= 1
 
     _save_meta(meta)
 

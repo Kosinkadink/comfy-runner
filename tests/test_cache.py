@@ -7,6 +7,7 @@ import pytest
 
 import comfy_runner.cache as cache_mod
 from comfy_runner.cache import (
+    DEFAULT_MAX_ENTRIES,
     _dir_size,
     evict,
     get_cache_path,
@@ -61,6 +62,59 @@ class TestEvict:
 
         evict(max_bytes=10000)
         assert p.exists()
+
+    def test_evicts_oldest_over_max_entries(self, tmp_config_dir):
+        paths = []
+        for i, name in enumerate(["a", "b", "c", "d"]):
+            p = get_cache_path(name)
+            (p / "data.bin").write_bytes(b"x" * 10)
+            touch(name)
+            paths.append(p)
+            time.sleep(0.05)
+
+        # max_entries=2 should evict the two oldest ("a" and "b")
+        evict(max_entries=2, max_bytes=10 * 1024 * 1024 * 1024)
+
+        assert not paths[0].exists(), "'a' should be evicted"
+        assert not paths[1].exists(), "'b' should be evicted"
+        assert paths[2].exists(), "'c' should survive"
+        assert paths[3].exists(), "'d' should survive"
+
+    def test_evicts_by_both_entries_and_bytes(self, tmp_config_dir):
+        """When both limits are exceeded, keep evicting until both are met."""
+        p1 = get_cache_path("old")
+        (p1 / "data.bin").write_bytes(b"x" * 600)
+        touch("old")
+        time.sleep(0.05)
+
+        p2 = get_cache_path("mid")
+        (p2 / "data.bin").write_bytes(b"y" * 600)
+        touch("mid")
+        time.sleep(0.05)
+
+        p3 = get_cache_path("new")
+        (p3 / "data.bin").write_bytes(b"z" * 600)
+        touch("new")
+
+        # max_entries=3 is fine, but max_bytes=700 forces eviction
+        evict(max_entries=3, max_bytes=700)
+
+        assert not p1.exists()
+        assert not p2.exists()
+        assert p3.exists()
+
+    def test_no_eviction_under_both_limits(self, tmp_config_dir):
+        for name in ["x", "y"]:
+            p = get_cache_path(name)
+            (p / "data.bin").write_bytes(b"a" * 50)
+            touch(name)
+
+        evict(max_entries=5, max_bytes=10000)
+        assert (cache_mod.CACHE_DIR / "x").exists()
+        assert (cache_mod.CACHE_DIR / "y").exists()
+
+    def test_default_max_entries_is_three(self):
+        assert DEFAULT_MAX_ENTRIES == 3
 
 
 class TestDirSize:

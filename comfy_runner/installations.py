@@ -40,6 +40,7 @@ def init_installation(
     install_dir: str | None = None,
     send_output: Callable[[str], None] | None = None,
     cuda_compat: bool = False,
+    max_cache_entries: int | None = None,
 ) -> dict[str, Any]:
     """Create a new ComfyUI installation from scratch.
 
@@ -121,7 +122,10 @@ def init_installation(
             send_output("=== Downloading standalone environment ===\n")
 
         cache_key = f"{tag}_{variant_id}"
-        download_and_extract(download_files, install_path, cache_key, send_output)
+        download_and_extract(
+            download_files, install_path, cache_key, send_output,
+            max_cache_entries=max_cache_entries,
+        )
 
         # 4b. macOS binary repair (quarantine + codesigning)
         from .macos import repair_mac_binaries
