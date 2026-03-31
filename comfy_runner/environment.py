@@ -1184,15 +1184,27 @@ def ensure_cuda_compatible_torch(
             f"Installed torch uses CUDA {torch_cuda} — incompatible with driver {driver_str}\n"
         )
 
+    # --- Read manifest to pin torch versions ---
+    manifest = read_manifest(install_path)
+    packages = ["torch", "torchvision", "torchaudio"]
+    if manifest:
+        # Pin to the same base versions from the standalone env, just with a
+        # different CUDA tag.  e.g. "2.10.0+cu130" → "2.10.0+cu128"
+        for i, key in enumerate(["torch_version", "torchvision_version", "torchaudio_version"]):
+            ver = manifest.get(key, "")
+            if ver:
+                base = ver.split("+")[0]  # strip +cu130
+                packages[i] = f"{packages[i]}=={base}"
+
     # --- Reinstall with the best CUDA tag for this driver ---
     if send_output:
-        send_output(f"Reinstalling PyTorch with CUDA {best_cuda}...\n")
+        send_output(f"Reinstalling PyTorch with CUDA {best_cuda} ({', '.join(packages)})...\n")
 
     index_url = f"https://download.pytorch.org/whl/{best_tag}"
     reinstall = subprocess.run(
         [
             venv_python, "-m", "pip", "install", "--force-reinstall",
-            "torch", "torchvision", "torchaudio",
+            *packages,
             "--index-url", index_url,
         ],
         capture_output=True,
