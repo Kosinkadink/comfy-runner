@@ -2059,6 +2059,7 @@ def _hosted_deploy(args: argparse.Namespace) -> None:
             reset=args.reset,
             start=getattr(args, "start", False),
             launch_args=getattr(args, "launch_args", None),
+            cuda_compat=getattr(args, "cuda_compat", False),
         )
 
         job_id = data.get("job_id")
@@ -2553,6 +2554,8 @@ def main(argv: list[str] | None = None) -> None:
     p_hosted_deploy.add_argument("--start", action="store_true", help="Start ComfyUI after deploy")
     p_hosted_deploy.add_argument("--launch-args", help="Launch args to pass to ComfyUI")
     p_hosted_deploy.add_argument("--install", dest="install_name", help="Installation name on pod (default: main)")
+    p_hosted_deploy.add_argument("--cuda-compat", action="store_true", default=False,
+                                 help="Auto-detect host NVIDIA driver and swap torch CUDA build if needed")
 
     # hosted sysinfo
     p_hosted_sysinfo = hosted_sub.add_parser("sysinfo", help="Show system/hardware info from a hosted pod")

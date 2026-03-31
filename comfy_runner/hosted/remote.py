@@ -136,6 +136,7 @@ class RemoteRunner:
         reset: bool = False,
         start: bool = False,
         launch_args: str | None = None,
+        cuda_compat: bool = False,
     ) -> dict[str, Any]:
         """POST /{name}/deploy — async, returns job data."""
         body: dict[str, Any] = {}
@@ -153,6 +154,8 @@ class RemoteRunner:
             body["start"] = True
         if launch_args is not None:
             body["launch_args"] = launch_args
+        if cuda_compat:
+            body["cuda_compat"] = True
         return self._request("POST", f"/{name}/deploy", json=body)
 
     # ------------------------------------------------------------------
