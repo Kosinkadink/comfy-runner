@@ -1738,6 +1738,9 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 else:
                     volume_id = args.volume
 
+            cuda_versions = None
+            if getattr(args, "cuda_versions", None):
+                cuda_versions = [v.strip() for v in args.cuda_versions.split(",")]
             pod = provider.create_pod(
                 name=args.name,
                 gpu_type=args.gpu,
@@ -1745,6 +1748,7 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 volume_id=volume_id,
                 datacenter=args.region,
                 cloud_type=args.cloud_type,
+                allowed_cuda_versions=cuda_versions,
             )
             # Save pod record for tracking
             from comfy_runner.hosted.config import set_pod_record
@@ -1967,6 +1971,9 @@ def _hosted_init(args: argparse.Namespace) -> None:
         # Create pod
         if not args.json:
             console.print(f"Creating pod [cyan]{args.name}[/cyan]...")
+        cuda_versions = None
+        if getattr(args, "cuda_versions", None):
+            cuda_versions = [v.strip() for v in args.cuda_versions.split(",")]
         pod = provider.create_pod(
             name=args.name,
             gpu_type=args.gpu,
@@ -1974,6 +1981,7 @@ def _hosted_init(args: argparse.Namespace) -> None:
             volume_id=volume_id,
             datacenter=args.region,
             cloud_type=args.cloud_type,
+            allowed_cuda_versions=cuda_versions,
         )
 
         # Save pod record
@@ -2494,6 +2502,8 @@ def main(argv: list[str] | None = None) -> None:
     p_hp_create.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
     p_hp_create.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
                              help="Cloud type (default: from config)")
+    p_hp_create.add_argument("--cuda-versions",
+                             help="Comma-separated CUDA versions to allow (default: 12.4,12.6,12.8,13.0)")
 
     hosted_pod_sub.add_parser("list", help="List all pods")
 
@@ -2525,6 +2535,8 @@ def main(argv: list[str] | None = None) -> None:
     p_hosted_init.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
     p_hosted_init.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
                                help="Cloud type (default: from config)")
+    p_hosted_init.add_argument("--cuda-versions",
+                               help="Comma-separated CUDA versions to allow (default: 12.4,12.6,12.8,13.0)")
 
     # hosted deploy
     p_hosted_deploy = hosted_sub.add_parser("deploy", help="Deploy a PR/branch/tag/commit to a hosted pod")

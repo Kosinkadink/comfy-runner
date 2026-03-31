@@ -12,6 +12,7 @@ from .runpod_api import RunPodAPI
 
 DEFAULT_IMAGE = "ghcr.io/kosinkadink/comfy-runner:latest"
 DEFAULT_PORTS = ["8188/http", "9189/http", "22/tcp"]
+DEFAULT_CUDA_VERSIONS = ["12.4", "12.6", "12.8", "13.0"]
 
 
 def _pod_info(data: dict[str, Any]) -> PodInfo:
@@ -78,6 +79,7 @@ class RunPodProvider:
         env: dict[str, str] | None = None,
         datacenter: str | None = None,
         cloud_type: str | None = None,
+        allowed_cuda_versions: list[str] | None = None,
     ) -> PodInfo:
         """Create a pod with sensible defaults from config."""
         params: dict[str, Any] = {
@@ -89,6 +91,9 @@ class RunPodProvider:
             "volumeMountPath": "/workspace",
             "cloudType": cloud_type or self.default_cloud_type,
         }
+        cuda_vers = allowed_cuda_versions if allowed_cuda_versions is not None else DEFAULT_CUDA_VERSIONS
+        if cuda_vers:
+            params["allowedCudaVersions"] = cuda_vers
         if datacenter or self.default_datacenter:
             params["dataCenterIds"] = [datacenter or self.default_datacenter]
         if volume_id is not None:

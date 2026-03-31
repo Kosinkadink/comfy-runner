@@ -21,6 +21,7 @@ from .config import (
 from .environment import (
     create_env,
     download_and_extract,
+    ensure_cuda_compatible_torch,
     fetch_latest_release,
     fetch_manifests,
     fetch_releases,
@@ -137,6 +138,12 @@ def init_installation(
             send_output("\n=== Creating default Python environment ===\n")
 
         create_env(install_path, send_output)
+
+        # 6b. Ensure torch CUDA build matches host driver
+        if send_output:
+            send_output("\n=== Checking CUDA compatibility ===\n")
+
+        ensure_cuda_compatible_torch(install_path, send_output)
 
         # 7. Strip bulky packages from master env
         if send_output:

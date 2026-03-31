@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -1057,6 +1058,158 @@ def _chmod_binaries(bin_dir: Path) -> None:
     for entry in bin_dir.iterdir():
         if entry.is_file():
             entry.chmod(0o755)
+
+
+# ---------------------------------------------------------------------------
+# CUDA compatibility — detect driver, check torch, reinstall if needed
+# ---------------------------------------------------------------------------
+
+# (driver_major_min, cuda_version, cu_tag)
+_DRIVER_CUDA_TABLE: list[tuple[int, str, str]] = [
+    (580, "13.0", "cu130"),
+    (570, "12.8", "cu128"),
+    (560, "12.6", "cu126"),
+    (550, "12.4", "cu124"),
+    (525, "12.1", "cu121"),
+]
+
+# Reverse lookup: CUDA version string → minimum driver major
+_CUDA_MIN_DRIVER: dict[str, int] = {cuda: drv for drv, cuda, _ in _DRIVER_CUDA_TABLE}
+
+
+def _detect_nvidia_driver_version() -> str | None:
+    """Query nvidia-smi for the driver version string (e.g. '590.48.01')."""
+    result = _run_silent([
+        "nvidia-smi",
+        "--query-gpu=driver_version",
+        "--format=csv,noheader",
+    ])
+    if result is None or result.returncode != 0:
+        return None
+    version = result.stdout.decode("utf-8", errors="replace").strip().splitlines()
+    return version[0].strip() if version else None
+
+
+def _driver_major(version: str) -> int | None:
+    """Parse the major version from a driver string (e.g. '590.48.01' → 590)."""
+    m = re.match(r"(\d+)", version)
+    return int(m.group(1)) if m else None
+
+
+def _best_cuda_for_driver(driver_major: int) -> tuple[str, str] | None:
+    """Return (cuda_version, cu_tag) for the highest CUDA supported by *driver_major*."""
+    for min_drv, cuda_ver, cu_tag in _DRIVER_CUDA_TABLE:
+        if driver_major >= min_drv:
+            return cuda_ver, cu_tag
+    return None
+
+
+def _torch_cuda_needs_driver(torch_cuda: str) -> int | None:
+    """Return the minimum driver major required for *torch_cuda* (e.g. '13.0' → 580)."""
+    return _CUDA_MIN_DRIVER.get(torch_cuda)
+
+
+def ensure_cuda_compatible_torch(
+    install_path: Path,
+    send_output: Callable[[str], None] | None = None,
+) -> bool:
+    """Check if the venv's torch CUDA build matches the host NVIDIA driver.
+
+    If the installed torch was built for a CUDA version that requires a newer
+    driver than the host has, reinstall torch/torchvision/torchaudio from the
+    appropriate PyTorch index URL.
+
+    Returns True if torch was swapped, False if no swap was needed.
+    """
+    install_path = Path(install_path)
+    venv = install_path / "ComfyUI" / ".venv"
+    if sys.platform == "win32":
+        venv_python = str(venv / "Scripts" / "python.exe")
+        venv_pip = str(venv / "Scripts" / "pip.exe")
+    else:
+        venv_python = str(venv / "bin" / "python3")
+        venv_pip = str(venv / "bin" / "pip")
+
+    if not Path(venv_python).exists():
+        if send_output:
+            send_output(f"Venv python not found at {venv_python}\n")
+        return False
+
+    # --- Detect host NVIDIA driver ---
+    driver_str = _detect_nvidia_driver_version()
+    if driver_str is None:
+        if send_output:
+            send_output("Could not detect NVIDIA driver version.\n")
+        return False
+
+    drv_major = _driver_major(driver_str)
+    if drv_major is None:
+        if send_output:
+            send_output(f"Could not parse driver version: {driver_str}\n")
+        return False
+
+    best = _best_cuda_for_driver(drv_major)
+    if best is None:
+        if send_output:
+            send_output(f"NVIDIA driver {driver_str} is too old (< 525). Cannot run CUDA torch.\n")
+        return False
+
+    best_cuda, best_tag = best
+    if send_output:
+        send_output(f"Detected NVIDIA driver: {driver_str} (max CUDA {best_cuda})\n")
+
+    # --- Detect torch's CUDA version ---
+    result = _run_silent(
+        [venv_python, "-c", "import torch; print(torch.version.cuda)"],
+        timeout=30,
+    )
+    if result is None or result.returncode != 0:
+        if send_output:
+            send_output("Could not detect torch CUDA version.\n")
+        return False
+
+    torch_cuda = result.stdout.decode("utf-8", errors="replace").strip()
+    if not torch_cuda or torch_cuda == "None":
+        if send_output:
+            send_output("Installed torch is CPU-only, skipping CUDA check.\n")
+        return False
+
+    # --- Check compatibility ---
+    needed_driver = _torch_cuda_needs_driver(torch_cuda)
+    if needed_driver is not None and drv_major >= needed_driver:
+        if send_output:
+            send_output(f"Installed torch uses CUDA {torch_cuda} — compatible ✓\n")
+        return False
+
+    if send_output:
+        send_output(
+            f"Installed torch uses CUDA {torch_cuda} — incompatible with driver {driver_str}\n"
+        )
+
+    # --- Reinstall with the best CUDA tag for this driver ---
+    if send_output:
+        send_output(f"Reinstalling PyTorch with CUDA {best_cuda}...\n")
+
+    index_url = f"https://download.pytorch.org/whl/{best_tag}"
+    reinstall = subprocess.run(
+        [
+            venv_pip, "install", "--force-reinstall",
+            "torch", "torchvision", "torchaudio",
+            "--index-url", index_url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+    )
+    if reinstall.returncode != 0:
+        if send_output:
+            send_output(f"Failed to reinstall torch: {reinstall.stderr or reinstall.stdout}\n")
+        return False
+
+    if send_output:
+        send_output(f"Successfully reinstalled torch with CUDA {best_cuda} ✓\n")
+    return True
 
 
 # ---------------------------------------------------------------------------

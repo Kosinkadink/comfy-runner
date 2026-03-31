@@ -4,6 +4,10 @@
 # network volume (/workspace).  comfy-runner is cloned from GitHub
 # at boot so the image rarely needs rebuilding.
 #
+# No CUDA toolkit is installed — PyTorch wheels bundle their own
+# CUDA runtime, so only the NVIDIA driver (provided by the host /
+# container runtime) is needed.
+#
 # Build:
 #   docker build -t ghcr.io/kosinkadink/comfy-runner:latest -f comfy_runner/hosted/Dockerfile .
 #
@@ -22,8 +26,6 @@ ENV NVIDIA_DISABLE_REQUIRE=true
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
-ARG CUDA_VERSION_DASH=13-0
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
@@ -33,18 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-venv \
         python3-pip \
         ca-certificates \
-        gnupg \
         p7zip-full \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
-
-# Install CUDA minimal toolkit from NVIDIA APT repo
-RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-    && dpkg -i cuda-keyring_1.1-1_all.deb \
-    && rm cuda-keyring_1.1-1_all.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends cuda-minimal-build-${CUDA_VERSION_DASH} \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy startup script
 COPY comfy_runner/hosted/startup.sh /opt/startup.sh
