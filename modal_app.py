@@ -16,7 +16,7 @@ Usage:
 Environment variables:
     GPU         GPU type (default: L40S). Options: T4, L4, A10, L40S,
                 A100, A100-80GB, H100, H200, B200
-    KEEP_WARM   Number of containers to keep warm (default: 0)
+    MIN_CONTAINERS  Minimum containers to keep warm (default: 0)
 """
 
 from __future__ import annotations
@@ -31,11 +31,11 @@ import modal
 # ---------------------------------------------------------------------------
 
 GPU_TYPE = os.environ.get("GPU", "L40S")
-KEEP_WARM = int(os.environ.get("KEEP_WARM", "0"))
+KEEP_WARM = int(os.environ.get("MIN_CONTAINERS", "0"))
 
-COMFY_RUNNER_REPO = "https://github.com/Kosinkadink/comfy-runner.git"
-COMFY_RUNNER_BRANCH = "main"
 COMFY_RUNNER_PATH = "/opt/comfy-runner"
+# Mount local source into the image (works for private repos without auth)
+LOCAL_SOURCE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/data"
 SERVER_PORT = 9189
 
@@ -57,10 +57,8 @@ image = (
         "pciutils",         # lspci for GPU detection
         "procps",           # ps, etc.
     )
-    .run_commands(
-        f"git clone --branch {COMFY_RUNNER_BRANCH} {COMFY_RUNNER_REPO} {COMFY_RUNNER_PATH}",
-    )
-    .pip_install_from_requirements(f"{COMFY_RUNNER_PATH}/requirements.txt")
+    .add_local_dir(LOCAL_SOURCE, COMFY_RUNNER_PATH, copy=True, ignore=["__pycache__", ".venv", ".git", "*.pyc"])
+    .pip_install("requests", "py7zr", "multivolumefile", "rich", "flask", "waitress")
     # Set COMFY_RUNNER_HOME early so config.py picks it up at import time
     .env({"COMFY_RUNNER_HOME": f"{DATA_DIR}/.comfy-runner"})
 )
@@ -76,9 +74,9 @@ app = modal.App("comfy-runner", image=image)
     gpu=GPU_TYPE,
     volumes={DATA_DIR: volume},
     timeout=86400,          # 24h — long-running server
-    keep_warm=KEEP_WARM,
-    allow_concurrent_inputs=16,
+    min_containers=KEEP_WARM,
 )
+@modal.concurrent(max_inputs=16)
 class ComfyRunnerServer:
     """Runs comfy-runner server inside a Modal container."""
 
