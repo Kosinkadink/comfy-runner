@@ -42,9 +42,22 @@ def set_tunnels_enabled(enabled: bool) -> None:
 # Output collector — captures send_output calls into a list
 # ---------------------------------------------------------------------------
 
-def _make_collector() -> tuple[Callable[[str], None], list[str]]:
-    """Return (send_output, lines) — thread-safe output collector."""
-    lines: list[str] = []
+def _make_collector(
+    job_id: str | None = None,
+) -> tuple[Callable[[str], None], list[str]]:
+    """Return (send_output, lines) — thread-safe output collector.
+
+    If *job_id* is given, output is written directly to the job's
+    ``output`` list so callers can poll progress in real time.
+    """
+    if job_id is not None:
+        job = _jobs.get(job_id)
+        if job:
+            lines = job["output"]
+        else:
+            lines = []
+    else:
+        lines = []
     lock = threading.Lock()
 
     def collect(text: str) -> None:
@@ -430,7 +443,7 @@ def create_app() -> Any:
             from comfy_runner.pip_utils import install_filtered_requirements
             from comfy_runner.process import get_status, start_installation, stop_installation
 
-            out, lines = _make_collector()
+            out, lines = _make_collector(job_id)
             lock = _get_install_lock(name)
             if not lock.acquire(timeout=5):
                 _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
@@ -557,7 +570,7 @@ def create_app() -> Any:
             from comfy_runner.config import get_installation
             from comfy_runner.process import get_status, start_installation, stop_installation
 
-            out, lines = _make_collector()
+            out, lines = _make_collector(job_id)
             lock = _get_install_lock(name)
             if not lock.acquire(timeout=5):
                 _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
@@ -742,7 +755,7 @@ def create_app() -> Any:
 
             def _run() -> None:
                 from comfy_runner.nodes import add_cnr_node, add_git_node
-                out, lines = _make_collector()
+                out, lines = _make_collector(job_id)
                 lock = _get_install_lock(name)
                 if not lock.acquire(timeout=5):
                     _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
@@ -769,7 +782,7 @@ def create_app() -> Any:
 
             def _run() -> None:
                 from comfy_runner.nodes import remove_node
-                out, lines = _make_collector()
+                out, lines = _make_collector(job_id)
                 lock = _get_install_lock(name)
                 if not lock.acquire(timeout=5):
                     _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
@@ -1029,7 +1042,7 @@ def create_app() -> Any:
             from comfy_runner.process import get_status, stop_installation
             from comfy_runner.snapshot import resolve_snapshot_id, restore_snapshot
 
-            out, lines = _make_collector()
+            out, lines = _make_collector(job_id)
             lock = _get_install_lock(name)
             if not lock.acquire(timeout=5):
                 _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
@@ -1107,7 +1120,7 @@ def create_app() -> Any:
                 from comfy_runner.process import get_status, stop_installation
                 from comfy_runner.snapshot import resolve_snapshot_id, restore_snapshot
 
-                out, lines = _make_collector()
+                out, lines = _make_collector(job_id)
                 lock = _get_install_lock(name)
                 if not lock.acquire(timeout=5):
                     _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
@@ -1196,7 +1209,7 @@ def create_app() -> Any:
         cancel_event = _jobs.get_cancel_event(job_id)
 
         def _run() -> None:
-            out, lines = _make_collector()
+            out, lines = _make_collector(job_id)
             try:
                 dl_result = download_models(
                     missing, models_dir, send_output=out,
@@ -1260,7 +1273,7 @@ def create_app() -> Any:
         job_id = _jobs.create(label=f"workflow-models {name}")
 
         def _run() -> None:
-            out, lines = _make_collector()
+            out, lines = _make_collector(job_id)
             cancel_event = _jobs.get_cancel_event(job_id)
             try:
                 dl_result = download_models(
