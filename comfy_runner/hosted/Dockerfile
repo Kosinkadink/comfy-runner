@@ -22,7 +22,7 @@ ENV NVIDIA_DISABLE_REQUIRE=true
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
-ARG CUDA_VERSION_DASH=12-8
+ARG CUDA_VERSION_DASH=13-0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
