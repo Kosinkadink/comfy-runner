@@ -89,6 +89,15 @@ class ComfyRunnerServer:
         if COMFY_RUNNER_PATH not in sys.path:
             sys.path.insert(0, COMFY_RUNNER_PATH)
 
+        # Ensure ComfyUI listens on all interfaces (needed for tunnel).
+        # Patch any existing installation records to include --listen 0.0.0.0.
+        from comfy_runner.config import list_installations, set_installation
+        for inst_name, record in list_installations().items():
+            args = record.get("launch_args", "")
+            if "--listen" not in args:
+                record["launch_args"] = f"{args} --listen 0.0.0.0".strip()
+                set_installation(inst_name, record)
+
         # Open a persistent tunnel to ComfyUI's port (8188).
         # The tunnel stays open for the container's lifetime.
         self._tunnel_ctx = modal.forward(8188)
