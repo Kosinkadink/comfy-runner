@@ -247,6 +247,8 @@ comfy_runner.py hosted logs my-comfy
 
 The pod runs a thin Docker image (`ghcr.io/kosinkadink/comfy-runner:latest`) that clones comfy-runner from GitHub on boot and starts the comfy-runner HTTP server on port 9189. Everything else (init, deploy, start ComfyUI, etc.) is driven by API requests to that server — the same API used for local installations.
 
+**Persistent storage:** When a network volume is mounted at `/workspace`, the startup script automatically sets `COMFY_RUNNER_HOME=/workspace/.comfy-runner`. This stores all config, installations, and download cache on the volume so they survive pod stop/restart/terminate. Without a volume, data lives on the container disk and is lost when the pod is stopped or terminated.
+
 **CUDA compatibility:** The standalone environment bundles PyTorch built for CUDA 13.0, which requires NVIDIA driver ≥ 580. Many cloud hosts have older drivers. Pass `--cuda-compat` to `init` (or `"cuda_compat": true` in the deploy API) to auto-detect the host driver and reinstall PyTorch with a compatible CUDA version. Pod creation filters for hosts with CUDA ≥ 12.4 by default (override with `--cuda-versions`).
 
 The hosted module lives under `comfy_runner/hosted/` and provides:

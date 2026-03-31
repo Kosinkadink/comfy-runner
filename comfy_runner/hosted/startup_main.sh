@@ -16,6 +16,15 @@ SERVER_PORT="${COMFY_RUNNER_PORT:-9189}"
 
 log() { echo "[comfy-runner] $(date '+%H:%M:%S') $*"; }
 
+# ── 0. Use persistent storage if a volume is mounted ─────────────────
+# If /workspace exists and is writable, store config, installations,
+# and download cache there so they survive pod stop/restart/terminate.
+
+if [ -z "${COMFY_RUNNER_HOME:-}" ] && [ -d "/workspace" ] && [ -w "/workspace" ]; then
+    export COMFY_RUNNER_HOME="/workspace/.comfy-runner"
+    log "Using persistent storage: ${COMFY_RUNNER_HOME}"
+fi
+
 # ── 1. Ensure native 7z is available (fast extraction) ───────────────
 
 if ! command -v 7z &>/dev/null; then
