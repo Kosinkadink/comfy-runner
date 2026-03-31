@@ -87,7 +87,7 @@ class RunPodProvider:
             "gpuTypeIds": [gpu_type or self.default_gpu],
             "imageName": image or self.default_image,
             "ports": ports or DEFAULT_PORTS,
-            "containerDiskInGb": 20,
+            "containerDiskInGb": 50,
             "volumeMountPath": "/workspace",
             "cloudType": cloud_type or self.default_cloud_type,
         }
