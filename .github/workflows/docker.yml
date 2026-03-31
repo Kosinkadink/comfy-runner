@@ -30,11 +30,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build & push CUDA 12.8 (default)
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: comfy_runner/hosted/Dockerfile
           push: true
+          build-args: CUDA_VERSION_DASH=12-8
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda12.8
+
+      - name: Build & push CUDA 13.0 (Blackwell/5090)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: comfy_runner/hosted/Dockerfile
+          push: true
+          build-args: CUDA_VERSION_DASH=13-0
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda13.0
