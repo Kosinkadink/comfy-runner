@@ -1520,7 +1520,7 @@ def _hosted_config(args: argparse.Namespace) -> None:
             print(json.dumps({"ok": True}))
         else:
             # Redact sensitive values
-            display = "***" if any(s in config_key for s in ("key", "secret", "token")) else value
+            display = "***" if any(s in config_key.lower() for s in _SENSITIVE_SUBSTRINGS) else value
             console.print(f"Set [cyan]{provider}[/cyan].[cyan]{config_key}[/cyan] = {display}")
     else:
         args._parser_hosted_config.print_help()

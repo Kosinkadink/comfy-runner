@@ -59,7 +59,7 @@ class RunPodAPI:
 
         raise RuntimeError(
             f"RunPod API error {resp.status_code} on {method} {path}: "
-            f"{resp.text}"
+            f"{resp.text[:500]}"
         )
 
     # ------------------------------------------------------------------
