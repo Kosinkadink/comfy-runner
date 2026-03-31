@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         ca-certificates \
         gnupg \
+        p7zip-full \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
