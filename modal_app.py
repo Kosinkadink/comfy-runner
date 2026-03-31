@@ -76,6 +76,7 @@ app = modal.App("comfy-runner", image=image)
     gpu=GPU_TYPE,
     volumes={DATA_DIR: volume},
     timeout=86400,          # 24h — long-running server
+    scaledown_window=1200,  # 20 min — keep alive during long ComfyUI boots
     min_containers=KEEP_WARM,
 )
 @modal.concurrent(max_inputs=16)
@@ -109,69 +110,30 @@ class ComfyRunnerServer:
     volumes={DATA_DIR: volume},
     timeout=1800,       # 30 min max
 )
-def prefetch():
-    """Download and extract the standalone environment into the volume."""
+def prefetch(name: str = "default"):
+    """Pre-initialize a ComfyUI installation into the volume.
+
+    Runs the full init_installation (download, extract, clone, venv)
+    on a cheap CPU container so the first GPU deploy only needs to
+    checkout a branch and start ComfyUI (~1 min instead of ~7 min).
+    """
     if COMFY_RUNNER_PATH not in sys.path:
         sys.path.insert(0, COMFY_RUNNER_PATH)
 
-    from comfy_runner.environment import (
-        fetch_latest_release,
-        fetch_manifests,
-        pick_variant,
-    )
+    from comfy_runner.config import get_installation
+    from comfy_runner.installations import init_installation
 
     def _log(msg):
         print(msg, end="", flush=True)
 
-    _log("Fetching latest release...\n")
-    release = fetch_latest_release()
-    tag = release.get("tag_name", "?")
-    _log(f"Release: {tag}\n")
+    existing = get_installation(name)
+    if existing:
+        _log(f"Installation '{name}' already exists at {existing['path']}.\n")
+        _log("Skipping prefetch (delete the installation first to re-init).\n")
+        return
 
-    manifests = fetch_manifests(release)
-    variant = pick_variant(manifests, release, variant_id="linux-nvidia")
-    manifest = variant["manifest"]
-    cache_key = f"{tag}_{manifest['id']}"
+    _log(f"Initializing installation '{name}' (this may take a few minutes)...\n\n")
+    init_installation(name=name, send_output=_log)
 
-    _log(f"Variant: {manifest['id']}\n")
-    _log(f"ComfyUI ref: {manifest.get('comfyui_ref', '?')}\n")
-
-    download_files = variant["download_files"]
-    total_mb = sum(f.get("size", 0) for f in download_files) / 1048576
-    _log(f"Download size: {total_mb:.0f} MB\n\n")
-
-    # Download archives to cache (volume-backed) without extracting.
-    # The real init_installation will find them cached and only extract.
-    from comfy_runner import cache as download_cache
-    from comfy_runner.environment import _is_download_complete, _download_file_resumable
-    import time as _time
-
-    cache_dir = download_cache.get_cache_path(cache_key)
-    total_bytes = sum(f.get("size", 0) for f in download_files)
-    completed_bytes = 0
-    overall_start = _time.monotonic()
-
-    for i, finfo in enumerate(download_files, 1):
-        filename = finfo["filename"]
-        expected_size = finfo.get("size", 0)
-        file_path = cache_dir / filename
-        label = f" ({i}/{len(download_files)})" if len(download_files) > 1 else ""
-
-        if _is_download_complete(file_path, expected_size):
-            completed_bytes += expected_size
-            _log(f"Already cached: {filename}{label}\n")
-        else:
-            size_mb = expected_size / 1048576 if expected_size else 0
-            _log(f"Downloading {filename}{label} ({size_mb:.0f} MB)...\n")
-            _download_file_resumable(
-                finfo["url"], file_path, expected_size,
-                base_completed=completed_bytes,
-                total_bytes=total_bytes,
-                overall_start=overall_start,
-                send_output=_log,
-            )
-            completed_bytes += expected_size
-
-    download_cache.touch(cache_key)
-    _log("\nPrefetch complete. Archives cached in volume.\n")
+    _log("\nPrefetch complete. Installation ready in volume.\n")
     volume.commit()
