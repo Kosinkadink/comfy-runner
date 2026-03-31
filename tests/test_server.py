@@ -232,6 +232,27 @@ class TestFlaskApp:
         assert data["ok"] is False
         assert "not found" in data["error"].lower()
 
+    def test_get_system_info(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "comfy_runner.system_info.detect_gpu", lambda: "cpu"
+        )
+        monkeypatch.setattr(
+            "comfy_runner.system_info._get_gpus", lambda: []
+        )
+        monkeypatch.setattr(
+            "comfy_runner.system_info._get_nvidia_driver_version", lambda: None
+        )
+        resp = client.get("/system-info")
+        data = resp.get_json()
+        assert resp.status_code == 200
+        assert data["ok"] is True
+        assert "system_info" in data
+        si = data["system_info"]
+        assert "gpu_vendor" in si
+        assert "cpu_model" in si
+        assert "total_memory_gb" in si
+        assert "disk_free_gb" in si
+
     def test_unknown_route_returns_json_not_html(self, client):
         resp = client.get("/this/route/does/not/exist")
         assert resp.status_code == 404

@@ -1288,6 +1288,65 @@ def cmd_info(args: argparse.Namespace) -> None:
     console.print(table)
 
 
+def cmd_sysinfo(args: argparse.Namespace) -> None:
+    """Show system hardware information."""
+    from comfy_runner.system_info import get_system_info
+
+    try:
+        info = get_system_info()
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps({"ok": True, "system_info": info}, indent=2))
+        return
+
+    table = Table(title="System Information")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+
+    # GPU
+    gpu_label = info.get("gpu_label") or "None (CPU only)"
+    table.add_row("GPU Vendor", gpu_label)
+    for i, gpu in enumerate(info.get("gpus", [])):
+        vram = f"{gpu['vram_mb']} MB" if gpu.get("vram_mb") else "unknown"
+        driver = gpu.get("driver_version") or ""
+        table.add_row(f"  GPU {i}", f"{gpu.get('model', '?')}  ({vram})" + (f"  driver {driver}" if driver else ""))
+    if info.get("nvidia_driver_version"):
+        supported = info.get("nvidia_driver_supported")
+        icon = "✓" if supported else "✗"
+        table.add_row("NVIDIA Driver", f"{info['nvidia_driver_version']}  {icon} {'supported' if supported else 'unsupported (need ≥580)'}")
+
+    # CPU
+    table.add_row("CPU", info.get("cpu_model", "Unknown"))
+    cores = f"{info.get('cpu_cores', '?')} logical"
+    if info.get("cpu_physical_cores"):
+        cores += f", {info['cpu_physical_cores']} physical"
+    if info.get("cpu_speed_ghz"):
+        cores += f", {info['cpu_speed_ghz']} GHz"
+    table.add_row("  Cores", cores)
+
+    # Memory
+    table.add_row("RAM", f"{info.get('total_memory_gb', '?')} GB")
+
+    # OS
+    distro = info.get("os_distro") or info.get("platform", "?")
+    table.add_row("OS", f"{distro}  ({info.get('arch', '?')})")
+    table.add_row("Kernel", info.get("os_version", "?"))
+
+    # Disk
+    table.add_row("Disk", f"{info.get('disk_free_gb', '?')} GB free / {info.get('disk_total_gb', '?')} GB total")
+
+    # Installations
+    table.add_row("Installations", str(info.get("installation_count", 0)))
+
+    console.print(table)
+
+
 def cmd_set(args: argparse.Namespace) -> None:
     """Set a configuration value on an installation."""
     from comfy_runner.config import get_installation, set_installation
@@ -1486,6 +1545,10 @@ def main(argv: list[str] | None = None) -> None:
     p_info = sub.add_parser("info", help="Show detailed info about an installation")
     p_info.add_argument("name", nargs="?", default="main", help="Installation name (default: main)")
     p_info.set_defaults(func=cmd_info)
+
+    # sysinfo
+    p_sysinfo = sub.add_parser("sysinfo", help="Show system hardware information")
+    p_sysinfo.set_defaults(func=cmd_sysinfo)
 
     # set
     p_set = sub.add_parser("set", help="Set a config value on an installation (e.g. launch_args)")
