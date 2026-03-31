@@ -1750,6 +1750,7 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 datacenter=args.region,
                 cloud_type=args.cloud_type,
                 allowed_cuda_versions=cuda_versions,
+                gpu_count=getattr(args, "gpu_count", 1) or 1,
             )
             # Save pod record for tracking
             from comfy_runner.hosted.config import set_pod_record
@@ -2506,6 +2507,8 @@ def main(argv: list[str] | None = None) -> None:
     p_hp_create.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
     p_hp_create.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
                              help="Cloud type (default: from config)")
+    p_hp_create.add_argument("--gpu-count", type=int, default=1,
+                             help="Number of GPUs (default: 1)")
     p_hp_create.add_argument("--cuda-versions",
                              help="Comma-separated CUDA versions to allow (default: 12.4,12.6,12.8,13.0)")
 

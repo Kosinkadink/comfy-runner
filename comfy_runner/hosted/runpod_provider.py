@@ -80,11 +80,13 @@ class RunPodProvider:
         datacenter: str | None = None,
         cloud_type: str | None = None,
         allowed_cuda_versions: list[str] | None = None,
+        gpu_count: int = 1,
     ) -> PodInfo:
         """Create a pod with sensible defaults from config."""
         params: dict[str, Any] = {
             "name": name,
             "gpuTypeIds": [gpu_type or self.default_gpu],
+            "gpuCount": gpu_count,
             "imageName": image or self.default_image,
             "ports": ports or DEFAULT_PORTS,
             "containerDiskInGb": 50,
