@@ -333,6 +333,18 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # GET /system-info — hardware and system information
+    # ------------------------------------------------------------------
+    @app.route("/system-info", methods=["GET"])
+    def route_system_info() -> Any:
+        from comfy_runner.system_info import get_system_info
+        try:
+            info = get_system_info()
+            return jsonify({"ok": True, "system_info": info})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # GET /status — aggregate status (all installations)
     # ------------------------------------------------------------------
     @app.route("/status", methods=["GET"])
