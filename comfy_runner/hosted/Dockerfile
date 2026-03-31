@@ -12,7 +12,7 @@
 #   2. Create venv + install requirements
 #   3. Start comfy-runner server on 0.0.0.0:9189
 
-FROM runpod/ubuntu:24.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -20,10 +20,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
         wget \
+        openssh-server \
         python3 \
         python3-venv \
         python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
 
 # Copy startup script
 COPY comfy_runner/hosted/startup.sh /opt/startup.sh
