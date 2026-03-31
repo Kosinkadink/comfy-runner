@@ -475,6 +475,13 @@ def create_app() -> Any:
                     if not rec:
                         _jobs.fail(job_id, "Installation record missing after init", lines)
                         return
+                    # Ensure ComfyUI listens on all interfaces so the
+                    # RunPod proxy (and any other external client) can
+                    # reach it.
+                    existing_args = rec.get("launch_args", "") or ""
+                    if "--listen" not in existing_args:
+                        rec["launch_args"] = f"--listen 0.0.0.0 {existing_args}".strip()
+                        set_installation(name, rec)
                     out(f"\n{'='*50}\nProceeding with deploy...\n{'='*50}\n\n")
 
                 install_path = rec["path"]
