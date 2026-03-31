@@ -85,9 +85,24 @@ class ComfyRunnerServer:
 
     @modal.enter()
     def startup(self):
-        """Add comfy-runner to sys.path so imports work."""
+        """Add comfy-runner to sys.path and open a tunnel to ComfyUI."""
         if COMFY_RUNNER_PATH not in sys.path:
             sys.path.insert(0, COMFY_RUNNER_PATH)
+
+        # Open a persistent tunnel to ComfyUI's port (8188).
+        # The tunnel stays open for the container's lifetime.
+        self._tunnel_ctx = modal.forward(8188)
+        tunnel = self._tunnel_ctx.__enter__()
+        self._comfyui_tunnel_url = tunnel.url
+        # Store in env so the Flask app can read it
+        os.environ["COMFYUI_TUNNEL_URL"] = tunnel.url
+        print(f"ComfyUI tunnel: {tunnel.url}")
+
+    @modal.exit()
+    def shutdown(self):
+        """Clean up the tunnel."""
+        if hasattr(self, "_tunnel_ctx"):
+            self._tunnel_ctx.__exit__(None, None, None)
 
     @modal.wsgi_app(requires_proxy_auth=True)
     def serve(self):

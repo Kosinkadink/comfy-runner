@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -472,6 +473,10 @@ def create_app() -> Any:
             tunnel_url = get_tunnel_url(name)
             if tunnel_url:
                 status["tunnel_url"] = tunnel_url
+            # Modal tunnel (set via COMFYUI_TUNNEL_URL env var)
+            modal_tunnel = os.environ.get("COMFYUI_TUNNEL_URL")
+            if modal_tunnel and not tunnel_url:
+                status["tunnel_url"] = modal_tunnel
             return jsonify({"ok": True, **status})
         except Exception as e:
             return _err(str(e))
