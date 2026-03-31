@@ -59,5 +59,5 @@ log "Installing requirements..."
 
 log "Starting comfy-runner server on ${SERVER_HOST}:${SERVER_PORT}..."
 exec "${VENV_DIR}/bin/python" -m comfy_runner_server \
-    --listen "${SERVER_HOST}" \
+    --host "${SERVER_HOST}" \
     --port "${SERVER_PORT}"
