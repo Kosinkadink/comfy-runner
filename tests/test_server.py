@@ -239,9 +239,6 @@ class TestFlaskApp:
         monkeypatch.setattr(
             "comfy_runner.system_info._get_gpus", lambda: []
         )
-        monkeypatch.setattr(
-            "comfy_runner.system_info._get_nvidia_driver_version", lambda: None
-        )
         resp = client.get("/system-info")
         data = resp.get_json()
         assert resp.status_code == 200

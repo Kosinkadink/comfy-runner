@@ -13,7 +13,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from .config import get_installations_dir, list_installations
 from .environment import _run_silent, detect_gpu
@@ -21,6 +21,48 @@ from .environment import _run_silent, detect_gpu
 # Paths that can be monkeypatched in tests
 _PROC_CPUINFO = "/proc/cpuinfo"
 _PROC_MEMINFO = "/proc/meminfo"
+
+# ---------------------------------------------------------------------------
+# Type definitions — match Desktop 2.0's SystemInfo / SystemGpuInfo
+# ---------------------------------------------------------------------------
+
+
+class GpuInfo(TypedDict):
+    vendor: str
+    model: str
+    vram_mb: int | None
+    driver_version: str | None
+
+
+class InstallationInfo(TypedDict):
+    name: str
+    variant: str
+    status: str
+    release_tag: str
+
+
+class SystemInfo(TypedDict):
+    gpu_vendor: str | None
+    gpu_label: str | None
+    gpus: list[GpuInfo]
+    nvidia_driver_version: str | None
+    nvidia_driver_supported: bool | None
+    platform: str
+    arch: str
+    os_version: str
+    os_distro: str | None
+    os_release: str | None
+    total_memory_gb: int
+    cpu_model: str
+    cpu_cores: int
+    cpu_physical_cores: int | None
+    cpu_speed_ghz: float | None
+    cpu_manufacturer: str | None
+    disk_free_gb: float
+    disk_total_gb: float
+    installation_count: int
+    installations: list[InstallationInfo]
+
 
 # ---------------------------------------------------------------------------
 # GPU label mapping
@@ -38,7 +80,7 @@ _GPU_LABEL: dict[str, str] = {
 # GPU detail collection
 # ---------------------------------------------------------------------------
 
-def _get_nvidia_gpus() -> list[dict[str, Any]]:
+def _get_nvidia_gpus() -> list[GpuInfo]:
     """Query nvidia-smi for per-GPU name, VRAM, and driver version."""
     result = _run_silent([
         "nvidia-smi",
@@ -47,7 +89,7 @@ def _get_nvidia_gpus() -> list[dict[str, Any]]:
     ])
     if result is None or result.returncode != 0:
         return []
-    gpus: list[dict[str, Any]] = []
+    gpus: list[GpuInfo] = []
     for line in result.stdout.decode("utf-8", errors="replace").splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 3:
@@ -65,19 +107,8 @@ def _get_nvidia_gpus() -> list[dict[str, Any]]:
     return gpus
 
 
-def _get_nvidia_driver_version() -> str | None:
-    """Return the NVIDIA driver version string, or None."""
-    result = _run_silent([
-        "nvidia-smi",
-        "--query-gpu=driver_version",
-        "--format=csv,noheader",
-    ])
-    if result is not None and result.returncode == 0:
-        ver = result.stdout.decode("utf-8", errors="replace").strip().splitlines()
-        if ver and ver[0].strip():
-            return ver[0].strip()
-
-    # Fallback: parse plain nvidia-smi banner
+def _get_nvidia_driver_version_from_banner() -> str | None:
+    """Fallback: parse driver version from plain nvidia-smi banner output."""
     result = _run_silent(["nvidia-smi"])
     if result is not None and result.returncode == 0:
         stdout = result.stdout.decode("utf-8", errors="replace")
@@ -97,26 +128,23 @@ def _is_nvidia_driver_supported(version: str | None) -> bool | None:
     return int(m.group(1)) >= 580
 
 
-def _get_linux_gpus_lspci() -> list[dict[str, Any]]:
+def _get_linux_gpus_lspci() -> list[GpuInfo]:
     """Parse ``lspci -vmm`` for VGA / 3D / Display controller stanzas."""
     result = _run_silent(["lspci", "-vmm"])
     if result is None or result.returncode != 0:
         return []
     stdout = result.stdout.decode("utf-8", errors="replace")
-    gpus: list[dict[str, Any]] = []
+    gpus: list[GpuInfo] = []
     stanza: dict[str, str] = {}
-    for line in stdout.splitlines():
+    for line in stdout.splitlines() + [""]:
         line = line.strip()
         if not line:
-            # End of stanza
             cls = stanza.get("Class", "")
             if any(kw in cls for kw in ("VGA", "3D", "Display")):
                 vendor_str = stanza.get("Vendor", stanza.get("SVendor", ""))
-                model_str = stanza.get("Device", "Unknown")
-                vendor = _map_vendor(vendor_str)
                 gpus.append({
-                    "vendor": vendor,
-                    "model": model_str,
+                    "vendor": _map_vendor(vendor_str),
+                    "model": stanza.get("Device", "Unknown"),
                     "vram_mb": None,
                     "driver_version": None,
                 })
@@ -125,19 +153,6 @@ def _get_linux_gpus_lspci() -> list[dict[str, Any]]:
         if ":" in line:
             key, _, val = line.partition(":")
             stanza[key.strip()] = val.strip()
-    # Handle last stanza if file doesn't end with blank line
-    if stanza:
-        cls = stanza.get("Class", "")
-        if any(kw in cls for kw in ("VGA", "3D", "Display")):
-            vendor_str = stanza.get("Vendor", stanza.get("SVendor", ""))
-            model_str = stanza.get("Device", "Unknown")
-            vendor = _map_vendor(vendor_str)
-            gpus.append({
-                "vendor": vendor,
-                "model": model_str,
-                "vram_mb": None,
-                "driver_version": None,
-            })
     return gpus
 
 
@@ -153,7 +168,7 @@ def _map_vendor(vendor_str: str) -> str:
     return vendor_str
 
 
-def _get_gpus() -> list[dict[str, Any]]:
+def _get_gpus() -> list[GpuInfo]:
     """Collect GPU info from nvidia-smi and (on Linux) lspci, deduplicated.
 
     nvidia-smi provides richer data (VRAM, driver) so its entries take priority.
@@ -383,7 +398,7 @@ def _get_disk_info(path: str | Path | None = None) -> dict[str, float]:
             "free_gb": round(usage.free / (1024 ** 3), 1),
             "total_gb": round(usage.total / (1024 ** 3), 1),
         }
-    except (OSError, ValueError):
+    except Exception:
         return {"free_gb": 0.0, "total_gb": 0.0}
 
 
@@ -391,7 +406,7 @@ def _get_disk_info(path: str | Path | None = None) -> dict[str, float]:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def get_system_info() -> dict[str, Any]:
+def get_system_info() -> SystemInfo:
     """Collect full system info matching Desktop 2.0's SystemInfo shape.
 
     Returns a dict with GPU, CPU, OS, memory, disk, and installation details.
@@ -404,7 +419,13 @@ def get_system_info() -> dict[str, Any]:
 
     gpus = _get_gpus()
 
-    nvidia_driver = _get_nvidia_driver_version()
+    # Extract driver version from nvidia-smi GPU data (already fetched);
+    # fall back to parsing the nvidia-smi banner only if gpus is empty.
+    nvidia_driver: str | None = None
+    if gpus:
+        nvidia_driver = gpus[0].get("driver_version")
+    if nvidia_driver is None and gpu_vendor == "nvidia":
+        nvidia_driver = _get_nvidia_driver_version_from_banner()
     nvidia_supported = _is_nvidia_driver_supported(nvidia_driver)
 
     os_info = _get_os_info()
@@ -418,7 +439,7 @@ def get_system_info() -> dict[str, Any]:
     except Exception:
         raw_installs = {}
 
-    installations: list[dict[str, str]] = []
+    installations: list[InstallationInfo] = []
     for name, rec in raw_installs.items():
         installations.append({
             "name": name,

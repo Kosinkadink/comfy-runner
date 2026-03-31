@@ -11,7 +11,7 @@ from comfy_runner.system_info import (
     _get_cpu_info,
     _get_disk_info,
     _get_linux_gpus_lspci,
-    _get_nvidia_driver_version,
+    _get_nvidia_driver_version_from_banner,
     _get_nvidia_gpus,
     _get_os_info,
     _get_total_memory_gb,
@@ -35,20 +35,25 @@ def _fake_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProces
 # _get_nvidia_driver_version
 # ---------------------------------------------------------------------------
 
-class TestGetNvidiaDriverVersion:
-    def test_parses_csv_output(self, monkeypatch):
+class TestGetNvidiaDriverVersionFromBanner:
+    def test_parses_banner_output(self, monkeypatch):
+        banner = (
+            "+-----+\n"
+            "| NVIDIA-SMI 580.126.09    Driver Version: 580.126.09 |\n"
+            "+-----+\n"
+        )
         monkeypatch.setattr(
             "comfy_runner.system_info._run_silent",
-            lambda *a, **kw: _fake_result("560.94\n"),
+            lambda *a, **kw: _fake_result(banner),
         )
-        assert _get_nvidia_driver_version() == "560.94"
+        assert _get_nvidia_driver_version_from_banner() == "580.126.09"
 
     def test_returns_none_on_failure(self, monkeypatch):
         monkeypatch.setattr(
             "comfy_runner.system_info._run_silent",
             lambda *a, **kw: None,
         )
-        assert _get_nvidia_driver_version() is None
+        assert _get_nvidia_driver_version_from_banner() is None
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +77,35 @@ class TestIsNvidiaDriverSupported:
 # ---------------------------------------------------------------------------
 # _get_nvidia_gpus
 # ---------------------------------------------------------------------------
+
+class TestDriverVersionExtraction:
+    """Driver version is extracted from _get_nvidia_gpus results, not a separate call."""
+
+    def test_extracted_from_gpus(self, monkeypatch, tmp_config_dir):
+        monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "nvidia")
+        monkeypatch.setattr(
+            "comfy_runner.system_info._get_gpus",
+            lambda: [{"vendor": "NVIDIA", "model": "RTX 4090", "vram_mb": 24564, "driver_version": "590.10"}],
+        )
+        info = get_system_info()
+        assert info["nvidia_driver_version"] == "590.10"
+
+    def test_falls_back_to_banner_when_gpus_empty(self, monkeypatch, tmp_config_dir):
+        monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "nvidia")
+        monkeypatch.setattr("comfy_runner.system_info._get_gpus", lambda: [])
+        monkeypatch.setattr(
+            "comfy_runner.system_info._get_nvidia_driver_version_from_banner",
+            lambda: "580.00",
+        )
+        info = get_system_info()
+        assert info["nvidia_driver_version"] == "580.00"
+
+    def test_none_when_no_nvidia(self, monkeypatch, tmp_config_dir):
+        monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "amd")
+        monkeypatch.setattr("comfy_runner.system_info._get_gpus", lambda: [])
+        info = get_system_info()
+        assert info["nvidia_driver_version"] is None
+
 
 class TestGetNvidiaGpus:
     def test_parses_multi_line_csv(self, monkeypatch):
@@ -192,10 +226,9 @@ class TestGetSystemInfo:
         monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "nvidia")
         monkeypatch.setattr(
             "comfy_runner.system_info._get_nvidia_gpus",
-            lambda: [{"vendor": "NVIDIA", "model": "RTX 4090", "vram_mb": 24564, "driver_version": "560.94"}],
+            lambda: [{"vendor": "NVIDIA", "model": "RTX 4090", "vram_mb": 24564, "driver_version": "590.10"}],
         )
         monkeypatch.setattr("comfy_runner.system_info._get_linux_gpus_lspci", lambda: [])
-        monkeypatch.setattr("comfy_runner.system_info._get_nvidia_driver_version", lambda: "590.10")
 
         info = get_system_info()
 
@@ -213,6 +246,7 @@ class TestGetSystemInfo:
         assert info["gpu_vendor"] == "nvidia"
         assert info["gpu_label"] == "NVIDIA"
         assert len(info["gpus"]) >= 1
+        # Driver version extracted from GPU data, not a separate nvidia-smi call
         assert info["nvidia_driver_version"] == "590.10"
         assert info["nvidia_driver_supported"] is True
 
@@ -225,7 +259,6 @@ class TestGpuLabelMapping:
     def test_cpu_maps_to_none(self, monkeypatch, tmp_config_dir):
         monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "cpu")
         monkeypatch.setattr("comfy_runner.system_info._get_gpus", lambda: [])
-        monkeypatch.setattr("comfy_runner.system_info._get_nvidia_driver_version", lambda: None)
 
         info = get_system_info()
         assert info["gpu_vendor"] is None
@@ -235,9 +268,8 @@ class TestGpuLabelMapping:
         monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "nvidia")
         monkeypatch.setattr(
             "comfy_runner.system_info._get_gpus",
-            lambda: [{"vendor": "NVIDIA", "model": "RTX 4090", "vram_mb": 24564, "driver_version": "560.94"}],
+            lambda: [{"vendor": "NVIDIA", "model": "RTX 4090", "vram_mb": 24564, "driver_version": "590.10"}],
         )
-        monkeypatch.setattr("comfy_runner.system_info._get_nvidia_driver_version", lambda: "560.94")
 
         info = get_system_info()
         assert info["gpu_label"] == "NVIDIA"
@@ -245,7 +277,6 @@ class TestGpuLabelMapping:
     def test_amd_maps_to_label(self, monkeypatch, tmp_config_dir):
         monkeypatch.setattr("comfy_runner.system_info.detect_gpu", lambda: "amd")
         monkeypatch.setattr("comfy_runner.system_info._get_gpus", lambda: [])
-        monkeypatch.setattr("comfy_runner.system_info._get_nvidia_driver_version", lambda: None)
 
         info = get_system_info()
         assert info["gpu_vendor"] == "amd"
