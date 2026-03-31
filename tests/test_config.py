@@ -71,8 +71,10 @@ class TestTunnelConfig:
 
 
 class TestSharedDir:
-    def test_default_empty(self, tmp_config_dir):
-        assert get_shared_dir() == ""
+    def test_default_matches_desktop(self, tmp_config_dir):
+        from pathlib import Path
+        expected = str(Path.home() / "ComfyUI-Shared")
+        assert get_shared_dir() == expected
 
     def test_set_and_get(self, tmp_config_dir):
         set_shared_dir("/mnt/shared")

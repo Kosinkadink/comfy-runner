@@ -14,11 +14,14 @@ from typing import Any
 CONFIG_DIR = Path(os.environ.get("COMFY_RUNNER_HOME", Path.home() / ".comfy-runner"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# Default shared directory matches ComfyUI Desktop 2.0 (~/ComfyUI-Shared)
+DEFAULT_SHARED_DIR = str(Path.home() / "ComfyUI-Shared")
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "installations_dir": str(CONFIG_DIR / "installations"),
     "installations": {},
     "tunnel": {},
-    "shared_dir": "",  # path to shared models/input/output directory
+    "shared_dir": DEFAULT_SHARED_DIR,
 }
 
 
@@ -95,9 +98,12 @@ def set_tunnel_config(provider: str, data: dict[str, Any]) -> None:
 
 
 def get_shared_dir() -> str:
-    """Return the configured shared directory path, or empty string if not set."""
+    """Return the configured shared directory path.
+
+    Defaults to ``~/ComfyUI-Shared`` to match ComfyUI Desktop 2.0.
+    """
     config = load_config()
-    return config.get("shared_dir", "")
+    return config.get("shared_dir", DEFAULT_SHARED_DIR)
 
 
 def set_shared_dir(path: str) -> None:
