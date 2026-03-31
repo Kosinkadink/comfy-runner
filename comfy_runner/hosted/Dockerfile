@@ -16,6 +16,14 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# NVIDIA container runtime — expose GPUs and skip driver version checks
+ENV NVIDIA_REQUIRE_CUDA=""
+ENV NVIDIA_DISABLE_REQUIRE=true
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+
+ARG CUDA_VERSION_DASH=12-8
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
@@ -25,8 +33,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-venv \
         python3-pip \
         ca-certificates \
+        gnupg \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+# Install CUDA minimal toolkit from NVIDIA APT repo
+RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends cuda-minimal-build-${CUDA_VERSION_DASH} \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy startup script
 COPY comfy_runner/hosted/startup.sh /opt/startup.sh
