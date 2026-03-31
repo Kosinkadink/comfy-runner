@@ -1718,11 +1718,24 @@ def _hosted_volume(args: argparse.Namespace) -> None:
         args._parser_hosted_volume.print_help()
 
 
+def _resolve_pod_id(raw: str) -> str:
+    """Resolve a pod name to its RunPod ID, or return *raw* if it's already an ID."""
+    from comfy_runner.hosted.config import get_pod_record
+    rec = get_pod_record("runpod", raw)
+    if rec:
+        return rec["id"]
+    return raw
+
+
 def _hosted_pod(args: argparse.Namespace) -> None:
     """Handle hosted pod create/list/show/start/stop/terminate/url."""
     from comfy_runner.hosted.runpod_provider import RunPodProvider
 
     pod_action = getattr(args, "hosted_pod_action", None)
+
+    # Resolve pod_id: accept a friendly name or raw ID
+    if hasattr(args, "pod_id") and args.pod_id:
+        args.pod_id = _resolve_pod_id(args.pod_id)
 
     if pod_action == "create":
         try:
@@ -2515,19 +2528,19 @@ def main(argv: list[str] | None = None) -> None:
     hosted_pod_sub.add_parser("list", help="List all pods")
 
     p_hp_show = hosted_pod_sub.add_parser("show", help="Show pod details")
-    p_hp_show.add_argument("pod_id", help="Pod ID")
+    p_hp_show.add_argument("pod_id", help="Pod name or ID")
 
     p_hp_start = hosted_pod_sub.add_parser("start", help="Start a stopped pod")
-    p_hp_start.add_argument("pod_id", help="Pod ID")
+    p_hp_start.add_argument("pod_id", help="Pod name or ID")
 
     p_hp_stop = hosted_pod_sub.add_parser("stop", help="Stop a running pod")
-    p_hp_stop.add_argument("pod_id", help="Pod ID")
+    p_hp_stop.add_argument("pod_id", help="Pod name or ID")
 
     p_hp_terminate = hosted_pod_sub.add_parser("terminate", help="Permanently terminate a pod")
-    p_hp_terminate.add_argument("pod_id", help="Pod ID")
+    p_hp_terminate.add_argument("pod_id", help="Pod name or ID")
 
     p_hp_url = hosted_pod_sub.add_parser("url", help="Get proxy URL for a running pod")
-    p_hp_url.add_argument("pod_id", help="Pod ID")
+    p_hp_url.add_argument("pod_id", help="Pod name or ID")
     p_hp_url.add_argument("--port", "-p", type=int, help="Port (default: 8188)")
 
     p_hosted_pod.set_defaults(_parser_hosted_pod=p_hosted_pod)
