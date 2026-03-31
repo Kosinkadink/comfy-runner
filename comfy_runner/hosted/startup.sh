@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────
-# comfy-runner pod startup script.
+# comfy-runner pod startup – thin bootstrap shim.
 #
-# Runs on every pod boot.  Clones (or updates) comfy-runner from
-# GitHub, installs its Python dependencies into a venv, then starts
-# the comfy-runner HTTP control server.
-#
-# Everything else (init, deploy, start ComfyUI, etc.) is driven by
-# API requests to the server on port 9189.
+# This script is baked into the Docker image.  It clones (or updates)
+# comfy-runner from GitHub, then re-execs the *cloned* copy of
+# startup_main.sh so that any startup improvements land without
+# rebuilding the image.
 # ──────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -22,20 +20,10 @@ else
     REPO_URL="${REPO_BASE}"
 fi
 INSTALL_DIR="/opt/comfy-runner"
-VENV_DIR="${INSTALL_DIR}/.venv"
-SERVER_HOST="0.0.0.0"
-SERVER_PORT="${COMFY_RUNNER_PORT:-9189}"
 
 log() { echo "[comfy-runner] $(date '+%H:%M:%S') $*"; }
 
-# ── 0. Ensure native 7z is available (fast extraction) ───────────────
-
-if ! command -v 7z &>/dev/null; then
-    log "Installing p7zip-full for native 7z extraction..."
-    apt-get update -qq && apt-get install -y -qq p7zip-full && rm -rf /var/lib/apt/lists/*
-fi
-
-# ── 1. Clone or update comfy-runner ──────────────────────────────────
+# ── Clone or update comfy-runner ─────────────────────────────────────
 
 if [ -d "${INSTALL_DIR}/.git" ]; then
     log "Updating comfy-runner (branch: ${REPO_BRANCH})..."
@@ -51,20 +39,31 @@ fi
 cd "${INSTALL_DIR}"
 log "comfy-runner at $(git rev-parse --short HEAD)"
 
-# ── 2. Create venv and install requirements ──────────────────────────
+# ── Hand off to the cloned startup_main.sh ───────────────────────────
+# This allows startup logic to evolve without image rebuilds.
 
-if [ ! -d "${VENV_DIR}" ]; then
-    log "Creating venv..."
-    python3 -m venv "${VENV_DIR}"
+MAIN_SCRIPT="${INSTALL_DIR}/comfy_runner/hosted/startup_main.sh"
+if [ -f "${MAIN_SCRIPT}" ]; then
+    exec bash "${MAIN_SCRIPT}"
+else
+    # Fallback for older commits that don't have startup_main.sh yet:
+    # run the original inline logic.
+    log "startup_main.sh not found — running inline fallback"
+
+    VENV_DIR="${INSTALL_DIR}/.venv"
+    SERVER_HOST="0.0.0.0"
+    SERVER_PORT="${COMFY_RUNNER_PORT:-9189}"
+
+    if [ ! -d "${VENV_DIR}" ]; then
+        log "Creating venv..."
+        python3 -m venv "${VENV_DIR}"
+    fi
+    log "Installing requirements..."
+    "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+    "${VENV_DIR}/bin/pip" install --quiet -r requirements.txt
+
+    log "Starting comfy-runner server on ${SERVER_HOST}:${SERVER_PORT}..."
+    exec "${VENV_DIR}/bin/python" -m comfy_runner_server \
+        --host "${SERVER_HOST}" \
+        --port "${SERVER_PORT}"
 fi
-
-log "Installing requirements..."
-"${VENV_DIR}/bin/pip" install --quiet --upgrade pip
-"${VENV_DIR}/bin/pip" install --quiet -r requirements.txt
-
-# ── 3. Start comfy-runner server ─────────────────────────────────────
-
-log "Starting comfy-runner server on ${SERVER_HOST}:${SERVER_PORT}..."
-exec "${VENV_DIR}/bin/python" -m comfy_runner_server \
-    --host "${SERVER_HOST}" \
-    --port "${SERVER_PORT}"
