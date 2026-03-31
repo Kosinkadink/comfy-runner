@@ -8,7 +8,7 @@ from .config import get_provider_config, get_runpod_api_key
 from .provider import PodInfo, VolumeInfo
 from .runpod_api import RunPodAPI
 
-DEFAULT_IMAGE = "runpod/ubuntu:24.04"
+DEFAULT_IMAGE = "ghcr.io/kosinkadink/comfy-runner:latest"
 DEFAULT_PORTS = ["8188/http", "9189/http", "22/tcp"]
 
 
@@ -53,6 +53,7 @@ class RunPodProvider:
         self.default_gpu: str = cfg.get("default_gpu", "NVIDIA L40S")
         self.default_datacenter: str = cfg.get("default_datacenter", "US-KS-2")
         self.default_cloud_type: str = cfg.get("default_cloud_type", "SECURE")
+        self.default_image: str = cfg.get("default_image", DEFAULT_IMAGE)
 
     # ------------------------------------------------------------------
     # Pod methods
@@ -74,7 +75,7 @@ class RunPodProvider:
         params: dict[str, Any] = {
             "name": name,
             "gpuTypeIds": [gpu_type or self.default_gpu],
-            "imageName": image or DEFAULT_IMAGE,
+            "imageName": image or self.default_image,
             "ports": ports or DEFAULT_PORTS,
             "containerDiskInGb": 20,
             "volumeMountPath": "/workspace",

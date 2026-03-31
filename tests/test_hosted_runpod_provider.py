@@ -119,7 +119,7 @@ class TestRunPodProviderCreatePod:
 
         call_kwargs = prov.api.create_pod.call_args[1]
         assert call_kwargs["gpuTypeIds"] == ["NVIDIA L40S"]
-        assert call_kwargs["imageName"] == DEFAULT_IMAGE
+        assert call_kwargs["imageName"] == "ghcr.io/kosinkadink/comfy-runner:latest"
         assert call_kwargs["ports"] == DEFAULT_PORTS
         assert call_kwargs["cloudType"] == "SECURE"
         assert call_kwargs["dataCenterIds"] == ["US-KS-2"]
