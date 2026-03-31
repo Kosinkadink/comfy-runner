@@ -201,7 +201,11 @@ comfy_runner.py hosted volume rm workspace
 # Remove local config only, keep the volume on RunPod
 comfy_runner.py hosted volume rm workspace --keep-remote
 
-# Create a pod (uses config defaults for GPU, region, image)
+# One-shot: create volume + pod, ready to receive API commands
+comfy_runner.py hosted init --name my-comfy --volume workspace
+comfy_runner.py hosted init --name my-comfy --volume workspace --volume-size 100 --gpu "NVIDIA A100 80GB"
+
+# Create a pod (lower-level, manual volume management)
 comfy_runner.py hosted pod create --name my-comfy
 comfy_runner.py hosted pod create --name my-comfy --gpu "NVIDIA A100 80GB" --volume workspace
 
@@ -221,12 +225,18 @@ comfy_runner.py hosted pod url <pod_id>
 comfy_runner.py hosted pod url <pod_id> --port 9189
 ```
 
+### How it works
+
+The pod runs a thin Docker image (`runpod/ubuntu:24.04`) that clones comfy-runner from GitHub on boot and starts the comfy-runner HTTP server on port 9189. Everything else (init, deploy, start ComfyUI, etc.) is driven by API requests to that server — the same API used for local installations.
+
 The hosted module lives under `comfy_runner/hosted/` and provides:
 
-- **`config.py`** — Provider credentials, volume registry, and API key fallback (`RUNPOD_API_KEY` env → config)
+- **`config.py`** — Provider credentials, volume/pod registry, and API key fallback (`RUNPOD_API_KEY` env → config)
 - **`runpod_api.py`** — Low-level RunPod REST API client (`https://rest.runpod.io/v1/`)
 - **`runpod_provider.py`** — High-level `RunPodProvider` with sensible defaults for pod creation
 - **`provider.py`** — `HostedProvider` protocol and shared dataclasses (`PodInfo`, `VolumeInfo`)
+- **`Dockerfile`** — Thin image definition for RunPod pods
+- **`startup.sh`** — Pod entrypoint (clone comfy-runner, install deps, start server)
 
 ### Tailscale Serve
 

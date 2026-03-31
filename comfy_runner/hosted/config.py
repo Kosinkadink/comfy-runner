@@ -42,7 +42,7 @@ def set_provider_config(provider: str, data: dict[str, Any]) -> None:
 
 
 _INT_KEYS = frozenset({"cache_releases"})
-_RESERVED_KEYS = frozenset({"volumes"})
+_RESERVED_KEYS = frozenset({"volumes", "pods"})
 
 
 def set_provider_value(provider: str, key: str, value: str) -> None:
@@ -116,3 +116,39 @@ def get_runpod_api_key() -> str:
     if token:
         return token
     return get_provider_config("runpod").get("api_key", "")
+
+
+# ---------------------------------------------------------------------------
+# Pod registry — track created pods by name
+# ---------------------------------------------------------------------------
+
+def get_pod_record(provider: str, pod_name: str) -> dict[str, Any] | None:
+    """Return a named pod's record, or ``None`` if it doesn't exist."""
+    pods = get_provider_config(provider).get("pods", {})
+    return pods.get(pod_name)
+
+
+def set_pod_record(provider: str, pod_name: str, data: dict[str, Any]) -> None:
+    """Create or update a named pod's record."""
+    config = load_config()
+    hosted = config.setdefault("hosted", {})
+    prov = hosted.setdefault(provider, {})
+    pods = prov.setdefault("pods", {})
+    pods[pod_name] = data
+    save_config(config)
+
+
+def remove_pod_record(provider: str, pod_name: str) -> bool:
+    """Remove a pod record. Returns ``True`` if it existed."""
+    config = load_config()
+    pods = config.get("hosted", {}).get(provider, {}).get("pods", {})
+    if pod_name in pods:
+        del pods[pod_name]
+        save_config(config)
+        return True
+    return False
+
+
+def list_pod_records(provider: str) -> dict[str, dict[str, Any]]:
+    """Return all pod records for a provider."""
+    return get_provider_config(provider).get("pods", {})

@@ -1458,6 +1458,8 @@ def cmd_hosted(args: argparse.Namespace) -> None:
         _hosted_volume(args)
     elif action == "pod":
         _hosted_pod(args)
+    elif action == "init":
+        _hosted_init(args)
     else:
         args._parser_hosted.print_help()
 
@@ -1655,10 +1657,15 @@ def _hosted_pod(args: argparse.Namespace) -> None:
             provider = RunPodProvider()
             # Resolve volume: --volume can be a config name or raw ID
             volume_id = None
+            volume_name = None
             if args.volume:
                 from comfy_runner.hosted.config import get_volume_config
                 vol_cfg = get_volume_config("runpod", args.volume)
-                volume_id = vol_cfg["id"] if vol_cfg else args.volume
+                if vol_cfg:
+                    volume_id = vol_cfg["id"]
+                    volume_name = args.volume
+                else:
+                    volume_id = args.volume
 
             pod = provider.create_pod(
                 name=args.name,
@@ -1668,14 +1675,33 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 datacenter=args.region,
                 cloud_type=args.cloud_type,
             )
+            # Save pod record for tracking
+            from comfy_runner.hosted.config import set_pod_record
+            record: dict = {
+                "id": pod.id,
+                "gpu_type": pod.gpu_type,
+                "datacenter": pod.datacenter,
+                "image": pod.image,
+            }
+            if volume_id:
+                record["volume_id"] = volume_id
+            if volume_name:
+                record["volume_name"] = volume_name
+            set_pod_record("runpod", args.name, record)
+
+            server_url = f"https://{pod.id}-9189.proxy.runpod.net"
+            comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
             if args.json:
                 print(json.dumps({"ok": True, "pod": {
                     "id": pod.id, "name": pod.name, "status": pod.status,
                     "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
                     "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+                    "server_url": server_url, "comfy_url": comfy_url,
                 }}, indent=2))
             else:
                 console.print(f"✓ Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+                console.print(f"  Server: {server_url}")
+                console.print(f"  ComfyUI: {comfy_url}")
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -1787,6 +1813,12 @@ def _hosted_pod(args: argparse.Namespace) -> None:
         try:
             provider = RunPodProvider()
             provider.terminate_pod(args.pod_id)
+            # Remove pod record if tracked by this ID
+            from comfy_runner.hosted.config import list_pod_records, remove_pod_record
+            for pname, prec in list_pod_records("runpod").items():
+                if prec.get("id") == args.pod_id:
+                    remove_pod_record("runpod", pname)
+                    break
             if args.json:
                 print(json.dumps({"ok": True}, indent=2))
             else:
@@ -1819,6 +1851,103 @@ def _hosted_pod(args: argparse.Namespace) -> None:
 
     else:
         args._parser_hosted_pod.print_help()
+
+
+def _hosted_init(args: argparse.Namespace) -> None:
+    """Create a volume + pod in one shot, ready to receive API commands."""
+    from comfy_runner.hosted.config import (
+        get_volume_config,
+        set_pod_record,
+        set_volume_config,
+    )
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+
+    try:
+        provider = RunPodProvider()
+
+        # Resolve or create volume
+        volume_id = None
+        volume_name = args.volume
+        if volume_name:
+            vol_cfg = get_volume_config("runpod", volume_name)
+            if vol_cfg:
+                volume_id = vol_cfg["id"]
+                if not args.json:
+                    console.print(f"Using existing volume [cyan]{volume_name}[/cyan] ({volume_id})")
+            else:
+                # Create a new volume
+                size = args.volume_size or 50
+                if not args.json:
+                    console.print(f"Creating volume [cyan]{volume_name}[/cyan] ({size} GB)...")
+                vol = provider.create_volume(
+                    name=volume_name,
+                    size_gb=size,
+                    datacenter=args.region,
+                )
+                volume_id = vol.id
+                set_volume_config("runpod", volume_name, {
+                    "id": vol.id,
+                    "datacenter": vol.datacenter,
+                    "size_gb": vol.size_gb,
+                })
+                if not args.json:
+                    console.print(f"✓ Volume created (id: {vol.id}, {vol.datacenter}, {vol.size_gb} GB)")
+
+        # Create pod
+        if not args.json:
+            console.print(f"Creating pod [cyan]{args.name}[/cyan]...")
+        pod = provider.create_pod(
+            name=args.name,
+            gpu_type=args.gpu,
+            image=args.image,
+            volume_id=volume_id,
+            datacenter=args.region,
+            cloud_type=args.cloud_type,
+        )
+
+        # Save pod record
+        record: dict = {
+            "id": pod.id,
+            "gpu_type": pod.gpu_type,
+            "datacenter": pod.datacenter,
+            "image": pod.image,
+        }
+        if volume_id:
+            record["volume_id"] = volume_id
+        if volume_name:
+            record["volume_name"] = volume_name
+        set_pod_record("runpod", args.name, record)
+
+        server_url = f"https://{pod.id}-9189.proxy.runpod.net"
+        comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+
+        if args.json:
+            result: dict = {
+                "ok": True,
+                "pod": {
+                    "id": pod.id, "name": pod.name, "status": pod.status,
+                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+                    "server_url": server_url, "comfy_url": comfy_url,
+                },
+            }
+            if volume_id:
+                result["volume"] = {"id": volume_id, "name": volume_name}
+            print(json.dumps(result, indent=2))
+        else:
+            console.print(f"✓ Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+            console.print(f"  Server:  {server_url}")
+            console.print(f"  ComfyUI: {comfy_url}")
+            console.print()
+            console.print("[dim]The pod is booting comfy-runner server. Once ready, use the server URL[/dim]")
+            console.print("[dim]to deploy, start ComfyUI, etc. via the API.[/dim]")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -2090,6 +2219,18 @@ def main(argv: list[str] | None = None) -> None:
     p_hp_url.add_argument("--port", "-p", type=int, help="Port (default: 8188)")
 
     p_hosted_pod.set_defaults(_parser_hosted_pod=p_hosted_pod)
+
+    # hosted init
+    p_hosted_init = hosted_sub.add_parser("init", help="Create a volume + pod in one shot")
+    p_hosted_init.add_argument("--name", "-n", required=True, help="Pod name")
+    p_hosted_init.add_argument("--gpu", "-g", help="GPU type (default: from config)")
+    p_hosted_init.add_argument("--image", "-i", help="Docker image (default: from config)")
+    p_hosted_init.add_argument("--volume", "-v", help="Volume name (reuse existing or create new)")
+    p_hosted_init.add_argument("--volume-size", type=int, help="Volume size in GB if creating new (default: 50)")
+    p_hosted_init.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
+    p_hosted_init.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
+                               help="Cloud type (default: from config)")
+
     p_hosted.set_defaults(func=cmd_hosted, _parser_hosted=p_hosted)
 
     # tunnel
