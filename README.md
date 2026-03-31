@@ -229,6 +229,9 @@ comfy_runner.py hosted deploy my-comfy --pr 1234
 comfy_runner.py hosted deploy my-comfy --branch feature-x --start
 comfy_runner.py hosted deploy my-comfy --reset
 
+# Query system/hardware info from a hosted pod
+comfy_runner.py hosted sysinfo my-comfy
+
 # Check status of installations on a hosted pod
 comfy_runner.py hosted status my-comfy
 
@@ -242,7 +245,9 @@ comfy_runner.py hosted logs my-comfy
 
 ### How it works
 
-The pod runs a thin Docker image (`runpod/ubuntu:24.04`) that clones comfy-runner from GitHub on boot and starts the comfy-runner HTTP server on port 9189. Everything else (init, deploy, start ComfyUI, etc.) is driven by API requests to that server — the same API used for local installations.
+The pod runs a thin Docker image (`ghcr.io/kosinkadink/comfy-runner:latest`) that clones comfy-runner from GitHub on boot and starts the comfy-runner HTTP server on port 9189. Everything else (init, deploy, start ComfyUI, etc.) is driven by API requests to that server — the same API used for local installations.
+
+**CUDA compatibility:** The standalone environment bundles PyTorch built for CUDA 13.0, which requires NVIDIA driver ≥ 580. Many cloud hosts have older drivers. Pass `--cuda-compat` to `init` (or `"cuda_compat": true` in the deploy API) to auto-detect the host driver and reinstall PyTorch with a compatible CUDA version. Pod creation filters for hosts with CUDA ≥ 12.4 by default (override with `--cuda-versions`).
 
 The hosted module lives under `comfy_runner/hosted/` and provides:
 
@@ -251,8 +256,9 @@ The hosted module lives under `comfy_runner/hosted/` and provides:
 - **`runpod_provider.py`** — High-level `RunPodProvider` with sensible defaults for pod creation
 - **`provider.py`** — `HostedProvider` protocol and shared dataclasses (`PodInfo`, `VolumeInfo`)
 - **`remote.py`** — HTTP client for proxying commands to a remote comfy-runner server
-- **`Dockerfile`** — Thin image definition for RunPod pods
-- **`startup.sh`** — Pod entrypoint (clone comfy-runner, install deps, start server)
+- **`Dockerfile`** — Thin image definition for RunPod pods (no CUDA toolkit — PyTorch bundles its own)
+- **`startup.sh`** — Pod entrypoint shim (clone comfy-runner, exec `startup_main.sh`)
+- **`startup_main.sh`** — Main startup logic (install 7z, create venv, start server) — updated via git without image rebuild
 
 ### Tailscale Serve
 

@@ -152,6 +152,45 @@ _ROUTES: list[dict[str, Any]] = [
         "responses": _ok_response("Job cancelled"),
     },
 
+    # ── System info ───────────────────────────────────────────────
+    {
+        "path": "/system-info",
+        "method": "get",
+        "tags": ["System"],
+        "summary": "System and hardware information",
+        "description": (
+            "Returns host system details including OS, CPU, memory, NVIDIA driver version, "
+            "and GPU information. Useful for checking CUDA compatibility before deploying."
+        ),
+        "responses": _ok_response("System info", {
+            "system_info": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string"},
+                    "arch": {"type": "string"},
+                    "os_distro": {"type": "string"},
+                    "os_release": {"type": "string"},
+                    "cpu_model": {"type": "string"},
+                    "cpu_cores": {"type": "integer"},
+                    "total_memory_gb": {"type": "number"},
+                    "nvidia_driver_version": {"type": "string", "nullable": True},
+                    "gpus": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "model": {"type": "string"},
+                                "vram_mb": {"type": "integer"},
+                                "driver_version": {"type": "string"},
+                            },
+                        },
+                    },
+                    "installation_count": {"type": "integer"},
+                },
+            },
+        }),
+    },
+
     # ── Installations ─────────────────────────────────────────────
     {
         "path": "/installations",
@@ -298,6 +337,14 @@ _ROUTES: list[dict[str, Any]] = [
                             "reset": {"type": "boolean", "description": "Reset to original ref"},
                             "start": {"type": "boolean", "description": "Start after deploy (auto-starts if was running)"},
                             "launch_args": {"type": "string", "description": "Override launch args for this deploy"},
+                            "cuda_compat": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Auto-detect host NVIDIA driver and swap torch CUDA build if needed during auto-init. "
+                                    "Only applies when the installation doesn't exist yet and is created automatically."
+                                ),
+                            },
                         },
                     }
                 }
@@ -684,6 +731,7 @@ _ROUTES: list[dict[str, Any]] = [
                             "reset": {"type": "boolean"},
                             "start": {"type": "boolean"},
                             "launch_args": {"type": "string"},
+                            "cuda_compat": {"type": "boolean", "default": False},
                         },
                     }
                 }
