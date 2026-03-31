@@ -16,13 +16,21 @@ SERVER_PORT="${COMFY_RUNNER_PORT:-9189}"
 
 log() { echo "[comfy-runner] $(date '+%H:%M:%S') $*"; }
 
-# ── 0. Use persistent storage if a volume is mounted ─────────────────
-# If /workspace exists and is writable, store config, installations,
-# and download cache there so they survive pod stop/restart/terminate.
+# ── 0. Persist download cache on volume (if mounted) ─────────────────
+# Installations run on fast container disk (~/.comfy-runner/installations/).
+# Only the download cache (large .7z archives) is symlinked to the volume
+# so re-downloads are avoided across pod stop/restart/terminate cycles.
 
-if [ -z "${COMFY_RUNNER_HOME:-}" ] && [ -d "/workspace" ] && [ -w "/workspace" ]; then
-    export COMFY_RUNNER_HOME="/workspace/.comfy-runner"
-    log "Using persistent storage: ${COMFY_RUNNER_HOME}"
+if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+    CACHE_ON_VOLUME="/workspace/.comfy-runner/cache"
+    LOCAL_CACHE="${HOME}/.comfy-runner/cache"
+    mkdir -p "${CACHE_ON_VOLUME}"
+    mkdir -p "$(dirname "${LOCAL_CACHE}")"
+    if [ ! -L "${LOCAL_CACHE}" ]; then
+        rm -rf "${LOCAL_CACHE}"
+        ln -s "${CACHE_ON_VOLUME}" "${LOCAL_CACHE}"
+        log "Download cache linked to volume: ${LOCAL_CACHE} → ${CACHE_ON_VOLUME}"
+    fi
 fi
 
 # ── 1. Ensure native 7z is available (fast extraction) ───────────────
