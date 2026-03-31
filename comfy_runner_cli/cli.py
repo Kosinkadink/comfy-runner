@@ -1460,6 +1460,16 @@ def cmd_hosted(args: argparse.Namespace) -> None:
         _hosted_pod(args)
     elif action == "init":
         _hosted_init(args)
+    elif action == "deploy":
+        _hosted_deploy(args)
+    elif action == "status":
+        _hosted_status(args)
+    elif action == "start-comfy":
+        _hosted_start_comfy(args)
+    elif action == "stop-comfy":
+        _hosted_stop_comfy(args)
+    elif action == "logs":
+        _hosted_logs(args)
     else:
         args._parser_hosted.print_help()
 
@@ -1950,6 +1960,196 @@ def _hosted_init(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _resolve_server_url(pod_name: str) -> str:
+    """Resolve a pod name to its comfy-runner server URL."""
+    from comfy_runner.hosted.config import get_pod_record
+    rec = get_pod_record("runpod", pod_name)
+    if not rec:
+        raise RuntimeError(
+            f"No pod record for '{pod_name}'. "
+            f"Create one with 'hosted init' or 'hosted pod create'."
+        )
+    return f"https://{rec['id']}-9189.proxy.runpod.net"
+
+
+def _hosted_deploy(args: argparse.Namespace) -> None:
+    """Deploy a PR/branch/tag/commit to a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner.deploy(
+            install_name,
+            pr=args.pr,
+            branch=args.branch,
+            tag=args.tag,
+            commit=args.commit,
+            reset=args.reset,
+            start=getattr(args, "start", False),
+            launch_args=getattr(args, "launch_args", None),
+        )
+
+        job_id = data.get("job_id")
+        if not job_id:
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print("✓ Deploy completed (sync)")
+            return
+
+        if not args.json:
+            console.print(f"Deploy started (job: {job_id}). Polling...")
+
+        result = runner.poll_job(job_id, on_output=None if args.json else _output)
+
+        if args.json:
+            print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+        else:
+            console.print(f"\n✓ Deploy complete.")
+            if result.get("port"):
+                console.print(f"  ComfyUI running on port {result['port']}")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_status(args: argparse.Namespace) -> None:
+    """Show status of a hosted pod's installations."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None)
+
+        if install_name:
+            data = runner.get_status(install_name)
+        else:
+            data = {"ok": True, "installations": runner.list_installations()}
+
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            if install_name:
+                running = data.get("running", False)
+                status_str = "[green]RUNNING[/green]" if running else "[dim]stopped[/dim]"
+                console.print(f"[cyan]{install_name}[/cyan]: {status_str}")
+                if data.get("port"):
+                    console.print(f"  Port: {data['port']}")
+                if data.get("pid"):
+                    console.print(f"  PID:  {data['pid']}")
+            else:
+                installs = data.get("installations", [])
+                if not installs:
+                    console.print("[dim]No installations on this pod.[/dim]")
+                else:
+                    for inst in installs:
+                        status = inst.get("_status", {})
+                        running = status.get("running", False)
+                        status_str = "[green]RUNNING[/green]" if running else "[dim]stopped[/dim]"
+                        console.print(f"  [cyan]{inst.get('name', '?')}[/cyan]: {status_str}")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_start_comfy(args: argparse.Namespace) -> None:
+    """Restart ComfyUI on a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner.restart(install_name)
+        job_id = data.get("job_id")
+
+        if job_id:
+            if not args.json:
+                console.print(f"Starting ComfyUI (job: {job_id})...")
+            result = runner.poll_job(job_id, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ ComfyUI started.")
+                if result.get("port"):
+                    console.print(f"  Port: {result['port']}")
+        else:
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print("✓ ComfyUI started.")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_stop_comfy(args: argparse.Namespace) -> None:
+    """Stop ComfyUI on a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner.stop(install_name)
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            was_running = data.get("was_running", False)
+            if was_running:
+                console.print("✓ ComfyUI stopped.")
+            else:
+                console.print("[dim]ComfyUI was not running.[/dim]")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_logs(args: argparse.Namespace) -> None:
+    """Show logs from a hosted pod's ComfyUI instance."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner._request("GET", f"/{install_name}/logs")
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            lines = data.get("lines", [])
+            if not lines:
+                console.print("[dim]No logs available.[/dim]")
+            else:
+                for line in lines:
+                    console.print(line, end="", highlight=False)
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -2230,6 +2430,39 @@ def main(argv: list[str] | None = None) -> None:
     p_hosted_init.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
     p_hosted_init.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
                                help="Cloud type (default: from config)")
+
+    # hosted deploy
+    p_hosted_deploy = hosted_sub.add_parser("deploy", help="Deploy a PR/branch/tag/commit to a hosted pod")
+    p_hosted_deploy.add_argument("pod_name", help="Pod name (from config)")
+    deploy_group = p_hosted_deploy.add_mutually_exclusive_group()
+    deploy_group.add_argument("--pr", type=int, help="PR number to deploy")
+    deploy_group.add_argument("--branch", help="Branch name to checkout")
+    deploy_group.add_argument("--tag", help="Tag to checkout")
+    deploy_group.add_argument("--commit", help="Commit SHA to checkout")
+    deploy_group.add_argument("--reset", action="store_true", help="Reset to original release ref")
+    p_hosted_deploy.add_argument("--start", action="store_true", help="Start ComfyUI after deploy")
+    p_hosted_deploy.add_argument("--launch-args", help="Launch args to pass to ComfyUI")
+    p_hosted_deploy.add_argument("--install", dest="install_name", help="Installation name on pod (default: main)")
+
+    # hosted status
+    p_hosted_status = hosted_sub.add_parser("status", help="Show status of a hosted pod")
+    p_hosted_status.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_status.add_argument("--install", dest="install_name", help="Specific installation name")
+
+    # hosted start-comfy
+    p_hosted_start = hosted_sub.add_parser("start-comfy", help="Start/restart ComfyUI on a hosted pod")
+    p_hosted_start.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_start.add_argument("--install", dest="install_name", help="Installation name (default: main)")
+
+    # hosted stop-comfy
+    p_hosted_stop = hosted_sub.add_parser("stop-comfy", help="Stop ComfyUI on a hosted pod")
+    p_hosted_stop.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_stop.add_argument("--install", dest="install_name", help="Installation name (default: main)")
+
+    # hosted logs
+    p_hosted_logs = hosted_sub.add_parser("logs", help="Show ComfyUI logs from a hosted pod")
+    p_hosted_logs.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_logs.add_argument("--install", dest="install_name", help="Installation name (default: main)")
 
     p_hosted.set_defaults(func=cmd_hosted, _parser_hosted=p_hosted)
 

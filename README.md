@@ -223,6 +223,21 @@ comfy_runner.py hosted pod terminate <pod_id>    # permanent
 # Get the proxy URL for a running pod (default port: 8188)
 comfy_runner.py hosted pod url <pod_id>
 comfy_runner.py hosted pod url <pod_id> --port 9189
+
+# Deploy a PR/branch/tag to a hosted pod (polls until complete)
+comfy_runner.py hosted deploy my-comfy --pr 1234
+comfy_runner.py hosted deploy my-comfy --branch feature-x --start
+comfy_runner.py hosted deploy my-comfy --reset
+
+# Check status of installations on a hosted pod
+comfy_runner.py hosted status my-comfy
+
+# Start/stop ComfyUI on a hosted pod
+comfy_runner.py hosted start-comfy my-comfy
+comfy_runner.py hosted stop-comfy my-comfy
+
+# View ComfyUI logs from a hosted pod
+comfy_runner.py hosted logs my-comfy
 ```
 
 ### How it works
@@ -235,6 +250,7 @@ The hosted module lives under `comfy_runner/hosted/` and provides:
 - **`runpod_api.py`** — Low-level RunPod REST API client (`https://rest.runpod.io/v1/`)
 - **`runpod_provider.py`** — High-level `RunPodProvider` with sensible defaults for pod creation
 - **`provider.py`** — `HostedProvider` protocol and shared dataclasses (`PodInfo`, `VolumeInfo`)
+- **`remote.py`** — HTTP client for proxying commands to a remote comfy-runner server
 - **`Dockerfile`** — Thin image definition for RunPod pods
 - **`startup.sh`** — Pod entrypoint (clone comfy-runner, install deps, start server)
 
