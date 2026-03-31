@@ -1125,10 +1125,8 @@ def ensure_cuda_compatible_torch(
     venv = install_path / "ComfyUI" / ".venv"
     if sys.platform == "win32":
         venv_python = str(venv / "Scripts" / "python.exe")
-        venv_pip = str(venv / "Scripts" / "pip.exe")
     else:
         venv_python = str(venv / "bin" / "python3")
-        venv_pip = str(venv / "bin" / "pip")
 
     if not Path(venv_python).exists():
         if send_output:
@@ -1193,7 +1191,7 @@ def ensure_cuda_compatible_torch(
     index_url = f"https://download.pytorch.org/whl/{best_tag}"
     reinstall = subprocess.run(
         [
-            venv_pip, "install", "--force-reinstall",
+            venv_python, "-m", "pip", "install", "--force-reinstall",
             "torch", "torchvision", "torchaudio",
             "--index-url", index_url,
         ],
