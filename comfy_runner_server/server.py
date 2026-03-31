@@ -15,6 +15,7 @@ GET /job/<job_id> to check status and retrieve results.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -311,6 +312,63 @@ def create_app() -> Any:
         if not job:
             return _err("Job not found", 404)
         return _err(f"Job is not running (status: {job['status']})")
+
+    # ------------------------------------------------------------------
+    # GET /job/<job_id>/stream — stream job output (SSE)
+    # ------------------------------------------------------------------
+    @app.route("/job/<job_id>/stream", methods=["GET"])
+    def route_job_stream(job_id: str) -> Any:
+        """Stream job output as Server-Sent Events.
+
+        Keeps the HTTP connection open until the job finishes, which
+        prevents serverless platforms (e.g. Modal) from recycling the
+        container while a long-running job is in progress.
+
+        Events:
+          data: {"type": "output", "line": "..."}
+          data: {"type": "done", "result": {...}}
+          data: {"type": "error", "error": "..."}
+        """
+        from flask import Response
+
+        job = _jobs.get(job_id)
+        if not job:
+            return _err("Job not found", 404)
+
+        def generate():
+            cursor = 0
+            while True:
+                j = _jobs.get(job_id)
+                if not j:
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Job expired'})}\n\n"
+                    break
+
+                # Emit any new output lines
+                output = j["output"]
+                while cursor < len(output):
+                    line = output[cursor]
+                    yield f"data: {json.dumps({'type': 'output', 'line': line})}\n\n"
+                    cursor += 1
+
+                # Check if job is finished
+                status = j["status"]
+                if status == "done":
+                    yield f"data: {json.dumps({'type': 'done', 'result': j.get('result')})}\n\n"
+                    break
+                elif status == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'error': j.get('error')})}\n\n"
+                    break
+                elif status == "cancelled":
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Job cancelled'})}\n\n"
+                    break
+
+                time.sleep(0.5)
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # ------------------------------------------------------------------
     # GET /installations — list all installations with status
