@@ -101,6 +101,15 @@ class RemoteRunner:
             time.sleep(_POLL_INTERVAL)
 
     # ------------------------------------------------------------------
+    # System info
+    # ------------------------------------------------------------------
+
+    def get_system_info(self) -> dict[str, Any]:
+        """GET /system-info"""
+        data = self._request("GET", "/system-info")
+        return data.get("system_info", {})
+
+    # ------------------------------------------------------------------
     # Installations
     # ------------------------------------------------------------------
 

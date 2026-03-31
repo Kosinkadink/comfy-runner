@@ -1521,6 +1521,8 @@ def cmd_hosted(args: argparse.Namespace) -> None:
         _hosted_init(args)
     elif action == "deploy":
         _hosted_deploy(args)
+    elif action == "sysinfo":
+        _hosted_sysinfo(args)
     elif action == "status":
         _hosted_status(args)
     elif action == "start-comfy":
@@ -2078,6 +2080,36 @@ def _hosted_deploy(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _hosted_sysinfo(args: argparse.Namespace) -> None:
+    """Show system/hardware info from a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        info = runner.get_system_info()
+
+        if args.json:
+            print(json.dumps({"ok": True, "system_info": info}, indent=2))
+        else:
+            console.print(f"[bold]OS:[/bold]       {info.get('os_distro', '?')}")
+            console.print(f"[bold]Arch:[/bold]     {info.get('arch', '?')}")
+            console.print(f"[bold]CPU:[/bold]      {info.get('cpu_model', '?')} ({info.get('cpu_cores', '?')} cores)")
+            console.print(f"[bold]Memory:[/bold]   {info.get('total_memory_gb', '?')} GB")
+            driver = info.get("nvidia_driver_version", "N/A")
+            console.print(f"[bold]Driver:[/bold]   {driver}")
+            for gpu in info.get("gpus", []):
+                vram = gpu.get("vram_mb", 0)
+                vram_gb = f"{vram / 1024:.1f} GB" if vram else "?"
+                console.print(f"[bold]GPU:[/bold]      {gpu.get('model', '?')} ({vram_gb})")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
 def _hosted_status(args: argparse.Namespace) -> None:
     """Show status of a hosted pod's installations."""
     from comfy_runner.hosted.remote import RemoteRunner
@@ -2506,6 +2538,10 @@ def main(argv: list[str] | None = None) -> None:
     p_hosted_deploy.add_argument("--start", action="store_true", help="Start ComfyUI after deploy")
     p_hosted_deploy.add_argument("--launch-args", help="Launch args to pass to ComfyUI")
     p_hosted_deploy.add_argument("--install", dest="install_name", help="Installation name on pod (default: main)")
+
+    # hosted sysinfo
+    p_hosted_sysinfo = hosted_sub.add_parser("sysinfo", help="Show system/hardware info from a hosted pod")
+    p_hosted_sysinfo.add_argument("pod_name", help="Pod name (from config)")
 
     # hosted status
     p_hosted_status = hosted_sub.add_parser("status", help="Show status of a hosted pod")
