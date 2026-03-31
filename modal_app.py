@@ -37,7 +37,6 @@ COMFY_RUNNER_PATH = "/opt/comfy-runner"
 # Mount local source into the image (works for private repos without auth)
 LOCAL_SOURCE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/data"
-SERVER_PORT = 9189
 
 # ---------------------------------------------------------------------------
 # Volumes — persist installations + model data across container restarts
