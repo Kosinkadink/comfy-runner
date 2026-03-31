@@ -25,7 +25,7 @@ from .environment import get_active_python_path, migrate_env_layout
 DEFAULT_PORT = 8188
 PORT_SEARCH_RANGE = 100  # try up to 100 ports above the default
 HEALTH_ENDPOINT = "/api/system_stats"
-HEALTH_TIMEOUT_S = 120
+HEALTH_TIMEOUT_S = 300
 HEALTH_POLL_INTERVAL_S = 1.0
 STOP_TIMEOUT_S = 10
 

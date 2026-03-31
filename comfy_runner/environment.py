@@ -634,12 +634,24 @@ def _download_file_resumable(
     _delete_dl_meta(dest)
 
 
-def _safe_tar_extractall(tar: tarfile.TarFile, dest: Path) -> None:
+def _safe_tar_extractall(
+    tar: tarfile.TarFile,
+    dest: Path,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
     """Extract tar with data filter when available (Python 3.12+), plain otherwise."""
-    if sys.version_info >= (3, 12):
-        tar.extractall(dest, filter="data")
-    else:
-        tar.extractall(dest)
+    members = tar.getmembers()
+    total = len(members)
+    for i, member in enumerate(members, 1):
+        if sys.version_info >= (3, 12):
+            tar.extract(member, dest, filter="data")
+        else:
+            tar.extract(member, dest)
+        if send_output and total > 0 and i % 500 == 0:
+            pct = i * 100 // total
+            send_output(f"\r  Extracted {i}/{total} files ({pct}%)")
+    if send_output and total > 0:
+        send_output(f"\r  Extracted {total}/{total} files (100%)\n")
 
 
 def _find_7z() -> str | None:
@@ -842,10 +854,10 @@ def _extract_archive(
 
     if name.endswith(".tar.gz") or name.endswith(".tgz"):
         with tarfile.open(archive_path, "r:gz") as tar:
-            _safe_tar_extractall(tar, dest)
+            _safe_tar_extractall(tar, dest, send_output)
     elif name.endswith(".tar"):
         with tarfile.open(archive_path, "r:") as tar:
-            _safe_tar_extractall(tar, dest)
+            _safe_tar_extractall(tar, dest, send_output)
     elif name.endswith(".7z") or name.endswith(".001"):
         seven_zip = _find_7z()
         if seven_zip:

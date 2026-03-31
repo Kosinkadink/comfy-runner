@@ -62,7 +62,10 @@ def _make_collector(
 
     def collect(text: str) -> None:
         with lock:
-            lines.append(text)
+            if text.startswith("\r") and lines:
+                lines[-1] = text
+            else:
+                lines.append(text)
 
     return collect, lines
 
