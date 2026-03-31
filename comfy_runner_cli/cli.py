@@ -36,6 +36,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             release_tag=args.release,
             install_dir=args.dir,
             send_output=None if args.json else _output,
+            cuda_compat=getattr(args, "cuda_compat", False),
         )
         if args.json:
             print(json.dumps({"ok": True, "installation": record}, indent=2))
@@ -2269,6 +2270,8 @@ def main(argv: list[str] | None = None) -> None:
     p_init.add_argument("--variant", "-v", help="Explicit variant ID (e.g. win-nvidia-cu128)")
     p_init.add_argument("--release", "-r", help="Specific release tag (e.g. v0.2.1)")
     p_init.add_argument("--dir", "-d", help="Custom installation directory")
+    p_init.add_argument("--cuda-compat", action="store_true", default=False,
+                        help="Auto-detect host NVIDIA driver and swap torch CUDA build if needed")
     p_init.set_defaults(func=cmd_init)
 
     # releases
