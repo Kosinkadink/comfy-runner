@@ -200,6 +200,25 @@ comfy_runner.py hosted volume rm workspace
 
 # Remove local config only, keep the volume on RunPod
 comfy_runner.py hosted volume rm workspace --keep-remote
+
+# Create a pod (uses config defaults for GPU, region, image)
+comfy_runner.py hosted pod create --name my-comfy
+comfy_runner.py hosted pod create --name my-comfy --gpu "NVIDIA A100 80GB" --volume workspace
+
+# List all pods
+comfy_runner.py hosted pod list
+
+# Show pod details
+comfy_runner.py hosted pod show <pod_id>
+
+# Start / stop / terminate a pod
+comfy_runner.py hosted pod start <pod_id>
+comfy_runner.py hosted pod stop <pod_id>
+comfy_runner.py hosted pod terminate <pod_id>    # permanent
+
+# Get the proxy URL for a running pod (default port: 8188)
+comfy_runner.py hosted pod url <pod_id>
+comfy_runner.py hosted pod url <pod_id> --port 9189
 ```
 
 The hosted module lives under `comfy_runner/hosted/` and provides:
