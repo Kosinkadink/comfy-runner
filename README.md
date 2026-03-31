@@ -4,7 +4,7 @@ A Python toolkit for managing ComfyUI instances — installation, snapshot, proc
 
 ## Packages
 
-- **`comfy_runner/`** — Core library (config, environment, process management, tunneling, shared paths, snapshots, nodes, git utilities)
+- **`comfy_runner/`** — Core library (config, environment, process management, tunneling, shared paths, snapshots, nodes, git utilities, hosted providers)
 - **`comfy_runner_cli/`** — CLI interface (`python -m comfy_runner_cli` or `python comfy_runner.py`)
 - **`comfy_runner_server/`** — HTTP API server (`python -m comfy_runner_server`, Flask + Waitress)
 
@@ -174,6 +174,86 @@ comfy_runner.py tunnel config --rm-domain example.ngrok.io
 
 These tunnels expose individual ComfyUI instances (their `--port`), not the runner server itself. For exposing the runner server, see **Tailscale Serve** below.
 
+### Hosted GPU Deployments (RunPod)
+
+Manage cloud GPU pods and network volumes via the RunPod REST API.
+
+```bash
+# Configure RunPod credentials (or set RUNPOD_API_KEY env var)
+comfy_runner.py hosted config set runpod.api_key rk_...
+
+# View hosted config (sensitive values are redacted in output)
+comfy_runner.py hosted config show
+
+# Set provider defaults
+comfy_runner.py hosted config set runpod.default_gpu "NVIDIA A100 80GB"
+comfy_runner.py hosted config set runpod.default_datacenter EU-RO-1
+
+# Create a network volume
+comfy_runner.py hosted volume create --name workspace --size 50 --region US-KS-2
+
+# List configured volumes
+comfy_runner.py hosted volume list
+
+# Remove a volume (deletes from RunPod and local config)
+comfy_runner.py hosted volume rm workspace
+
+# Remove local config only, keep the volume on RunPod
+comfy_runner.py hosted volume rm workspace --keep-remote
+
+# One-shot: create volume + pod, ready to receive API commands
+comfy_runner.py hosted init --name my-comfy --volume workspace
+comfy_runner.py hosted init --name my-comfy --volume workspace --volume-size 100 --gpu "NVIDIA A100 80GB"
+
+# Create a pod (lower-level, manual volume management)
+comfy_runner.py hosted pod create --name my-comfy
+comfy_runner.py hosted pod create --name my-comfy --gpu "NVIDIA A100 80GB" --volume workspace
+
+# List all pods
+comfy_runner.py hosted pod list
+
+# Show pod details
+comfy_runner.py hosted pod show <pod_id>
+
+# Start / stop / terminate a pod
+comfy_runner.py hosted pod start <pod_id>
+comfy_runner.py hosted pod stop <pod_id>
+comfy_runner.py hosted pod terminate <pod_id>    # permanent
+
+# Get the proxy URL for a running pod (default port: 8188)
+comfy_runner.py hosted pod url <pod_id>
+comfy_runner.py hosted pod url <pod_id> --port 9189
+
+# Deploy a PR/branch/tag to a hosted pod (polls until complete)
+comfy_runner.py hosted deploy my-comfy --pr 1234
+comfy_runner.py hosted deploy my-comfy --branch feature-x --start
+comfy_runner.py hosted deploy my-comfy --reset
+
+# Check status of installations on a hosted pod
+comfy_runner.py hosted status my-comfy
+
+# Start/stop ComfyUI on a hosted pod
+comfy_runner.py hosted start-comfy my-comfy
+comfy_runner.py hosted stop-comfy my-comfy
+
+# View ComfyUI logs from a hosted pod
+comfy_runner.py hosted logs my-comfy
+```
+
+### How it works
+
+The pod runs a thin Docker image (`runpod/ubuntu:24.04`) that clones comfy-runner from GitHub on boot and starts the comfy-runner HTTP server on port 9189. Everything else (init, deploy, start ComfyUI, etc.) is driven by API requests to that server — the same API used for local installations.
+
+The hosted module lives under `comfy_runner/hosted/` and provides:
+
+- **`config.py`** — Provider credentials, volume/pod registry, and API key fallback (`RUNPOD_API_KEY` env → config)
+- **`runpod_api.py`** — Low-level RunPod REST API client (`https://rest.runpod.io/v1/`)
+- **`runpod_provider.py`** — High-level `RunPodProvider` with sensible defaults for pod creation
+- **`provider.py`** — `HostedProvider` protocol and shared dataclasses (`PodInfo`, `VolumeInfo`)
+- **`remote.py`** — HTTP client for proxying commands to a remote comfy-runner server
+- **`Dockerfile`** — Thin image definition for RunPod pods
+- **`startup.sh`** — Pod entrypoint (clone comfy-runner, install deps, start server)
+
 ### Tailscale Serve
 
 Expose the runner server itself over your tailnet (private HTTPS, accessible only to devices on your Tailscale network).
@@ -258,6 +338,29 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 - Long-running operations (deploy, restart, snapshot restore, node add/rm) run in background threads and return a `job_id`.
 - Poll `GET /job/<job_id>` to check job status.
 - All responses are JSON: `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
+
+### OpenAPI Spec
+
+The server auto-serves an OpenAPI 3.0.3 spec at `GET /openapi.json`. The spec is generated at runtime from route metadata in `comfy_runner_server/openapi.py` — no manual YAML to maintain. When routes change, update the `_ROUTES` list in that file and the spec updates automatically.
+
+```bash
+# Fetch the spec from a running server
+curl http://localhost:9189/openapi.json | python -m json.tool
+```
+
+## Testing
+
+```bash
+# Run all tests
+.venv/bin/python -m pytest tests/ -q
+
+# Run a specific test file
+.venv/bin/python -m pytest tests/test_hosted_config.py -v
+```
+
+Tests use `pytest` with `unittest.mock.patch` for mocking. The `tmp_config_dir` fixture (see `tests/conftest.py`) redirects all config/cache paths to `tmp_path` so tests never touch the real home directory.
+
+Test files follow the naming convention `tests/test_<module>.py` and are organized by class per feature area.
 
 ## Global Flags
 

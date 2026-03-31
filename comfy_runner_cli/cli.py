@@ -1445,6 +1445,712 @@ def cmd_workflow_models(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Hosted commands
+# ---------------------------------------------------------------------------
+
+def cmd_hosted(args: argparse.Namespace) -> None:
+    """Dispatch hosted subcommands."""
+    action = getattr(args, "hosted_action", None)
+
+    if action == "config":
+        _hosted_config(args)
+    elif action == "volume":
+        _hosted_volume(args)
+    elif action == "pod":
+        _hosted_pod(args)
+    elif action == "init":
+        _hosted_init(args)
+    elif action == "deploy":
+        _hosted_deploy(args)
+    elif action == "status":
+        _hosted_status(args)
+    elif action == "start-comfy":
+        _hosted_start_comfy(args)
+    elif action == "stop-comfy":
+        _hosted_stop_comfy(args)
+    elif action == "logs":
+        _hosted_logs(args)
+    else:
+        args._parser_hosted.print_help()
+
+
+_SENSITIVE_SUBSTRINGS = ("key", "secret", "token", "password")
+
+
+def _redact_config(data: dict) -> dict:
+    """Deep-copy a config dict, replacing sensitive values with '***'."""
+    import copy
+    out = copy.deepcopy(data)
+    def _walk(d: dict) -> None:
+        for k, v in d.items():
+            if isinstance(v, dict):
+                _walk(v)
+            elif isinstance(v, str) and v and any(s in k.lower() for s in _SENSITIVE_SUBSTRINGS):
+                d[k] = "***"
+    _walk(out)
+    return out
+
+
+def _hosted_config(args: argparse.Namespace) -> None:
+    """Handle hosted config show/set."""
+    from comfy_runner.hosted.config import (
+        get_hosted_config,
+        set_provider_value,
+    )
+
+    config_action = getattr(args, "hosted_config_action", None)
+
+    if config_action == "show":
+        data = get_hosted_config()
+        redacted = _redact_config(data)
+        if args.json:
+            print(json.dumps({"ok": True, "config": redacted}, indent=2))
+        else:
+            if not redacted:
+                console.print("[dim]No hosted config set.[/dim]")
+            else:
+                console.print_json(json.dumps(redacted, indent=2))
+
+    elif config_action == "set":
+        key = args.key
+        value = args.value
+        # Key format: runpod.api_key → provider=runpod, key=api_key
+        parts = key.split(".", 1)
+        if len(parts) < 2:
+            console.print("[red]Error: key must be in format provider.key (e.g. runpod.api_key)[/red]")
+            sys.exit(1)
+        provider, config_key = parts
+        try:
+            set_provider_value(provider, config_key, value)
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        if args.json:
+            print(json.dumps({"ok": True}))
+        else:
+            # Redact sensitive values
+            display = "***" if any(s in config_key.lower() for s in _SENSITIVE_SUBSTRINGS) else value
+            console.print(f"Set [cyan]{provider}[/cyan].[cyan]{config_key}[/cyan] = {display}")
+    else:
+        args._parser_hosted_config.print_help()
+
+
+def _hosted_volume(args: argparse.Namespace) -> None:
+    """Handle hosted volume create/list/rm."""
+    from comfy_runner.hosted.config import (
+        get_volume_config,
+        list_volume_configs,
+        remove_volume_config,
+        set_volume_config,
+    )
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+
+    volume_action = getattr(args, "hosted_volume_action", None)
+
+    if volume_action == "create":
+        try:
+            provider = RunPodProvider()
+            vol = provider.create_volume(
+                name=args.name,
+                size_gb=args.size,
+                datacenter=args.region,
+            )
+            set_volume_config("runpod", args.name, {
+                "id": vol.id,
+                "datacenter": vol.datacenter,
+                "size_gb": vol.size_gb,
+            })
+            if args.json:
+                print(json.dumps({"ok": True, "volume": {
+                    "id": vol.id, "name": vol.name,
+                    "datacenter": vol.datacenter, "size_gb": vol.size_gb,
+                }}, indent=2))
+            else:
+                console.print(f"✓ Volume [cyan]{args.name}[/cyan] created (id: {vol.id}, {vol.datacenter}, {vol.size_gb} GB)")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif volume_action == "list":
+        try:
+            local_volumes = list_volume_configs("runpod")
+            if args.json:
+                # Also fetch live data from RunPod API
+                try:
+                    provider = RunPodProvider()
+                    remote = [
+                        {"id": v.id, "name": v.name, "datacenter": v.datacenter, "size_gb": v.size_gb}
+                        for v in provider.list_volumes()
+                    ]
+                except Exception:
+                    remote = []
+                print(json.dumps({
+                    "ok": True,
+                    "local": local_volumes,
+                    "remote": remote,
+                }, indent=2))
+            else:
+                if not local_volumes:
+                    console.print("[dim]No volumes configured.[/dim]")
+                    return
+                table = Table(title="Hosted Volumes (RunPod)")
+                table.add_column("Name", style="cyan")
+                table.add_column("ID", style="dim")
+                table.add_column("Datacenter", style="green")
+                table.add_column("Size (GB)", style="yellow", justify="right")
+                for vname, vdata in local_volumes.items():
+                    table.add_row(
+                        vname,
+                        vdata.get("id", ""),
+                        vdata.get("datacenter", ""),
+                        str(vdata.get("size_gb", "")),
+                    )
+                console.print(table)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif volume_action == "rm":
+        try:
+            vol_cfg = get_volume_config("runpod", args.name)
+            if not vol_cfg:
+                raise RuntimeError(f"Volume '{args.name}' not found in config.")
+            vol_id = vol_cfg["id"]
+            remote_error = None
+            if not args.keep_remote:
+                try:
+                    provider = RunPodProvider()
+                    provider.delete_volume(vol_id)
+                    if not args.json:
+                        console.print(f"Deleted volume [cyan]{vol_id}[/cyan] from RunPod.")
+                except Exception as e:
+                    remote_error = str(e)
+                    if not args.json:
+                        console.print(f"[yellow]⚠ Remote deletion failed: {e}[/yellow]")
+                        console.print("[dim]Removing local config anyway.[/dim]")
+            remove_volume_config("runpod", args.name)
+            if args.json:
+                result: dict = {"ok": True}
+                if remote_error:
+                    result["warning"] = f"Remote deletion failed: {remote_error}"
+                print(json.dumps(result, indent=2))
+            else:
+                console.print(f"✓ Volume [cyan]{args.name}[/cyan] removed.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    else:
+        args._parser_hosted_volume.print_help()
+
+
+def _hosted_pod(args: argparse.Namespace) -> None:
+    """Handle hosted pod create/list/show/start/stop/terminate/url."""
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+
+    pod_action = getattr(args, "hosted_pod_action", None)
+
+    if pod_action == "create":
+        try:
+            provider = RunPodProvider()
+            # Resolve volume: --volume can be a config name or raw ID
+            volume_id = None
+            volume_name = None
+            if args.volume:
+                from comfy_runner.hosted.config import get_volume_config
+                vol_cfg = get_volume_config("runpod", args.volume)
+                if vol_cfg:
+                    volume_id = vol_cfg["id"]
+                    volume_name = args.volume
+                else:
+                    volume_id = args.volume
+
+            pod = provider.create_pod(
+                name=args.name,
+                gpu_type=args.gpu,
+                image=args.image,
+                volume_id=volume_id,
+                datacenter=args.region,
+                cloud_type=args.cloud_type,
+            )
+            # Save pod record for tracking
+            from comfy_runner.hosted.config import set_pod_record
+            record: dict = {
+                "id": pod.id,
+                "gpu_type": pod.gpu_type,
+                "datacenter": pod.datacenter,
+                "image": pod.image,
+            }
+            if volume_id:
+                record["volume_id"] = volume_id
+            if volume_name:
+                record["volume_name"] = volume_name
+            set_pod_record("runpod", args.name, record)
+
+            server_url = f"https://{pod.id}-9189.proxy.runpod.net"
+            comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+            if args.json:
+                print(json.dumps({"ok": True, "pod": {
+                    "id": pod.id, "name": pod.name, "status": pod.status,
+                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+                    "server_url": server_url, "comfy_url": comfy_url,
+                }}, indent=2))
+            else:
+                console.print(f"✓ Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+                console.print(f"  Server: {server_url}")
+                console.print(f"  ComfyUI: {comfy_url}")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "list":
+        try:
+            provider = RunPodProvider()
+            pods = provider.list_pods()
+            if args.json:
+                print(json.dumps({"ok": True, "pods": [
+                    {"id": p.id, "name": p.name, "status": p.status,
+                     "gpu_type": p.gpu_type, "datacenter": p.datacenter,
+                     "cost_per_hr": p.cost_per_hr, "image": p.image}
+                    for p in pods
+                ]}, indent=2))
+            else:
+                if not pods:
+                    console.print("[dim]No pods found.[/dim]")
+                    return
+                table = Table(title="RunPod Pods")
+                table.add_column("Name", style="cyan")
+                table.add_column("ID", style="dim")
+                table.add_column("Status", style="bold")
+                table.add_column("GPU", style="green")
+                table.add_column("Datacenter", style="yellow")
+                table.add_column("$/hr", justify="right")
+                for p in pods:
+                    status_style = "green" if p.status == "RUNNING" else "red" if p.status == "EXITED" else "yellow"
+                    table.add_row(
+                        p.name, p.id,
+                        f"[{status_style}]{p.status}[/{status_style}]",
+                        p.gpu_type, p.datacenter,
+                        f"{p.cost_per_hr:.2f}",
+                    )
+                console.print(table)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "show":
+        try:
+            provider = RunPodProvider()
+            pod = provider.get_pod(args.pod_id)
+            if not pod:
+                raise RuntimeError(f"Pod '{args.pod_id}' not found.")
+            if args.json:
+                print(json.dumps({"ok": True, "pod": {
+                    "id": pod.id, "name": pod.name, "status": pod.status,
+                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+                }}, indent=2))
+            else:
+                status_style = "green" if pod.status == "RUNNING" else "red" if pod.status == "EXITED" else "yellow"
+                console.print(f"[cyan]{pod.name}[/cyan] ({pod.id})")
+                console.print(f"  Status:     [{status_style}]{pod.status}[/{status_style}]")
+                console.print(f"  GPU:        {pod.gpu_type}")
+                console.print(f"  Datacenter: {pod.datacenter}")
+                console.print(f"  Image:      {pod.image}")
+                console.print(f"  Cost:       ${pod.cost_per_hr:.2f}/hr")
+                if pod.status == "RUNNING":
+                    url = f"https://{pod.id}-8188.proxy.runpod.net"
+                    console.print(f"  ComfyUI:    [link={url}]{url}[/link]")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "start":
+        try:
+            provider = RunPodProvider()
+            pod = provider.start_pod(args.pod_id)
+            if args.json:
+                print(json.dumps({"ok": True, "pod": {
+                    "id": pod.id, "name": pod.name, "status": pod.status,
+                }}, indent=2))
+            else:
+                console.print(f"✓ Pod [cyan]{pod.name}[/cyan] started ({pod.id})")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "stop":
+        try:
+            provider = RunPodProvider()
+            provider.stop_pod(args.pod_id)
+            if args.json:
+                print(json.dumps({"ok": True}, indent=2))
+            else:
+                console.print(f"✓ Pod [cyan]{args.pod_id}[/cyan] stopped.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "terminate":
+        try:
+            provider = RunPodProvider()
+            provider.terminate_pod(args.pod_id)
+            # Remove pod record if tracked by this ID
+            from comfy_runner.hosted.config import list_pod_records, remove_pod_record
+            for pname, prec in list_pod_records("runpod").items():
+                if prec.get("id") == args.pod_id:
+                    remove_pod_record("runpod", pname)
+                    break
+            if args.json:
+                print(json.dumps({"ok": True}, indent=2))
+            else:
+                console.print(f"✓ Pod [cyan]{args.pod_id}[/cyan] terminated.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "url":
+        try:
+            provider = RunPodProvider()
+            port = args.port or 8188
+            url = provider.get_pod_url(args.pod_id, port)
+            if args.json:
+                print(json.dumps({"ok": True, "url": url}, indent=2))
+            else:
+                if url:
+                    console.print(f"[link={url}]{url}[/link]")
+                else:
+                    console.print("[dim]Pod is not running — no URL available.[/dim]")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    else:
+        args._parser_hosted_pod.print_help()
+
+
+def _hosted_init(args: argparse.Namespace) -> None:
+    """Create a volume + pod in one shot, ready to receive API commands."""
+    from comfy_runner.hosted.config import (
+        get_volume_config,
+        set_pod_record,
+        set_volume_config,
+    )
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+
+    try:
+        provider = RunPodProvider()
+
+        # Resolve or create volume
+        volume_id = None
+        volume_name = args.volume
+        if volume_name:
+            vol_cfg = get_volume_config("runpod", volume_name)
+            if vol_cfg:
+                volume_id = vol_cfg["id"]
+                if not args.json:
+                    console.print(f"Using existing volume [cyan]{volume_name}[/cyan] ({volume_id})")
+            else:
+                # Create a new volume
+                size = args.volume_size or 50
+                if not args.json:
+                    console.print(f"Creating volume [cyan]{volume_name}[/cyan] ({size} GB)...")
+                vol = provider.create_volume(
+                    name=volume_name,
+                    size_gb=size,
+                    datacenter=args.region,
+                )
+                volume_id = vol.id
+                set_volume_config("runpod", volume_name, {
+                    "id": vol.id,
+                    "datacenter": vol.datacenter,
+                    "size_gb": vol.size_gb,
+                })
+                if not args.json:
+                    console.print(f"✓ Volume created (id: {vol.id}, {vol.datacenter}, {vol.size_gb} GB)")
+
+        # Create pod
+        if not args.json:
+            console.print(f"Creating pod [cyan]{args.name}[/cyan]...")
+        pod = provider.create_pod(
+            name=args.name,
+            gpu_type=args.gpu,
+            image=args.image,
+            volume_id=volume_id,
+            datacenter=args.region,
+            cloud_type=args.cloud_type,
+        )
+
+        # Save pod record
+        record: dict = {
+            "id": pod.id,
+            "gpu_type": pod.gpu_type,
+            "datacenter": pod.datacenter,
+            "image": pod.image,
+        }
+        if volume_id:
+            record["volume_id"] = volume_id
+        if volume_name:
+            record["volume_name"] = volume_name
+        set_pod_record("runpod", args.name, record)
+
+        server_url = f"https://{pod.id}-9189.proxy.runpod.net"
+        comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+
+        if args.json:
+            result: dict = {
+                "ok": True,
+                "pod": {
+                    "id": pod.id, "name": pod.name, "status": pod.status,
+                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+                    "server_url": server_url, "comfy_url": comfy_url,
+                },
+            }
+            if volume_id:
+                result["volume"] = {"id": volume_id, "name": volume_name}
+            print(json.dumps(result, indent=2))
+        else:
+            console.print(f"✓ Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+            console.print(f"  Server:  {server_url}")
+            console.print(f"  ComfyUI: {comfy_url}")
+            console.print()
+            console.print("[dim]The pod is booting comfy-runner server. Once ready, use the server URL[/dim]")
+            console.print("[dim]to deploy, start ComfyUI, etc. via the API.[/dim]")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _resolve_server_url(pod_name: str) -> str:
+    """Resolve a pod name to its comfy-runner server URL."""
+    from comfy_runner.hosted.config import get_pod_record
+    rec = get_pod_record("runpod", pod_name)
+    if not rec:
+        raise RuntimeError(
+            f"No pod record for '{pod_name}'. "
+            f"Create one with 'hosted init' or 'hosted pod create'."
+        )
+    return f"https://{rec['id']}-9189.proxy.runpod.net"
+
+
+def _hosted_deploy(args: argparse.Namespace) -> None:
+    """Deploy a PR/branch/tag/commit to a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner.deploy(
+            install_name,
+            pr=args.pr,
+            branch=args.branch,
+            tag=args.tag,
+            commit=args.commit,
+            reset=args.reset,
+            start=getattr(args, "start", False),
+            launch_args=getattr(args, "launch_args", None),
+        )
+
+        job_id = data.get("job_id")
+        if not job_id:
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print("✓ Deploy completed (sync)")
+            return
+
+        if not args.json:
+            console.print(f"Deploy started (job: {job_id}). Polling...")
+
+        result = runner.poll_job(job_id, on_output=None if args.json else _output)
+
+        if args.json:
+            print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+        else:
+            console.print(f"\n✓ Deploy complete.")
+            if result.get("port"):
+                console.print(f"  ComfyUI running on port {result['port']}")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_status(args: argparse.Namespace) -> None:
+    """Show status of a hosted pod's installations."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None)
+
+        if install_name:
+            data = runner.get_status(install_name)
+        else:
+            data = {"ok": True, "installations": runner.list_installations()}
+
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            if install_name:
+                running = data.get("running", False)
+                status_str = "[green]RUNNING[/green]" if running else "[dim]stopped[/dim]"
+                console.print(f"[cyan]{install_name}[/cyan]: {status_str}")
+                if data.get("port"):
+                    console.print(f"  Port: {data['port']}")
+                if data.get("pid"):
+                    console.print(f"  PID:  {data['pid']}")
+            else:
+                installs = data.get("installations", [])
+                if not installs:
+                    console.print("[dim]No installations on this pod.[/dim]")
+                else:
+                    for inst in installs:
+                        status = inst.get("_status", {})
+                        running = status.get("running", False)
+                        status_str = "[green]RUNNING[/green]" if running else "[dim]stopped[/dim]"
+                        console.print(f"  [cyan]{inst.get('name', '?')}[/cyan]: {status_str}")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_start_comfy(args: argparse.Namespace) -> None:
+    """Restart ComfyUI on a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner.restart(install_name)
+        job_id = data.get("job_id")
+
+        if job_id:
+            if not args.json:
+                console.print(f"Starting ComfyUI (job: {job_id})...")
+            result = runner.poll_job(job_id, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ ComfyUI started.")
+                if result.get("port"):
+                    console.print(f"  Port: {result['port']}")
+        else:
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print("✓ ComfyUI started.")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_stop_comfy(args: argparse.Namespace) -> None:
+    """Stop ComfyUI on a hosted pod."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner.stop(install_name)
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            was_running = data.get("was_running", False)
+            if was_running:
+                console.print("✓ ComfyUI stopped.")
+            else:
+                console.print("[dim]ComfyUI was not running.[/dim]")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _hosted_logs(args: argparse.Namespace) -> None:
+    """Show logs from a hosted pod's ComfyUI instance."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    try:
+        runner = RemoteRunner(_resolve_server_url(args.pod_name))
+        install_name = getattr(args, "install_name", None) or "main"
+
+        data = runner._request("GET", f"/{install_name}/logs")
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            lines = data.get("lines", [])
+            if not lines:
+                console.print("[dim]No logs available.[/dim]")
+            else:
+                for line in lines:
+                    console.print(line, end="", highlight=False)
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1649,6 +2355,116 @@ def main(argv: list[str] | None = None) -> None:
     p_wfm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_wfm.add_argument("--dry-run", action="store_true", help="List models without downloading")
     p_wfm.set_defaults(func=cmd_workflow_models)
+
+    # hosted
+    p_hosted = sub.add_parser("hosted", help="Manage hosted GPU deployments (RunPod, etc.)")
+    hosted_sub = p_hosted.add_subparsers(dest="hosted_action")
+
+    # hosted config
+    p_hosted_config = hosted_sub.add_parser("config", help="View or set hosted provider configuration")
+    hosted_config_sub = p_hosted_config.add_subparsers(dest="hosted_config_action")
+    hosted_config_sub.add_parser("show", help="Show hosted configuration")
+    p_hc_set = hosted_config_sub.add_parser("set", help="Set a configuration value")
+    p_hc_set.add_argument("key", help="Config key (e.g. runpod.api_key)")
+    p_hc_set.add_argument("value", help="Value to set")
+    p_hosted_config.set_defaults(_parser_hosted_config=p_hosted_config)
+
+    # hosted volume
+    p_hosted_volume = hosted_sub.add_parser("volume", help="Manage hosted network volumes")
+    hosted_volume_sub = p_hosted_volume.add_subparsers(dest="hosted_volume_action")
+
+    p_hv_create = hosted_volume_sub.add_parser("create", help="Create a network volume")
+    p_hv_create.add_argument("--name", "-n", required=True, help="Volume name (local config label)")
+    p_hv_create.add_argument("--size", "-s", type=int, required=True, help="Volume size in GB")
+    p_hv_create.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
+
+    hosted_volume_sub.add_parser("list", help="List configured volumes")
+
+    p_hv_rm = hosted_volume_sub.add_parser("rm", help="Remove a volume")
+    p_hv_rm.add_argument("name", help="Volume name to remove")
+    p_hv_rm.add_argument("--keep-remote", action="store_true",
+                         help="Remove local config only, keep volume on RunPod")
+
+    p_hosted_volume.set_defaults(_parser_hosted_volume=p_hosted_volume)
+
+    # hosted pod
+    p_hosted_pod = hosted_sub.add_parser("pod", help="Manage hosted GPU pods")
+    hosted_pod_sub = p_hosted_pod.add_subparsers(dest="hosted_pod_action")
+
+    p_hp_create = hosted_pod_sub.add_parser("create", help="Create a new pod")
+    p_hp_create.add_argument("--name", "-n", required=True, help="Pod name")
+    p_hp_create.add_argument("--gpu", "-g", help="GPU type (default: from config)")
+    p_hp_create.add_argument("--image", "-i", help="Docker image (default: runpod/ubuntu:24.04)")
+    p_hp_create.add_argument("--volume", "-v", help="Volume name (from config) or volume ID")
+    p_hp_create.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
+    p_hp_create.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
+                             help="Cloud type (default: from config)")
+
+    hosted_pod_sub.add_parser("list", help="List all pods")
+
+    p_hp_show = hosted_pod_sub.add_parser("show", help="Show pod details")
+    p_hp_show.add_argument("pod_id", help="Pod ID")
+
+    p_hp_start = hosted_pod_sub.add_parser("start", help="Start a stopped pod")
+    p_hp_start.add_argument("pod_id", help="Pod ID")
+
+    p_hp_stop = hosted_pod_sub.add_parser("stop", help="Stop a running pod")
+    p_hp_stop.add_argument("pod_id", help="Pod ID")
+
+    p_hp_terminate = hosted_pod_sub.add_parser("terminate", help="Permanently terminate a pod")
+    p_hp_terminate.add_argument("pod_id", help="Pod ID")
+
+    p_hp_url = hosted_pod_sub.add_parser("url", help="Get proxy URL for a running pod")
+    p_hp_url.add_argument("pod_id", help="Pod ID")
+    p_hp_url.add_argument("--port", "-p", type=int, help="Port (default: 8188)")
+
+    p_hosted_pod.set_defaults(_parser_hosted_pod=p_hosted_pod)
+
+    # hosted init
+    p_hosted_init = hosted_sub.add_parser("init", help="Create a volume + pod in one shot")
+    p_hosted_init.add_argument("--name", "-n", required=True, help="Pod name")
+    p_hosted_init.add_argument("--gpu", "-g", help="GPU type (default: from config)")
+    p_hosted_init.add_argument("--image", "-i", help="Docker image (default: from config)")
+    p_hosted_init.add_argument("--volume", "-v", help="Volume name (reuse existing or create new)")
+    p_hosted_init.add_argument("--volume-size", type=int, help="Volume size in GB if creating new (default: 50)")
+    p_hosted_init.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
+    p_hosted_init.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
+                               help="Cloud type (default: from config)")
+
+    # hosted deploy
+    p_hosted_deploy = hosted_sub.add_parser("deploy", help="Deploy a PR/branch/tag/commit to a hosted pod")
+    p_hosted_deploy.add_argument("pod_name", help="Pod name (from config)")
+    deploy_group = p_hosted_deploy.add_mutually_exclusive_group()
+    deploy_group.add_argument("--pr", type=int, help="PR number to deploy")
+    deploy_group.add_argument("--branch", help="Branch name to checkout")
+    deploy_group.add_argument("--tag", help="Tag to checkout")
+    deploy_group.add_argument("--commit", help="Commit SHA to checkout")
+    deploy_group.add_argument("--reset", action="store_true", help="Reset to original release ref")
+    p_hosted_deploy.add_argument("--start", action="store_true", help="Start ComfyUI after deploy")
+    p_hosted_deploy.add_argument("--launch-args", help="Launch args to pass to ComfyUI")
+    p_hosted_deploy.add_argument("--install", dest="install_name", help="Installation name on pod (default: main)")
+
+    # hosted status
+    p_hosted_status = hosted_sub.add_parser("status", help="Show status of a hosted pod")
+    p_hosted_status.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_status.add_argument("--install", dest="install_name", help="Specific installation name")
+
+    # hosted start-comfy
+    p_hosted_start = hosted_sub.add_parser("start-comfy", help="Start/restart ComfyUI on a hosted pod")
+    p_hosted_start.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_start.add_argument("--install", dest="install_name", help="Installation name (default: main)")
+
+    # hosted stop-comfy
+    p_hosted_stop = hosted_sub.add_parser("stop-comfy", help="Stop ComfyUI on a hosted pod")
+    p_hosted_stop.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_stop.add_argument("--install", dest="install_name", help="Installation name (default: main)")
+
+    # hosted logs
+    p_hosted_logs = hosted_sub.add_parser("logs", help="Show ComfyUI logs from a hosted pod")
+    p_hosted_logs.add_argument("pod_name", help="Pod name (from config)")
+    p_hosted_logs.add_argument("--install", dest="install_name", help="Installation name (default: main)")
+
+    p_hosted.set_defaults(func=cmd_hosted, _parser_hosted=p_hosted)
 
     # tunnel
     p_tunnel = sub.add_parser("tunnel", help="Manage tunnel exposure")
