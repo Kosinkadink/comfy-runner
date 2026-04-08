@@ -311,16 +311,50 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
 
+    # ── Info ──────────────────────────────────────────────────────
+    {
+        "path": "/{name}/info",
+        "method": "get",
+        "tags": ["Installations"],
+        "summary": "Installation info",
+        "description": (
+            "Returns the full installation record (variant, release, ComfyUI ref, commit, "
+            "launch args, deploy tracking) merged with runtime status and tunnel URLs."
+        ),
+        "parameters": [_NAME_PARAM],
+        "responses": _ok_response("Installation info", {
+            "name": {"type": "string"},
+            "path": {"type": "string"},
+            "variant": {"type": "string"},
+            "release_tag": {"type": "string"},
+            "comfyui_ref": {"type": "string"},
+            "head_commit": {"type": "string"},
+            "python_version": {"type": "string"},
+            "launch_args": {"type": "string"},
+            "created_at": {"type": "string"},
+            "deployed_pr": {"type": "integer", "nullable": True},
+            "deployed_branch": {"type": "string", "nullable": True},
+            "deployed_repo": {"type": "string", "nullable": True},
+            "deployed_title": {"type": "string", "nullable": True},
+            "running": {"type": "boolean"},
+            "pid": {"type": "integer"},
+            "port": {"type": "integer"},
+            "healthy": {"type": "boolean"},
+            "serve_url": {"type": "string", "description": "Tailscale serve URL (if active)"},
+            "tunnel_url": {"type": "string", "description": "Tunnel URL (if active)"},
+        }),
+    },
+
     # ── Deploy ────────────────────────────────────────────────────
     {
         "path": "/{name}/deploy",
         "method": "post",
         "tags": ["Deploy"],
-        "summary": "Deploy PR/branch/tag/commit or reset",
+        "summary": "Deploy PR/branch/tag/commit, update to latest release, or pull",
         "description": (
             "Deploys a code change to the installation. Exactly one of pr, branch, tag, commit, "
-            "or reset must be specified. If the installation doesn't exist, it is auto-initialized. "
-            "Async — returns a job_id."
+            "reset, latest, or pull must be specified. If the installation doesn't exist, it is "
+            "auto-initialized. Async — returns a job_id."
         ),
         "parameters": [_NAME_PARAM],
         "requestBody": {
@@ -331,10 +365,24 @@ _ROUTES: list[dict[str, Any]] = [
                         "type": "object",
                         "properties": {
                             "pr": {"type": "integer", "description": "PR number to deploy"},
-                            "branch": {"type": "string", "description": "Branch name to deploy"},
+                            "branch": {"type": "string", "description": "Branch name to deploy (persisted for --pull)"},
                             "tag": {"type": "string", "description": "Git tag to deploy"},
                             "commit": {"type": "string", "description": "Commit SHA to deploy"},
                             "reset": {"type": "boolean", "description": "Reset to original ref"},
+                            "latest": {
+                                "type": "boolean",
+                                "description": (
+                                    "Update to the latest standalone release's ComfyUI ref. "
+                                    "Lightweight — does not re-download the standalone environment."
+                                ),
+                            },
+                            "pull": {
+                                "type": "boolean",
+                                "description": (
+                                    "Re-fetch the currently tracked branch or PR. "
+                                    "Errors if no movable target is tracked."
+                                ),
+                            },
                             "start": {"type": "boolean", "description": "Start after deploy (auto-starts if was running)"},
                             "launch_args": {"type": "string", "description": "Override launch args for this deploy"},
                             "cuda_compat": {

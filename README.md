@@ -149,11 +149,21 @@ comfy_runner.py snapshot import <file> [name]
 ```bash
 # Deploy a PR, branch, tag, or commit
 comfy_runner.py deploy [name] --pr 1234
-comfy_runner.py deploy [name] --branch feature-x
+comfy_runner.py deploy [name] --branch master
 comfy_runner.py deploy [name] --tag v1.0.0
 comfy_runner.py deploy [name] --commit abc1234
-comfy_runner.py deploy [name] --reset    # reset to default state
+comfy_runner.py deploy [name] --reset    # reset to original release ref
+
+# Update to the latest standalone release's ComfyUI ref
+# (lightweight — only updates git checkout, not the standalone environment)
+comfy_runner.py deploy [name] --latest
+
+# Re-fetch the currently tracked branch or PR
+# (requires a prior --branch or --pr deploy to set tracking)
+comfy_runner.py deploy [name] --pull
 ```
+
+Using `--branch` persists the branch name so `--pull` can re-fetch it later. The deploy command automatically stops the instance before deploying, installs changed requirements, restarts if it was running, and captures a post-update snapshot.
 
 ### Tunneling
 
@@ -162,6 +172,7 @@ Expose a running ComfyUI instance's port to the internet via ngrok or Tailscale 
 ```bash
 # Start/stop a tunnel for an installation's ComfyUI port
 comfy_runner.py tunnel start [name] --provider ngrok
+comfy_runner.py tunnel start [name] --provider ngrok --domain myapp.ngrok-free.app
 comfy_runner.py tunnel start [name] --provider tailscale
 comfy_runner.py tunnel stop [name]
 
