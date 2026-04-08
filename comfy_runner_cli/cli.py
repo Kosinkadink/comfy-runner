@@ -420,9 +420,9 @@ def cmd_logs(args: argparse.Namespace) -> None:
 
 
 def cmd_deploy(args: argparse.Namespace) -> None:
-    """Deploy a PR, branch, tag, or commit to a ComfyUI installation."""
-    from comfy_runner.comfyui import deploy_pr, deploy_ref, deploy_reset
+    """Deploy a PR, branch, tag, commit, latest release, or pull current tracking."""
     from comfy_runner.config import get_installation, set_installation
+    from comfy_runner.deployments import execute_deploy
     from comfy_runner.pip_utils import install_filtered_requirements
     from comfy_runner.process import get_status, start_installation, stop_installation
 
@@ -443,34 +443,22 @@ def cmd_deploy(args: argparse.Namespace) -> None:
 
         if was_running:
             if running_port:
-                _maybe_tailscale_unserve(running_port, send_output=out)
+                maybe_tailscale_unserve(running_port, send_output=out)
             if out:
                 out(f"Stopping '{name}' before deploy...\n")
             stop_installation(name, send_output=out)
 
-        # Determine which deploy mode
-        if args.reset:
-            original_ref = record.get("comfyui_ref")
-            if not original_ref:
-                raise RuntimeError(
-                    "No original comfyui_ref recorded for this installation. "
-                    "Cannot reset."
-                )
-            result = deploy_reset(install_path, original_ref, send_output=out)
-        elif args.pr:
-            result = deploy_pr(install_path, args.pr, send_output=out)
-        elif args.branch:
-            result = deploy_ref(install_path, args.branch, send_output=out)
-        elif args.tag:
-            result = deploy_ref(install_path, args.tag, send_output=out)
-        elif args.commit:
-            result = deploy_ref(
-                install_path, args.commit, fetch_first=False, send_output=out
-            )
-        else:
-            raise RuntimeError(
-                "Specify one of: --pr, --branch, --tag, --commit, or --reset"
-            )
+        result, updates = execute_deploy(
+            install_path, record,
+            pr=getattr(args, "pr", None),
+            branch=getattr(args, "branch", None),
+            tag=getattr(args, "tag", None),
+            commit=getattr(args, "commit", None),
+            reset=getattr(args, "reset", False),
+            latest=getattr(args, "latest", False),
+            pull=getattr(args, "pull", False),
+            send_output=out,
+        )
 
         # Check if requirements changed and install if so
         changed_files = result.get("changed_files", [])
@@ -497,15 +485,15 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             if out and changed_files:
                 out("Requirements unchanged — skipping pip install.\n")
 
-        # Update config with new HEAD and deploy tracking
-        if result.get("new_head"):
-            record["head_commit"] = result["new_head"]
-        if args.pr:
+        # Apply record updates
+        for k, v in updates.items():
+            if v is None:
+                record.pop(k, None)
+            else:
+                record[k] = v
+        # Preserve repo/title from args for PR deploys
+        if getattr(args, "pr", None):
             record["deployed_pr"] = args.pr
-        else:
-            record.pop("deployed_pr", None)
-            record.pop("deployed_repo", None)
-            record.pop("deployed_title", None)
         set_installation(name, record)
 
         # Restart if it was running
@@ -521,11 +509,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             result["port"] = start_result.get("port")
             result["pid"] = start_result.get("pid")
             if start_result.get("port"):
-                _maybe_tailscale_serve(start_result["port"], send_output=out)
+                maybe_tailscale_serve(start_result["port"], send_output=out)
         else:
             result["restarted"] = False
 
-        _capture_snapshot(name, "post-update", send_output=out)
+        capture_snapshot(name, "post-update", send_output=out)
 
         if out:
             out(f"\n✓ Deploy complete.\n")
@@ -2466,7 +2454,7 @@ def main(argv: list[str] | None = None) -> None:
     p_ts.set_defaults(func=cmd_tailscale_serve, _parser_ts=p_ts)
 
     # deploy
-    p_deploy = sub.add_parser("deploy", help="Deploy a PR, branch, tag, or commit")
+    p_deploy = sub.add_parser("deploy", help="Deploy a PR, branch, tag, commit, or update to latest release")
     p_deploy.add_argument("name", nargs="?", default="main", help="Installation name (default: main)")
     deploy_group = p_deploy.add_mutually_exclusive_group()
     deploy_group.add_argument("--pr", type=int, help="PR number to deploy")
@@ -2474,6 +2462,8 @@ def main(argv: list[str] | None = None) -> None:
     deploy_group.add_argument("--tag", help="Tag to checkout")
     deploy_group.add_argument("--commit", help="Commit SHA to checkout")
     deploy_group.add_argument("--reset", action="store_true", help="Reset to the original release ref")
+    deploy_group.add_argument("--latest", action="store_true", help="Update to the latest standalone release's ComfyUI ref")
+    deploy_group.add_argument("--pull", action="store_true", help="Re-fetch the currently tracked PR or branch")
     p_deploy.set_defaults(func=cmd_deploy)
 
     # download-model

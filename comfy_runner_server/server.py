@@ -444,6 +444,7 @@ def create_app() -> Any:
                 "launch_args": record.get("launch_args"),
                 "created_at": record.get("created_at"),
                 "deployed_pr": record.get("deployed_pr"),
+                "deployed_branch": record.get("deployed_branch"),
                 "deployed_repo": record.get("deployed_repo"),
                 "deployed_title": record.get("deployed_title"),
                 "running": status.get("running", False),
@@ -479,15 +480,18 @@ def create_app() -> Any:
         tag = body.get("tag")
         commit = body.get("commit")
         reset = body.get("reset", False)
-        if not any([pr, branch, tag, commit, reset]):
-            return _err("Specify one of: pr, branch, tag, commit, or reset")
+        latest = body.get("latest", False)
+        pull = body.get("pull", False)
+        modes = [pr is not None, bool(branch), bool(tag), bool(commit), reset, latest, pull]
+        if sum(modes) != 1:
+            return _err("Specify exactly one of: pr, branch, tag, commit, reset, latest, or pull")
 
         needs_init = record is None
         job_id = _jobs.create(label=f"{'init + ' if needs_init else ''}deploy {name}")
 
         def _run() -> None:
-            from comfy_runner.comfyui import deploy_pr, deploy_ref, deploy_reset
             from comfy_runner.config import get_installation, set_installation
+            from comfy_runner.deployments import execute_deploy
             from comfy_runner.installations import init_installation
             from comfy_runner.pip_utils import install_filtered_requirements
             from comfy_runner.process import get_status, start_installation, stop_installation
@@ -521,9 +525,6 @@ def create_app() -> Any:
                     if not rec:
                         _jobs.fail(job_id, "Installation record missing after init", lines)
                         return
-                    # Ensure ComfyUI listens on all interfaces so the
-                    # RunPod proxy (and any other external client) can
-                    # reach it.
                     existing_args = rec.get("launch_args", "") or ""
                     if "--listen" not in existing_args:
                         rec["launch_args"] = f"--listen 0.0.0.0 {existing_args}".strip()
@@ -542,23 +543,18 @@ def create_app() -> Any:
                     except RuntimeError:
                         pass
 
-                if reset:
-                    original_ref = rec.get("comfyui_ref")
-                    if not original_ref:
-                        _jobs.fail(job_id, "No original comfyui_ref recorded.", lines)
-                        return
-                    result = deploy_reset(install_path, original_ref, send_output=out)
-                elif pr:
-                    result = deploy_pr(install_path, int(pr), send_output=out)
-                elif branch:
-                    result = deploy_ref(install_path, branch, send_output=out)
-                elif tag:
-                    result = deploy_ref(install_path, tag, send_output=out)
-                elif commit:
-                    result = deploy_ref(install_path, commit, fetch_first=False, send_output=out)
-                else:
-                    _jobs.fail(job_id, "No deploy mode specified", lines)
-                    return
+                result, updates = execute_deploy(
+                    install_path, rec,
+                    pr=int(pr) if pr else None,
+                    branch=branch,
+                    tag=tag,
+                    commit=commit,
+                    reset=reset,
+                    latest=latest,
+                    pull=pull,
+                    repo_url=body.get("repo"),
+                    send_output=out,
+                )
 
                 # Install requirements if changed
                 changed_files = result.get("changed_files", [])
@@ -575,17 +571,17 @@ def create_app() -> Any:
                 else:
                     result["requirements_installed"] = False
 
-                if result.get("new_head"):
-                    rec["head_commit"] = result["new_head"]
+                # Apply record updates from shared helper
+                for k, v in updates.items():
+                    if v is None:
+                        rec.pop(k, None)
+                    else:
+                        rec[k] = v
+                # Preserve repo/title from request body for PR deploys
                 if pr:
                     rec["deployed_pr"] = int(pr)
                     rec["deployed_repo"] = body.get("repo", "")
                     rec["deployed_title"] = body.get("title", "")
-                else:
-                    rec.pop("deployed_pr", None)
-                    rec.pop("deployed_repo", None)
-                    rec.pop("deployed_title", None)
-                # Apply launch_args if provided in the request
                 if "launch_args" in body:
                     rec["launch_args"] = body["launch_args"]
                 set_installation(name, rec)
