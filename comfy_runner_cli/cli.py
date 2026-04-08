@@ -564,6 +564,7 @@ def cmd_tunnel_start(args: argparse.Namespace) -> None:
             name=args.name,
             provider=args.provider,
             send_output=None if args.json else _output,
+            domain=getattr(args, "domain", "") or "",
         )
         if args.json:
             print(json.dumps({"ok": True, **result}, indent=2))
@@ -2619,6 +2620,7 @@ def main(argv: list[str] | None = None) -> None:
     p_tunnel_start = tunnel_sub.add_parser("start", help="Start tunnel")
     p_tunnel_start.add_argument("name", nargs="?", default="main")
     p_tunnel_start.add_argument("--provider", choices=["ngrok", "tailscale"], default="tailscale")
+    p_tunnel_start.add_argument("--domain", help="Explicit ngrok domain (overrides pool)")
 
     p_tunnel_stop = tunnel_sub.add_parser("stop", help="Stop tunnel")
     p_tunnel_stop.add_argument("name", nargs="?", default="main")

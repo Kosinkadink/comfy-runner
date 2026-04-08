@@ -876,11 +876,12 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         provider = body.get("provider", "tailscale")
+        domain = body.get("domain", "")
         out, lines = _make_collector()
 
         log.info("Starting %s tunnel for '%s'…", provider, name)
         try:
-            result = start_tunnel(name, provider=provider, send_output=out)
+            result = start_tunnel(name, provider=provider, send_output=out, domain=domain)
             log.info("Tunnel started for '%s': %s", name, result.get("url", "?"))
             return jsonify({"ok": True, **result, "output": lines})
         except Exception as e:

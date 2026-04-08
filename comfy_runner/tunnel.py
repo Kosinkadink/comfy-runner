@@ -104,7 +104,7 @@ class NgrokTunnel:
         self._pid = pid
         self._api_addr: str | None = None
 
-    def start(self, port: int) -> str:
+    def start(self, port: int, *, domain: str = "") -> str:
         if not shutil.which("ngrok"):
             raise RuntimeError("ngrok binary not found on PATH.")
 
@@ -117,8 +117,9 @@ class NgrokTunnel:
 
         self._port = port
 
-        # Allocate a domain from the pool (if configured)
-        domain = _allocate_ngrok_domain(domains, port)
+        # Use explicit domain override, or allocate from the pool
+        if not domain:
+            domain = _allocate_ngrok_domain(domains, port)
 
         # Pick a unique API address so multiple ngrok processes can coexist
         api_port = 14000 + port
@@ -621,11 +622,13 @@ def start_tunnel(
     name: str,
     provider: str = "ngrok",
     send_output: Callable[[str], None] | None = None,
+    domain: str = "",
 ) -> dict[str, Any]:
     """Start a tunnel for a running installation.
 
     Reads the installation's running port from status, spawns the tunnel
-    provider, and returns the public URL.
+    provider, and returns the public URL.  When *domain* is given, it
+    overrides the automatic domain pool selection (ngrok only).
     """
     status = get_status(name)
     if not status.get("running"):
@@ -648,7 +651,7 @@ def start_tunnel(
         send_output(f"Starting {provider} tunnel for '{name}' on port {port}...\n")
 
     tunnel = _get_provider(provider)
-    url = tunnel.start(port)
+    url = tunnel.start(port, domain=domain) if domain and isinstance(tunnel, NgrokTunnel) else tunnel.start(port)
 
     if send_output:
         send_output(f"\n✓ Tunnel active: {url}\n")
