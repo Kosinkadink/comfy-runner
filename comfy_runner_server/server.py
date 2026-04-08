@@ -419,6 +419,52 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # GET /<name>/info
+    # ------------------------------------------------------------------
+    @app.route("/<name>/info", methods=["GET"])
+    def route_info(name: str) -> Any:
+        from comfy_runner.process import get_status
+        from comfy_runner.tunnel import get_tunnel_url
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        try:
+            status = get_status(name)
+            info: dict[str, Any] = {
+                "ok": True,
+                "name": name,
+                "path": record.get("path"),
+                "variant": record.get("variant"),
+                "release_tag": record.get("release_tag"),
+                "comfyui_ref": record.get("comfyui_ref"),
+                "head_commit": record.get("head_commit"),
+                "python_version": record.get("python_version"),
+                "launch_args": record.get("launch_args"),
+                "created_at": record.get("created_at"),
+                "deployed_pr": record.get("deployed_pr"),
+                "deployed_repo": record.get("deployed_repo"),
+                "deployed_title": record.get("deployed_title"),
+                "running": status.get("running", False),
+                "pid": status.get("pid"),
+                "port": status.get("port"),
+                "healthy": status.get("healthy"),
+            }
+            if _tailscale_mode and status.get("port"):
+                from comfy_runner.tunnel import _load_serve_registry, get_tailscale_serve_url
+                if status["port"] in _load_serve_registry():
+                    serve_url = get_tailscale_serve_url(status["port"])
+                    if serve_url:
+                        info["serve_url"] = serve_url
+            tunnel_url = get_tunnel_url(name)
+            if tunnel_url:
+                info["tunnel_url"] = tunnel_url
+            return jsonify(info)
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # POST /<name>/deploy  (async — returns job_id)
     # ------------------------------------------------------------------
     @app.route("/<name>/deploy", methods=["POST"])
