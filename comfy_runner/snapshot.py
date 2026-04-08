@@ -9,6 +9,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,6 +144,150 @@ def capture_state(
             "commit": commit,
             "releaseTag": manifest["version"],
             "variant": manifest["id"],
+        },
+        "customNodes": [_node_to_camel(n) for n in custom_nodes],
+        "pipPackages": pip_packages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# External / Manual Install Capture
+# ---------------------------------------------------------------------------
+
+_VENV_CANDIDATES = (".venv", "venv", ".env", "env")
+
+
+def _find_venv_python(comfyui_dir: Path) -> Path | None:
+    """Find a Python binary in common venv locations inside a ComfyUI dir.
+
+    Mirrors Desktop 2.0 git.ts findVenv + getVenvPython — checks .venv,
+    venv, .env, env for a pyvenv.cfg marker.
+    """
+    for name in _VENV_CANDIDATES:
+        venv_dir = comfyui_dir / name
+        if not (venv_dir / "pyvenv.cfg").exists():
+            continue
+        if sys.platform == "win32":
+            py = venv_dir / "Scripts" / "python.exe"
+            if py.exists():
+                return py
+            py = venv_dir / "python.exe"
+            if py.exists():
+                return py
+        else:
+            py = venv_dir / "bin" / "python3"
+            if py.exists():
+                return py
+            py = venv_dir / "bin" / "python"
+            if py.exists():
+                return py
+    return None
+
+
+def pip_freeze_direct(python_path: str | Path) -> dict[str, str]:
+    """Run ``python -m pip freeze --local`` against an arbitrary Python binary.
+
+    Unlike pip_utils.pip_freeze this does NOT require uv or a comfy-runner
+    managed installation — it works with any venv.  Mirrors Desktop 2.0
+    desktopDetect.ts pipFreezeDirect.
+    """
+    result = subprocess.run(
+        [str(python_path), "-m", "pip", "freeze", "--local"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        creationflags=subprocess.CREATE_NO_WINDOW
+        if hasattr(subprocess, "CREATE_NO_WINDOW")
+        else 0,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout)[:500]
+        raise RuntimeError(f"pip freeze failed: {detail}")
+
+    packages: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        # Editable installs: "-e git+https://...@commit#egg=name"
+        if trimmed.startswith("-e "):
+            m = re.search(r"#egg=(.+)", trimmed)
+            if m:
+                packages[m.group(1)] = trimmed
+            continue
+        # PEP 508 direct references: "package @ git+https://..."
+        at_match = re.match(r"^([A-Za-z0-9_.-]+)\s*@\s*(.+)$", trimmed)
+        if at_match:
+            packages[at_match.group(1)] = at_match.group(2).strip()
+            continue
+        # Standard: "package==version"
+        eq_idx = trimmed.find("==")
+        if eq_idx > 0:
+            packages[trimmed[:eq_idx]] = trimmed[eq_idx + 2:]
+
+    return packages
+
+
+def capture_external_state(
+    comfyui_dir: str | Path,
+    venv_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Capture snapshot state from a manual/portable ComfyUI install.
+
+    Unlike capture_state (which expects a comfy-runner managed install_path
+    with ``install_path/ComfyUI/``), this takes the ComfyUI directory itself
+    as the root.  Mirrors Desktop 2.0 localMigration.ts captureLocalSnapshot.
+
+    Parameters
+    ----------
+    comfyui_dir:
+        Path to the ComfyUI git clone (the directory containing ``main.py``
+        and ``custom_nodes/``).
+    venv_path:
+        Optional explicit path to a venv directory.  If omitted, common
+        locations (``.venv``, ``venv``, etc.) inside *comfyui_dir* are probed.
+    """
+    from .git_utils import read_git_head
+    from .nodes import scan_custom_nodes_dir
+
+    comfyui_dir = Path(comfyui_dir)
+    commit = read_git_head(str(comfyui_dir))
+    custom_nodes = scan_custom_nodes_dir(comfyui_dir / "custom_nodes")
+
+    # Resolve Python binary
+    python: Path | None = None
+    if venv_path is not None:
+        venv = Path(venv_path)
+        if sys.platform == "win32":
+            for candidate in (venv / "Scripts" / "python.exe", venv / "python.exe"):
+                if candidate.exists():
+                    python = candidate
+                    break
+        else:
+            for candidate in (venv / "bin" / "python3", venv / "bin" / "python"):
+                if candidate.exists():
+                    python = candidate
+                    break
+        if python is None:
+            raise RuntimeError(
+                f"Python not found in specified venv: {venv_path}"
+            )
+    else:
+        python = _find_venv_python(comfyui_dir)
+
+    pip_packages: dict[str, str] = {}
+    if python is not None:
+        try:
+            pip_packages = pip_freeze_direct(python)
+        except Exception as e:
+            print(f"Snapshot: pip freeze failed: {e}", file=sys.stderr)
+
+    return {
+        "comfyui": {
+            "ref": "manual",
+            "commit": commit,
+            "releaseTag": "",
+            "variant": "",
         },
         "customNodes": [_node_to_camel(n) for n in custom_nodes],
         "pipPackages": pip_packages,

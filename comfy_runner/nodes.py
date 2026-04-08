@@ -106,6 +106,16 @@ def scan_custom_nodes(install_path: str | Path) -> list[dict[str, Any]]:
     """
     install_path = Path(install_path)
     custom_nodes_dir = install_path / "ComfyUI" / "custom_nodes"
+    return scan_custom_nodes_dir(custom_nodes_dir)
+
+
+def scan_custom_nodes_dir(custom_nodes_dir: str | Path) -> list[dict[str, Any]]:
+    """Scan a custom_nodes directory directly.
+
+    Like scan_custom_nodes but takes the custom_nodes path itself, making it
+    usable for manual/portable installs where the ComfyUI dir IS the root.
+    """
+    custom_nodes_dir = Path(custom_nodes_dir)
     nodes: list[dict[str, Any]] = []
 
     # Active nodes

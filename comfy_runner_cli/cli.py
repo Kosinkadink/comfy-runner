@@ -981,20 +981,32 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
 
     try:
         if action == "capture":
-            from comfy_runner.snapshot import _iso_now, capture_state
+            from comfy_runner.snapshot import (
+                _iso_now, capture_state, capture_external_state,
+            )
 
             install_path = Path(args.path).resolve()
             comfyui_dir = install_path / "ComfyUI"
-            if not comfyui_dir.is_dir():
+            venv_override = getattr(args, "venv", None)
+
+            if comfyui_dir.is_dir():
+                # Standard comfy-runner layout: install_path/ComfyUI/
+                if out:
+                    out(f"Capturing snapshot from {install_path}...\n")
+                state = capture_state(install_path)
+            elif (install_path / "custom_nodes").is_dir():
+                # Manual/portable install: path IS the ComfyUI dir
+                if out:
+                    out(f"Capturing snapshot from manual install at {install_path}...\n")
+                state = capture_external_state(
+                    install_path,
+                    venv_path=venv_override,
+                )
+            else:
                 raise RuntimeError(
                     f"Not a valid ComfyUI installation: {install_path}\n"
-                    f"Expected ComfyUI/ subdirectory at {comfyui_dir}"
+                    f"Expected ComfyUI/ subdirectory or custom_nodes/ directory"
                 )
-
-            if out:
-                out(f"Capturing snapshot from {install_path}...\n")
-
-            state = capture_state(install_path)
             snapshot = {
                 "version": 1,
                 "createdAt": _iso_now(),
@@ -2395,7 +2407,8 @@ def main(argv: list[str] | None = None) -> None:
     snap_sub = p_snap.add_subparsers(dest="snapshot_action")
 
     p_snap_capture = snap_sub.add_parser("capture", help="Capture snapshot from any ComfyUI directory (no registration required)")
-    p_snap_capture.add_argument("--path", required=True, help="Path to ComfyUI installation directory")
+    p_snap_capture.add_argument("--path", required=True, help="Path to ComfyUI installation directory (managed or manual/portable)")
+    p_snap_capture.add_argument("--venv", help="Explicit venv path for manual installs (auto-detected if omitted)")
     p_snap_capture.add_argument("--label", "-l", help="Optional label for the snapshot")
     p_snap_capture.add_argument("--output", "-o", required=True, help="Output file path for the snapshot JSON")
 
