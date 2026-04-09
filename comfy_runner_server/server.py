@@ -1533,6 +1533,53 @@ def create_app() -> Any:
         return send_from_directory(str(output_dir), filepath)
 
     # ------------------------------------------------------------------
+    # GET /config — view global config
+    # PUT /config — update global config keys
+    # ------------------------------------------------------------------
+    @app.route("/config", methods=["GET"])
+    def route_global_config_get() -> Any:
+        from comfy_runner.config import get_shared_dir, get_hf_token, get_modelscope_token
+        return jsonify({
+            "ok": True,
+            "config": {
+                "shared_dir": get_shared_dir(),
+                "hf_token": bool(get_hf_token()),
+                "modelscope_token": bool(get_modelscope_token()),
+            },
+        })
+
+    @app.route("/config", methods=["PUT"])
+    def route_global_config_set() -> Any:
+        from comfy_runner.config import (
+            set_shared_dir, set_hf_token, set_modelscope_token,
+        )
+        body = request.get_json(silent=True) or {}
+        allowed_keys = {"shared_dir", "hf_token", "modelscope_token"}
+        updated = {}
+        for key in allowed_keys:
+            if key in body:
+                value = body[key]
+                if key == "shared_dir":
+                    if value:
+                        from comfy_runner.shared_paths import ensure_shared_dirs
+                        resolved = str(Path(value).resolve())
+                        ensure_shared_dirs(resolved)
+                        set_shared_dir(resolved)
+                        updated[key] = resolved
+                    else:
+                        set_shared_dir("")
+                        updated[key] = ""
+                elif key == "hf_token":
+                    set_hf_token(value)
+                    updated[key] = bool(value)
+                elif key == "modelscope_token":
+                    set_modelscope_token(value)
+                    updated[key] = bool(value)
+        if not updated:
+            return _err(f"No valid keys. Allowed: {', '.join(sorted(allowed_keys))}")
+        return jsonify({"ok": True, "updated": updated})
+
+    # ------------------------------------------------------------------
     # Backwards-compat: un-prefixed routes default to first installation
     # ------------------------------------------------------------------
     def _default_name() -> str:

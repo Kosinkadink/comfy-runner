@@ -83,6 +83,28 @@ def _validate_model_path(models_dir: Path, directory: str, name: str) -> Path:
     return resolved
 
 
+def _get_auth_headers(url: str) -> dict[str, str]:
+    """Return auth headers for known model hosting platforms.
+
+    Detects HuggingFace and ModelScope URLs and adds Bearer token
+    if configured. Returns empty dict for unknown hosts or if no
+    token is set.
+    """
+    from urllib.parse import urlparse
+    from .config import get_hf_token, get_modelscope_token
+
+    host = urlparse(url).hostname or ""
+    if "huggingface.co" in host:
+        token = get_hf_token()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+    elif "modelscope.cn" in host or "modelscope.ai" in host:
+        token = get_modelscope_token()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def check_missing_models(
     models: list[dict[str, str]],
     models_dir: Path,
@@ -222,7 +244,8 @@ def download_models(
                 continue
 
             try:
-                resp = requests.get(model["url"], stream=True, timeout=30)
+                auth_headers = _get_auth_headers(model["url"])
+                resp = requests.get(model["url"], stream=True, timeout=30, headers=auth_headers)
                 resp.raise_for_status()
             except Exception as e:
                 result["failed"].append(rel)

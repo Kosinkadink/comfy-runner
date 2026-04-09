@@ -641,14 +641,14 @@ def cmd_tunnel_config(args: argparse.Namespace) -> None:
 
 def cmd_config(args: argparse.Namespace) -> None:
     """View or set global configuration."""
-    from comfy_runner.config import get_shared_dir, load_config, set_shared_dir
+    from comfy_runner.config import get_shared_dir, get_hf_token, get_modelscope_token, load_config, set_shared_dir, set_hf_token, set_modelscope_token
 
     action = getattr(args, "config_action", None)
 
     if action == "set":
         key = args.key
         value = args.value
-        allowed_keys = {"shared_dir"}
+        allowed_keys = {"shared_dir", "hf_token", "modelscope_token"}
         if key not in allowed_keys:
             err = f"Unknown key '{key}'. Allowed: {', '.join(sorted(allowed_keys))}"
             if args.json:
@@ -671,6 +671,18 @@ def cmd_config(args: argparse.Namespace) -> None:
                 if not args.json:
                     console.print("[green]✓ shared_dir cleared[/green]")
 
+        elif key == "hf_token":
+            set_hf_token(value)
+            if not args.json:
+                display = "(cleared)" if not value else f"{value[:8]}..."
+                console.print(f"[green]✓ hf_token = {display}[/green]")
+
+        elif key == "modelscope_token":
+            set_modelscope_token(value)
+            if not args.json:
+                display = "(cleared)" if not value else f"{value[:8]}..."
+                console.print(f"[green]✓ modelscope_token = {display}[/green]")
+
         if args.json:
             print(json.dumps({"ok": True, "key": key, "value": value}))
 
@@ -688,6 +700,10 @@ def cmd_config(args: argparse.Namespace) -> None:
             console.print("[bold]comfy-runner configuration[/bold]\n")
             console.print(f"  shared_dir:        [bold]{shared or '(not set)'}[/bold]")
             console.print(f"  installations_dir: {config.get('installations_dir', '')}")
+            hf = get_hf_token()
+            ms = get_modelscope_token()
+            console.print(f"  hf_token:          [bold]{(hf[:8] + '...') if hf else '(not set)'}[/bold]")
+            console.print(f"  modelscope_token:  [bold]{(ms[:8] + '...') if ms else '(not set)'}[/bold]")
             tunnel_cfg = config.get("tunnel", {})
             if tunnel_cfg:
                 for provider, pcfg in tunnel_cfg.items():

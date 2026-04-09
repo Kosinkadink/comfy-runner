@@ -122,3 +122,41 @@ def get_github_token() -> str:
         return token
     config = load_config()
     return config.get("github_token", "")
+
+
+def get_hf_token() -> str:
+    """Get HuggingFace token from config or environment."""
+    token = os.environ.get("HF_TOKEN", "")
+    if token:
+        return token
+    config = load_config()
+    return config.get("hf_token", "")
+
+
+def set_hf_token(token: str) -> None:
+    """Set HuggingFace token in config."""
+    config = load_config()
+    if token:
+        config["hf_token"] = token
+    else:
+        config.pop("hf_token", None)
+    save_config(config)
+
+
+def get_modelscope_token() -> str:
+    """Get ModelScope token from config or environment."""
+    token = os.environ.get("MODELSCOPE_SDK_TOKEN", "")
+    if token:
+        return token
+    config = load_config()
+    return config.get("modelscope_token", "")
+
+
+def set_modelscope_token(token: str) -> None:
+    """Set ModelScope token in config."""
+    config = load_config()
+    if token:
+        config["modelscope_token"] = token
+    else:
+        config.pop("modelscope_token", None)
+    save_config(config)
