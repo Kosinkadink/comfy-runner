@@ -1477,18 +1477,22 @@ def create_app() -> Any:
 
         prefix = request.args.get("prefix", "")
         limit = request.args.get("limit", 50, type=int)
+        after = request.args.get("after", type=float)
 
         files = []
         for p in sorted(output_dir.rglob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
             if not p.is_file():
+                continue
+            stat = p.stat()
+            if after is not None and stat.st_mtime <= after:
                 continue
             rel = p.relative_to(output_dir)
             if prefix and not str(rel).startswith(prefix):
                 continue
             files.append({
                 "name": str(rel),
-                "size": p.stat().st_size,
-                "modified": p.stat().st_mtime,
+                "size": stat.st_size,
+                "modified": stat.st_mtime,
             })
             if len(files) >= limit:
                 break
