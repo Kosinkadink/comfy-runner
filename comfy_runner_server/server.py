@@ -1365,6 +1365,161 @@ def create_app() -> Any:
         })
 
     # ------------------------------------------------------------------
+    # POST /<name>/start  (async — returns job_id)
+    # ------------------------------------------------------------------
+    @app.route("/<name>/start", methods=["POST"])
+    def route_start(name: str) -> Any:
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        job_id = _jobs.create(label=f"start {name}")
+
+        def _run() -> None:
+            from comfy_runner.config import get_installation
+            from comfy_runner.process import get_status, start_installation
+
+            out, lines = _make_collector(job_id)
+            lock = _get_install_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Installation '{name}' is busy", lines)
+                return
+            try:
+                status = get_status(name)
+                if status.get("running"):
+                    _jobs.fail(job_id, f"Installation '{name}' is already running", lines)
+                    return
+
+                rec = get_installation(name)
+                install_path = rec["path"] if rec else ""
+
+                result = start_installation(name, send_output=out)
+                if _tailscale_mode and result.get("port"):
+                    try:
+                        from comfy_runner.tunnel import start_tailscale_serve_port
+                        ts_url = start_tailscale_serve_port(result["port"], send_output=out)
+                        result["tailscale_url"] = ts_url
+                    except Exception as e:
+                        out(f"⚠ Tailscale serve failed: {e}\n")
+                if install_path:
+                    _capture_and_track(name, install_path, "start", out=out)
+                _jobs.finish(job_id, result, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # GET/POST /<name>/comfyui/<path> — proxy to running ComfyUI instance
+    # ------------------------------------------------------------------
+    @app.route("/<name>/comfyui/", defaults={"subpath": ""}, methods=["GET", "POST", "PUT", "DELETE"])
+    @app.route("/<name>/comfyui/<path:subpath>", methods=["GET", "POST", "PUT", "DELETE"])
+    def route_comfyui_proxy(name: str, subpath: str) -> Any:
+        import requests as req_lib
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        from comfy_runner.process import get_status
+        status = get_status(name)
+        if not status.get("running"):
+            return _err(f"Installation '{name}' is not running", 503)
+
+        port = status["port"]
+        target_url = f"http://127.0.0.1:{port}/{subpath}"
+        if request.query_string:
+            target_url += f"?{request.query_string.decode()}"
+
+        try:
+            resp = req_lib.request(
+                method=request.method,
+                url=target_url,
+                headers={k: v for k, v in request.headers if k.lower() not in ("host", "content-length")},
+                data=request.get_data(),
+                timeout=120,
+            )
+            from flask import Response
+            return Response(
+                resp.content,
+                status=resp.status_code,
+                headers=dict(resp.headers),
+            )
+        except req_lib.ConnectionError:
+            return _err(f"Cannot connect to ComfyUI on port {port}", 502)
+        except req_lib.Timeout:
+            return _err("ComfyUI request timed out", 504)
+
+    # ------------------------------------------------------------------
+    # GET /<name>/outputs — list output files
+    # GET /<name>/outputs/<path> — download a specific output file
+    # ------------------------------------------------------------------
+    @app.route("/<name>/outputs", methods=["GET"])
+    def route_outputs_list(name: str) -> Any:
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        from comfy_runner.config import get_shared_dir
+
+        # Determine output directory: shared dir or installation-local
+        shared_dir = get_shared_dir()
+        if shared_dir:
+            output_dir = Path(shared_dir) / "output"
+        else:
+            output_dir = Path(record["path"]) / "ComfyUI" / "output"
+
+        if not output_dir.exists():
+            return jsonify({"ok": True, "output_dir": str(output_dir), "files": []})
+
+        prefix = request.args.get("prefix", "")
+        limit = request.args.get("limit", 50, type=int)
+
+        files = []
+        for p in sorted(output_dir.rglob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(output_dir)
+            if prefix and not str(rel).startswith(prefix):
+                continue
+            files.append({
+                "name": str(rel),
+                "size": p.stat().st_size,
+                "modified": p.stat().st_mtime,
+            })
+            if len(files) >= limit:
+                break
+
+        return jsonify({"ok": True, "output_dir": str(output_dir), "files": files})
+
+    @app.route("/<name>/outputs/<path:filepath>", methods=["GET"])
+    def route_outputs_download(name: str, filepath: str) -> Any:
+        from flask import send_from_directory
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        from comfy_runner.config import get_shared_dir
+
+        shared_dir = get_shared_dir()
+        if shared_dir:
+            output_dir = Path(shared_dir) / "output"
+        else:
+            output_dir = Path(record["path"]) / "ComfyUI" / "output"
+
+        target = (output_dir / filepath).resolve()
+        if not str(target).startswith(str(output_dir.resolve())):
+            return _err("Invalid path", 403)
+        if not target.is_file():
+            return _err(f"File not found: {filepath}", 404)
+
+        return send_from_directory(str(output_dir), filepath)
+
+    # ------------------------------------------------------------------
     # Backwards-compat: un-prefixed routes default to first installation
     # ------------------------------------------------------------------
     def _default_name() -> str:
