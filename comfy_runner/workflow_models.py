@@ -72,6 +72,17 @@ def resolve_models_dir(install_path: str | Path) -> Path:
 # Check which models are missing
 # ---------------------------------------------------------------------------
 
+def _validate_model_path(models_dir: Path, directory: str, name: str) -> Path:
+    """Resolve and validate a model path, preventing path traversal.
+
+    Raises ValueError if the resolved path escapes models_dir.
+    """
+    resolved = (models_dir / directory / name).resolve()
+    if not resolved.is_relative_to(models_dir.resolve()):
+        raise ValueError(f"Invalid model path: {directory}/{name}")
+    return resolved
+
+
 def check_missing_models(
     models: list[dict[str, str]],
     models_dir: Path,
@@ -84,7 +95,7 @@ def check_missing_models(
     existing: list[dict[str, str]] = []
 
     for model in models:
-        path = models_dir / model["directory"] / model["name"]
+        path = _validate_model_path(models_dir, model["directory"], model["name"])
         if path.is_file():
             existing.append(model)
         else:
@@ -196,8 +207,8 @@ def download_models(
     try:
         for idx, model in enumerate(models, 1):
             rel = f"{model['directory']}/{model['name']}"
-            dest_dir = models_dir / model["directory"]
-            dest_file = dest_dir / model["name"]
+            dest_file = _validate_model_path(models_dir, model["directory"], model["name"])
+            dest_dir = dest_file.parent
 
             # Check cancellation before starting a new model
             if cancel_event is not None and cancel_event.is_set():
