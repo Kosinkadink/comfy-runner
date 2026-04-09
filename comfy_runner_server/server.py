@@ -711,10 +711,15 @@ def create_app() -> Any:
         out, lines = _make_collector()
 
         try:
-            # Stop if running
+            # Stop tunnel, tailscale serve, and instance if running
             status = get_status(name)
             if status.get("running"):
                 if status.get("port"):
+                    from comfy_runner.tunnel import stop_tunnel
+                    try:
+                        stop_tunnel(name, send_output=out)
+                    except Exception:
+                        pass
                     from comfy_runner.lifecycle import maybe_tailscale_unserve
                     maybe_tailscale_unserve(status["port"], send_output=out)
                 stop_installation(name, send_output=out)

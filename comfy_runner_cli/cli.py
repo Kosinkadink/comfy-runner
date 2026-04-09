@@ -107,10 +107,15 @@ def cmd_rm(args: argparse.Namespace) -> None:
 
     out = None if args.json else _output
     try:
-        # Unserve Tailscale before removing
+        # Stop tunnel and unserve Tailscale before removing
         try:
             status = get_status(args.name)
             if status.get("port"):
+                from comfy_runner.tunnel import stop_tunnel
+                try:
+                    stop_tunnel(args.name, send_output=out)
+                except Exception:
+                    pass
                 maybe_tailscale_unserve(status["port"], send_output=out)
         except Exception:
             pass
