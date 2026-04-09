@@ -626,6 +626,9 @@ def create_app() -> Any:
         if not record:
             return _err(err, 404)
 
+        body = request.get_json(silent=True) or {}
+        extra_args = body.get("extra_args")
+
         job_id = _jobs.create(label=f"restart {name}")
 
         def _run() -> None:
@@ -649,7 +652,7 @@ def create_app() -> Any:
                 except RuntimeError:
                     pass
 
-                result = start_installation(name, port_override=running_port, send_output=out)
+                result = start_installation(name, port_override=running_port, extra_args=extra_args, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
@@ -1378,6 +1381,9 @@ def create_app() -> Any:
         if not record:
             return _err(err, 404)
 
+        body = request.get_json(silent=True) or {}
+        extra_args = body.get("extra_args")
+
         job_id = _jobs.create(label=f"start {name}")
 
         def _run() -> None:
@@ -1398,7 +1404,7 @@ def create_app() -> Any:
                 rec = get_installation(name)
                 install_path = rec["path"] if rec else ""
 
-                result = start_installation(name, send_output=out)
+                result = start_installation(name, extra_args=extra_args, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
