@@ -1415,6 +1415,12 @@ def create_app() -> Any:
     # ------------------------------------------------------------------
     # GET/POST /<name>/comfyui/<path> — proxy to running ComfyUI instance
     # ------------------------------------------------------------------
+    _HOP_BY_HOP_HEADERS = frozenset({
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailers", "transfer-encoding", "upgrade",
+        "content-encoding", "content-length",
+    })
+
     @app.route("/<name>/comfyui/", defaults={"subpath": ""}, methods=["GET", "POST", "PUT", "DELETE"])
     @app.route("/<name>/comfyui/<path:subpath>", methods=["GET", "POST", "PUT", "DELETE"])
     def route_comfyui_proxy(name: str, subpath: str) -> Any:
@@ -1441,12 +1447,17 @@ def create_app() -> Any:
                 headers={k: v for k, v in request.headers if k.lower() not in ("host", "content-length")},
                 data=request.get_data(),
                 timeout=120,
+                stream=True,
             )
             from flask import Response
+            fwd_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in _HOP_BY_HOP_HEADERS
+            }
             return Response(
-                resp.content,
+                resp.iter_content(chunk_size=None),
                 status=resp.status_code,
-                headers=dict(resp.headers),
+                headers=fwd_headers,
             )
         except req_lib.ConnectionError:
             return _err(f"Cannot connect to ComfyUI on port {port}", 502)
@@ -1457,21 +1468,20 @@ def create_app() -> Any:
     # GET /<name>/outputs — list output files
     # GET /<name>/outputs/<path> — download a specific output file
     # ------------------------------------------------------------------
+    def _get_output_dir(record: dict) -> Path:
+        from comfy_runner.config import get_shared_dir
+        shared_dir = get_shared_dir()
+        if shared_dir:
+            return Path(shared_dir) / "output"
+        return Path(record["path"]) / "ComfyUI" / "output"
+
     @app.route("/<name>/outputs", methods=["GET"])
     def route_outputs_list(name: str) -> Any:
         record, err = _get_record(name)
         if not record:
             return _err(err, 404)
 
-        from comfy_runner.config import get_shared_dir
-
-        # Determine output directory: shared dir or installation-local
-        shared_dir = get_shared_dir()
-        if shared_dir:
-            output_dir = Path(shared_dir) / "output"
-        else:
-            output_dir = Path(record["path"]) / "ComfyUI" / "output"
-
+        output_dir = _get_output_dir(record)
         if not output_dir.exists():
             return jsonify({"ok": True, "output_dir": str(output_dir), "files": []})
 
@@ -1479,20 +1489,26 @@ def create_app() -> Any:
         limit = request.args.get("limit", 50, type=int)
         after = request.args.get("after", type=float)
 
-        files = []
-        for p in sorted(output_dir.rglob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        # Collect file stats in one pass, then sort
+        entries = []
+        for p in output_dir.rglob("*"):
             if not p.is_file():
                 continue
-            stat = p.stat()
-            if after is not None and stat.st_mtime <= after:
-                continue
+            st = p.stat()
+            entries.append((p, st))
+        entries.sort(key=lambda x: x[1].st_mtime, reverse=True)
+
+        files = []
+        for p, st in entries:
+            if after is not None and st.st_mtime <= after:
+                break
             rel = p.relative_to(output_dir)
             if prefix and not str(rel).startswith(prefix):
                 continue
             files.append({
                 "name": str(rel),
-                "size": stat.st_size,
-                "modified": stat.st_mtime,
+                "size": st.st_size,
+                "modified": st.st_mtime,
             })
             if len(files) >= limit:
                 break
@@ -1507,16 +1523,9 @@ def create_app() -> Any:
         if not record:
             return _err(err, 404)
 
-        from comfy_runner.config import get_shared_dir
-
-        shared_dir = get_shared_dir()
-        if shared_dir:
-            output_dir = Path(shared_dir) / "output"
-        else:
-            output_dir = Path(record["path"]) / "ComfyUI" / "output"
-
+        output_dir = _get_output_dir(record)
         target = (output_dir / filepath).resolve()
-        if not str(target).startswith(str(output_dir.resolve())):
+        if not target.is_relative_to(output_dir.resolve()):
             return _err("Invalid path", 403)
         if not target.is_file():
             return _err(f"File not found: {filepath}", 404)
