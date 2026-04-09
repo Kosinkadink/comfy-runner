@@ -805,6 +805,119 @@ _ROUTES: list[dict[str, Any]] = [
             "was_running": {"type": "boolean"},
         }),
     },
+
+    # ── Start ─────────────────────────────────────────────────────
+    {
+        "path": "/{name}/start",
+        "method": "post",
+        "tags": ["Process"],
+        "summary": "Start installation",
+        "description": "Start a stopped installation. Fails if already running.",
+        "parameters": [_NAME_PARAM],
+        "responses": _async_response("Start queued"),
+    },
+
+    # ── ComfyUI Proxy ─────────────────────────────────────────────
+    {
+        "path": "/{name}/comfyui/{subpath}",
+        "method": "get",
+        "tags": ["ComfyUI Proxy"],
+        "summary": "Proxy GET to ComfyUI",
+        "description": "Forward a GET request to the running ComfyUI instance. The subpath is appended to http://127.0.0.1:{port}/.",
+        "parameters": [
+            _NAME_PARAM,
+            {"name": "subpath", "in": "path", "required": True, "schema": {"type": "string"}, "description": "Path to forward to ComfyUI"},
+        ],
+        "responses": {"200": {"description": "Proxied response from ComfyUI"}},
+    },
+    {
+        "path": "/{name}/comfyui/{subpath}",
+        "method": "post",
+        "tags": ["ComfyUI Proxy"],
+        "summary": "Proxy POST to ComfyUI",
+        "description": "Forward a POST request to the running ComfyUI instance (e.g. queue a prompt via /api/prompt).",
+        "parameters": [
+            _NAME_PARAM,
+            {"name": "subpath", "in": "path", "required": True, "schema": {"type": "string"}, "description": "Path to forward to ComfyUI"},
+        ],
+        "responses": {"200": {"description": "Proxied response from ComfyUI"}},
+    },
+
+    # ── Outputs ───────────────────────────────────────────────────
+    {
+        "path": "/{name}/outputs",
+        "method": "get",
+        "tags": ["Outputs"],
+        "summary": "List output files",
+        "description": "List generated output files, sorted by modification time (newest first). Supports prefix filtering, pagination via limit, and time-based filtering via after.",
+        "parameters": [
+            _NAME_PARAM,
+            {"name": "prefix", "in": "query", "schema": {"type": "string"}, "description": "Filter by filename prefix"},
+            {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}, "description": "Max files to return"},
+            {"name": "after", "in": "query", "schema": {"type": "number"}, "description": "Only return files modified after this Unix timestamp"},
+        ],
+        "responses": _ok_response("Output file list", {
+            "output_dir": {"type": "string"},
+            "files": {"type": "array", "items": {"type": "object", "properties": {
+                "name": {"type": "string"},
+                "size": {"type": "integer"},
+                "modified": {"type": "number"},
+            }}},
+        }),
+    },
+    {
+        "path": "/{name}/outputs/{filepath}",
+        "method": "get",
+        "tags": ["Outputs"],
+        "summary": "Download output file",
+        "description": "Download a specific output file by path. Returns the raw file content.",
+        "parameters": [
+            _NAME_PARAM,
+            {"name": "filepath", "in": "path", "required": True, "schema": {"type": "string"}, "description": "Relative path to the output file"},
+        ],
+        "responses": {"200": {"description": "File content", "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
+    },
+
+    # ── Global Config ─────────────────────────────────────────────
+    {
+        "path": "/config",
+        "method": "get",
+        "tags": ["Config"],
+        "summary": "View global config",
+        "description": "Returns global configuration including shared_dir and whether auth tokens are configured (booleans, never actual values).",
+        "responses": _ok_response("Global config", {
+            "config": {"type": "object", "properties": {
+                "shared_dir": {"type": "string"},
+                "hf_token": {"type": "boolean", "description": "Whether a HuggingFace token is set"},
+                "modelscope_token": {"type": "boolean", "description": "Whether a ModelScope token is set"},
+            }},
+        }),
+    },
+    {
+        "path": "/config",
+        "method": "put",
+        "tags": ["Config"],
+        "summary": "Update global config",
+        "description": "Set global configuration values. Token values are stored securely; GET /config only returns booleans.",
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "shared_dir": {"type": "string", "description": "Path to shared directory"},
+                            "hf_token": {"type": "string", "description": "HuggingFace access token (empty string to clear)"},
+                            "modelscope_token": {"type": "string", "description": "ModelScope SDK token (empty string to clear)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Config updated", {
+            "updated": {"type": "object"},
+        }),
+    },
 ]
 
 

@@ -358,6 +358,40 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 - Poll `GET /job/<job_id>` to check job status.
 - All responses are JSON: `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
 
+### API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/installations` | List all installations |
+| `GET` | `/status` | Status of all installations |
+| `GET` | `/system-info` | GPU, CPU, memory info |
+| `GET` | `/config` | View global config (shared_dir, token status) |
+| `PUT` | `/config` | Update global config (shared_dir, hf_token, modelscope_token) |
+| `GET` | `/jobs` | List background jobs |
+| `GET` | `/job/{id}` | Get job status and output |
+| `POST` | `/job/{id}/cancel` | Cancel a running job |
+| `GET` | `/{name}/status` | Installation status (running, port, health) |
+| `GET` | `/{name}/info` | Detailed installation info |
+| `POST` | `/{name}/start` | Start a stopped installation |
+| `POST` | `/{name}/stop` | Stop a running installation |
+| `POST` | `/{name}/restart` | Restart an installation |
+| `POST` | `/{name}/deploy` | Deploy a branch, tag, PR, or commit |
+| `PUT` | `/{name}/config` | Update installation config (launch_args) |
+| `GET` | `/{name}/logs` | Read logs (with `?lines=N` or `?after=offset`) |
+| `GET` | `/{name}/logs/sessions` | List log sessions |
+| `GET` | `/{name}/nodes` | List custom nodes |
+| `POST` | `/{name}/nodes` | Add/remove/enable/disable custom nodes |
+| `GET/POST` | `/{name}/comfyui/{path}` | Proxy requests to running ComfyUI instance |
+| `GET` | `/{name}/outputs` | List output files (`?prefix=`, `?limit=`, `?after=`) |
+| `GET` | `/{name}/outputs/{file}` | Download an output file |
+| `POST` | `/{name}/download-model` | Download a model by URL |
+| `POST` | `/{name}/workflow-models` | Download models from a workflow |
+| `GET` | `/{name}/snapshot` | List snapshots |
+| `POST` | `/{name}/snapshot/save` | Save a snapshot |
+| `POST` | `/{name}/snapshot/restore` | Restore a snapshot |
+| `POST` | `/{name}/tunnel/start` | Start a tunnel |
+| `POST` | `/{name}/tunnel/stop` | Stop a tunnel |
+
 ### OpenAPI Spec
 
 The server auto-serves an OpenAPI 3.0.3 spec at `GET /openapi.json`. The spec is generated at runtime from route metadata in `comfy_runner_server/openapi.py` — no manual YAML to maintain. When routes change, update the `_ROUTES` list in that file and the spec updates automatically.
@@ -366,6 +400,27 @@ The server auto-serves an OpenAPI 3.0.3 spec at `GET /openapi.json`. The spec is
 # Fetch the spec from a running server
 curl http://localhost:9189/openapi.json | python -m json.tool
 ```
+
+### Model Download Authentication
+
+comfy-runner supports auth tokens for downloading models from private repositories:
+
+```bash
+# Set HuggingFace token
+comfy_runner.py config set hf_token hf_abc123...
+
+# Set ModelScope token
+comfy_runner.py config set modelscope_token ms_abc123...
+
+# View configured tokens (masked)
+comfy_runner.py config show
+
+# Or set via environment variables
+export HF_TOKEN=hf_abc123...
+export MODELSCOPE_SDK_TOKEN=ms_abc123...
+```
+
+Tokens are automatically used when downloading from `huggingface.co` or `modelscope.cn`/`modelscope.ai` URLs. Public models work without tokens.
 
 ## Testing
 
