@@ -121,16 +121,11 @@ class NgrokTunnel:
         if not domain:
             domain = _allocate_ngrok_domain(domains, port)
 
-        # Pick a unique API address so multiple ngrok processes can coexist
-        api_port = 14000 + port
-        self._api_addr = f"127.0.0.1:{api_port}"
-
         cmd: list[str] = ["ngrok", "http", str(port)]
         if domain:
             cmd.extend(["--url", domain])
         if region:
             cmd.extend(["--region", region])
-        cmd.extend(["--api-addr", self._api_addr])
 
         # Pass authtoken via env var (not CLI arg) to avoid process-list exposure
         env = os.environ.copy()
@@ -153,11 +148,14 @@ class NgrokTunnel:
         proc = subprocess.Popen(cmd, **kwargs)
         self._pid = proc.pid
 
-        # Poll the ngrok local API until we get a tunnel URL
-        url = self._poll_ngrok_api(self._api_addr)
+        # If we know the domain, the URL is deterministic — no need to poll
+        if domain:
+            url = f"https://{domain}"
+        else:
+            url = self._poll_ngrok_api("127.0.0.1:4040")
+
         _write_tunnel_state(
-            port, proc.pid, url, "ngrok",
-            api_addr=self._api_addr, domain=domain or "",
+            port, proc.pid, url, "ngrok", domain=domain or "",
         )
         return url
 
