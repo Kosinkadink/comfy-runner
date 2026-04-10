@@ -759,6 +759,33 @@ def create_app() -> Any:
         return jsonify({"ok": True, "updated": updated})
 
     # ------------------------------------------------------------------
+    # POST /<name>/rename — rename an installation
+    # ------------------------------------------------------------------
+    @app.route("/<name>/rename", methods=["POST"])
+    def route_rename(name: str) -> Any:
+        from comfy_runner.config import rename_installation
+        from comfy_runner.process import get_status
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        new_name = body.get("name")
+        if not new_name or not isinstance(new_name, str):
+            return _err("'name' is required (string)")
+
+        status = get_status(name)
+        if status.get("running"):
+            return _err(f"Installation '{name}' is running — stop it first")
+
+        try:
+            updated = rename_installation(name, new_name)
+            return jsonify({"ok": True, "old_name": name, "new_name": new_name})
+        except ValueError as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # GET /<name>/nodes
     # ------------------------------------------------------------------
     @app.route("/<name>/nodes", methods=["GET"])

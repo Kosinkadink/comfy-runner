@@ -71,6 +71,23 @@ def remove_installation(name: str) -> bool:
     return False
 
 
+def rename_installation(old_name: str, new_name: str) -> dict[str, Any]:
+    """Rename an installation record. Returns the updated record.
+
+    Raises ValueError if old_name doesn't exist or new_name already exists.
+    """
+    config = load_config()
+    if old_name not in config["installations"]:
+        raise ValueError(f"Installation '{old_name}' not found.")
+    if new_name in config["installations"]:
+        raise ValueError(f"Installation '{new_name}' already exists.")
+    record = config["installations"].pop(old_name)
+    record["name"] = new_name
+    config["installations"][new_name] = record
+    save_config(config)
+    return record
+
+
 def list_installations() -> dict[str, dict[str, Any]]:
     """Return all installation records."""
     config = load_config()
