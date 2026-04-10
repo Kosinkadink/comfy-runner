@@ -1644,6 +1644,49 @@ def create_app() -> Any:
     def route_stop_default() -> Any:
         return route_stop(_default_name())
 
+    # ------------------------------------------------------------------
+    # POST /self-update — git pull and restart the server process
+    # ------------------------------------------------------------------
+    @app.route("/self-update", methods=["POST"])
+    def route_self_update() -> Any:
+        import os
+        import subprocess
+        import sys
+
+        repo_dir = Path(__file__).resolve().parent.parent
+
+        # git pull
+        try:
+            result = subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=str(repo_dir),
+                capture_output=True, text=True, timeout=30,
+            )
+            pull_output = result.stdout.strip()
+            if result.returncode != 0:
+                return _err(f"git pull failed: {result.stderr.strip()}")
+        except Exception as e:
+            return _err(f"git pull failed: {e}")
+
+        already_up_to_date = "Already up to date" in pull_output
+
+        if already_up_to_date:
+            return jsonify({"ok": True, "updated": False, "message": pull_output})
+
+        # Schedule restart after response is sent
+        def _restart() -> None:
+            time.sleep(1)
+            log.info("Self-update: restarting server process...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        threading.Thread(target=_restart, daemon=True).start()
+        return jsonify({
+            "ok": True,
+            "updated": True,
+            "message": pull_output,
+            "restarting": True,
+        })
+
     return app
 
 
