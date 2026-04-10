@@ -317,6 +317,13 @@ There are two ways to access the runner server remotely:
 
 The server binds to `127.0.0.1` — Tailscale serve handles HTTPS termination and forwards to localhost. On shutdown, stale tailscale serve registrations are automatically cleaned up.
 
+> **Important:** When connecting to a Tailscale-served endpoint, you **must** use the full MagicDNS FQDN (e.g. `https://mybox.tailnet-name.ts.net:9189`), not the short hostname (`https://mybox:9189`). The TLS certificate is issued for the FQDN — using the short name causes TLS handshake failures (`SEC_E_INTERNAL_ERROR` on Windows, `TLSV1_ALERT_INTERNAL_ERROR` on Linux/macOS). Plain `http://` requests are also rejected since Tailscale serve enforces HTTPS.
+>
+> To discover the FQDN suffix programmatically:
+> ```bash
+> tailscale status --json | python -c "import json,sys; print(json.load(sys.stdin)['MagicDNSSuffix'])"
+> ```
+
 #### ngrok (for public access)
 
 [ngrok](https://ngrok.com/) creates public HTTPS tunnels. Use it to expose individual ComfyUI instance ports (not the runner server itself).
