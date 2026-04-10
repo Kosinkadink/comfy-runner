@@ -398,6 +398,24 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 | `POST` | `/{name}/snapshot/restore` | Restore a snapshot |
 | `POST` | `/{name}/tunnel/start` | Start a tunnel |
 | `POST` | `/{name}/tunnel/stop` | Stop a tunnel |
+| `POST` | `/{name}/rename` | Rename an installation (must be stopped) |
+| `POST` | `/self-update` | Git pull and restart the server process |
+
+### Self-Update
+
+The server can update itself remotely:
+
+```bash
+curl -X POST https://mybox.tailnet-name.ts.net:9189/self-update
+```
+
+If new commits are available, it runs `git pull --ff-only` and restarts the process automatically. Returns `{"updated": false}` when already up to date, or `{"updated": true, "restarting": true}` when new code was pulled. The server is briefly unavailable (~1–2 seconds) during restart.
+
+### Avoiding Loss of Instance State
+
+Operations like `POST /<name>/deploy` accept a `launch_args` field that **replaces** the existing value — it does not merge. Before setting new launch args, check the current value via `GET /<name>/info` so you don't accidentally drop flags like `--cuda-device`, `--enable-manager`, etc.
+
+For example, if an instance currently has `--enable-manager --cuda-device 0` and you deploy with `{"latest": true, "launch_args": "--enable-manager"}`, the `--cuda-device 0` flag is lost. Always read first, then include all desired flags in the new value.
 
 ### OpenAPI Spec
 
