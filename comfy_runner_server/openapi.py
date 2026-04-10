@@ -878,6 +878,52 @@ _ROUTES: list[dict[str, Any]] = [
         "responses": {"200": {"description": "File content", "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
     },
 
+    # ── Rename ─────────────────────────────────────────────────────
+    {
+        "path": "/{name}/rename",
+        "method": "post",
+        "tags": ["Installations"],
+        "summary": "Rename an installation",
+        "description": "Rename an installation. The installation must be stopped first.",
+        "parameters": [_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string", "description": "New installation name"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Renamed", {
+            "old_name": {"type": "string"},
+            "new_name": {"type": "string"},
+        }),
+    },
+
+    # ── Self-update ───────────────────────────────────────────────
+    {
+        "path": "/self-update",
+        "method": "post",
+        "tags": ["System"],
+        "summary": "Update server code and restart",
+        "description": (
+            "Runs git pull --ff-only on the comfy-runner repo. "
+            "If new commits are pulled, the server process restarts automatically (~1-2s downtime). "
+            "Returns updated=false if already up to date."
+        ),
+        "responses": _ok_response("Update result", {
+            "updated": {"type": "boolean", "description": "Whether new code was pulled"},
+            "message": {"type": "string", "description": "git pull output"},
+            "restarting": {"type": "boolean", "description": "Whether the server is restarting (only present if updated=true)"},
+        }),
+    },
+
     # ── Global Config ─────────────────────────────────────────────
     {
         "path": "/config",
