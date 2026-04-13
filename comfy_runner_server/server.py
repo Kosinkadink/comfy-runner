@@ -1297,6 +1297,8 @@ def create_app() -> Any:
         except Exception as e:
             return _err(str(e))
 
+        token = body.get("token", "")
+
         model = {"name": filename, "url": url, "directory": directory}
         missing, existing = check_missing_models([model], models_dir)
 
@@ -1312,6 +1314,7 @@ def create_app() -> Any:
                 dl_result = download_models(
                     missing, models_dir, send_output=out,
                     cancel_event=cancel_event,
+                    token=token,
                 )
                 if dl_result.get("cancelled"):
                     _jobs.fail(job_id, "Cancelled by user", lines)

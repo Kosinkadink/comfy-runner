@@ -724,6 +724,7 @@ _ROUTES: list[dict[str, Any]] = [
                             "url": {"type": "string", "description": "Download URL"},
                             "directory": {"type": "string", "description": "Target subdirectory under models/ (e.g. 'checkpoints')"},
                             "name": {"type": "string", "description": "Override filename (auto-derived from URL if omitted)"},
+                            "token": {"type": "string", "description": "Bearer token for authenticated downloads (ephemeral, not stored)"},
                         },
                     }
                 }

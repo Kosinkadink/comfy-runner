@@ -1440,7 +1440,7 @@ def cmd_download_model(args: argparse.Namespace) -> None:
             console.print(f"Models dir: [dim]{models_dir}[/dim]")
 
         model = {"name": filename, "url": url, "directory": directory}
-        result = download_models([model], models_dir, send_output=None if args.json else _output)
+        result = download_models([model], models_dir, send_output=None if args.json else _output, token=getattr(args, "token", "") or "")
 
         if args.json:
             print(json.dumps({"ok": True, **result}, indent=2))
@@ -2492,6 +2492,7 @@ def main(argv: list[str] | None = None) -> None:
     p_dlm.add_argument("--url", required=True, help="Download URL")
     p_dlm.add_argument("--dir", required=True, help="Target subdirectory under models/ (e.g. checkpoints, loras)")
     p_dlm.add_argument("--name", dest="filename", help="Filename to save as (default: derived from URL)")
+    p_dlm.add_argument("--token", help="Bearer token for authenticated downloads (not stored)")
     p_dlm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_dlm.set_defaults(func=cmd_download_model)
 

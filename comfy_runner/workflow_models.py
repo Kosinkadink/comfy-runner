@@ -83,25 +83,29 @@ def _validate_model_path(models_dir: Path, directory: str, name: str) -> Path:
     return resolved
 
 
-def _get_auth_headers(url: str) -> dict[str, str]:
+def _get_auth_headers(url: str, token: str = "") -> dict[str, str]:
     """Return auth headers for known model hosting platforms.
 
-    Detects HuggingFace and ModelScope URLs and adds Bearer token
-    if configured. Returns empty dict for unknown hosts or if no
-    token is set.
+    If *token* is provided, it is used directly as a Bearer token.
+    Otherwise, detects HuggingFace and ModelScope URLs and uses the
+    configured token. Returns empty dict for unknown hosts or if no
+    token is available.
     """
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+
     from urllib.parse import urlparse
     from .config import get_hf_token, get_modelscope_token
 
     host = urlparse(url).hostname or ""
     if "huggingface.co" in host:
-        token = get_hf_token()
-        if token:
-            return {"Authorization": f"Bearer {token}"}
+        t = get_hf_token()
+        if t:
+            return {"Authorization": f"Bearer {t}"}
     elif "modelscope.cn" in host or "modelscope.ai" in host:
-        token = get_modelscope_token()
-        if token:
-            return {"Authorization": f"Bearer {token}"}
+        t = get_modelscope_token()
+        if t:
+            return {"Authorization": f"Bearer {t}"}
     return {}
 
 
@@ -202,6 +206,7 @@ def download_models(
     models_dir: Path,
     send_output: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    token: str = "",
 ) -> dict[str, Any]:
     """Download models to ``{models_dir}/{directory}/{name}``.
 
@@ -244,7 +249,7 @@ def download_models(
                 continue
 
             try:
-                auth_headers = _get_auth_headers(model["url"])
+                auth_headers = _get_auth_headers(model["url"], token=token)
                 resp = requests.get(model["url"], stream=True, timeout=30, headers=auth_headers)
                 resp.raise_for_status()
             except Exception as e:
