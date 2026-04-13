@@ -733,6 +733,89 @@ _ROUTES: list[dict[str, Any]] = [
         "responses": _async_response("Download queued"),
     },
     {
+        "path": "/{name}/upload-model",
+        "method": "post",
+        "tags": ["Models"],
+        "summary": "Upload a model file",
+        "description": (
+            "Upload a model file via multipart form data. Supports resumable uploads — "
+            "check status first to get bytes_received, then re-upload with offset. "
+            "Staging files older than 24h are automatically cleaned up."
+        ),
+        "parameters": [_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["file", "directory"],
+                        "properties": {
+                            "file": {"type": "string", "format": "binary", "description": "Model file to upload"},
+                            "directory": {"type": "string", "description": "Target subdirectory under models/"},
+                            "name": {"type": "string", "description": "Override filename (default: original filename)"},
+                            "offset": {"type": "integer", "description": "Byte offset for resuming (default: 0)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Upload complete", {
+            "path": {"type": "string"},
+            "size": {"type": "integer"},
+            "resumed": {"type": "boolean"},
+            "skipped": {"type": "boolean"},
+        }),
+    },
+    {
+        "path": "/{name}/upload-model/status",
+        "method": "get",
+        "tags": ["Models"],
+        "summary": "Check upload status",
+        "description": (
+            "Check if a model file exists or has a partial upload in staging. "
+            "Use bytes_received to determine the resume offset."
+        ),
+        "parameters": [
+            _NAME_PARAM,
+            {"name": "directory", "in": "query", "required": True, "schema": {"type": "string"}},
+            {"name": "name", "in": "query", "required": True, "schema": {"type": "string"}},
+        ],
+        "responses": _ok_response("Upload status", {
+            "exists": {"type": "boolean"},
+            "complete": {"type": "boolean"},
+            "bytes_received": {"type": "integer"},
+            "path": {"type": "string"},
+            "created_at": {"type": "number", "nullable": True},
+        }),
+    },
+    {
+        "path": "/{name}/upload-model/status",
+        "method": "delete",
+        "tags": ["Models"],
+        "summary": "Delete partial upload",
+        "description": "Remove a stale partial upload from the staging directory.",
+        "parameters": [_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["directory", "name"],
+                        "properties": {
+                            "directory": {"type": "string"},
+                            "name": {"type": "string"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Staging deleted", {
+            "removed": {"type": "boolean"},
+        }),
+    },
+    {
         "path": "/{name}/workflow-models",
         "method": "post",
         "tags": ["Models"],

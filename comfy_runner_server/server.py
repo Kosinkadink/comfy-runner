@@ -1337,6 +1337,90 @@ def create_app() -> Any:
         })
 
     # ------------------------------------------------------------------
+    # POST /<name>/upload-model
+    # ------------------------------------------------------------------
+    @app.route("/<name>/upload-model", methods=["POST"])
+    def route_upload_model(name: str) -> Any:
+        from comfy_runner.upload import receive_upload
+        from comfy_runner.workflow_models import resolve_models_dir
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        if "file" not in request.files:
+            return _err("Missing 'file' field in multipart form data")
+
+        directory = request.form.get("directory", "")
+        if not directory:
+            return _err("Missing 'directory' field")
+
+        filename = request.form.get("name", "")
+        if not filename:
+            uploaded = request.files["file"]
+            filename = uploaded.filename or "upload"
+
+        offset = int(request.form.get("offset", "0"))
+
+        try:
+            models_dir = resolve_models_dir(record["path"])
+            file_stream = request.files["file"].stream
+            result = receive_upload(
+                models_dir, directory, filename, file_stream,
+                offset=offset,
+            )
+            return jsonify({"ok": True, **result})
+        except (ValueError, RuntimeError) as e:
+            return _err(str(e))
+        except Exception as e:
+            log.error("Upload failed for '%s': %s", name, e)
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # GET /<name>/upload-model/status
+    # ------------------------------------------------------------------
+    @app.route("/<name>/upload-model/status", methods=["GET"])
+    def route_upload_status(name: str) -> Any:
+        from comfy_runner.upload import get_upload_status
+        from comfy_runner.workflow_models import resolve_models_dir
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        directory = request.args.get("directory", "")
+        filename = request.args.get("name", "")
+        if not directory or not filename:
+            return _err("Missing 'directory' and 'name' query parameters")
+
+        try:
+            models_dir = resolve_models_dir(record["path"])
+            status = get_upload_status(models_dir, directory, filename)
+            return jsonify({"ok": True, **status})
+        except (ValueError, RuntimeError) as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # DELETE /<name>/upload-model/status
+    # ------------------------------------------------------------------
+    @app.route("/<name>/upload-model/status", methods=["DELETE"])
+    def route_upload_delete(name: str) -> Any:
+        from comfy_runner.upload import delete_staging
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        directory = body.get("directory", "")
+        filename = body.get("name", "")
+        if not directory or not filename:
+            return _err("Missing 'directory' and 'name' fields")
+
+        removed = delete_staging(directory, filename)
+        return jsonify({"ok": True, "removed": removed})
+
+    # ------------------------------------------------------------------
     # POST /<name>/workflow-models  (async — returns job_id)
     # ------------------------------------------------------------------
     @app.route("/<name>/workflow-models", methods=["POST"])

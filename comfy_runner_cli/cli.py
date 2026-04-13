@@ -1458,6 +1458,67 @@ def cmd_download_model(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_upload_model(args: argparse.Namespace) -> None:
+    """Upload a model file to an installation's models directory."""
+    from comfy_runner.config import get_installation
+    from comfy_runner.upload import get_upload_status, receive_upload
+    from comfy_runner.workflow_models import resolve_models_dir
+
+    try:
+        record = get_installation(args.name)
+        if not record:
+            raise RuntimeError(f"Installation '{args.name}' not found.")
+
+        file_path = Path(args.file)
+        if not file_path.is_file():
+            raise RuntimeError(f"File not found: {file_path}")
+
+        directory = args.dir
+        filename = args.filename or file_path.name
+        models_dir = resolve_models_dir(record["path"])
+
+        # Check if resuming
+        offset = 0
+        if args.resume:
+            status = get_upload_status(models_dir, directory, filename)
+            if status.get("complete"):
+                if args.json:
+                    print(json.dumps({"ok": True, "skipped": True, "path": f"{directory}/{filename}"}))
+                else:
+                    console.print(f"[dim]Already exists: {directory}/{filename}[/dim]")
+                return
+            if status.get("exists") and not status.get("complete"):
+                offset = status["bytes_received"]
+                if not args.json:
+                    console.print(f"Resuming from {offset / 1048576:.1f} MB")
+
+        if not args.json:
+            console.print(f"Uploading [bold]{filename}[/bold] → {directory}/")
+
+        with open(file_path, "rb") as f:
+            if offset > 0:
+                f.seek(offset)
+            result = receive_upload(
+                models_dir, directory, filename, f,
+                offset=offset,
+                send_output=None if args.json else _output,
+            )
+
+        if args.json:
+            print(json.dumps({"ok": True, **result}, indent=2))
+        elif result.get("skipped"):
+            console.print(f"[dim]Already exists: {directory}/{filename}[/dim]")
+        else:
+            console.print("[green]✓ Done[/green]")
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
 def cmd_workflow_models(args: argparse.Namespace) -> None:
     """Download models referenced in a workflow template."""
     from comfy_runner.workflow_models import (
@@ -2495,6 +2556,15 @@ def main(argv: list[str] | None = None) -> None:
     p_dlm.add_argument("--token", help="Bearer token for authenticated downloads (not stored)")
     p_dlm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_dlm.set_defaults(func=cmd_download_model)
+
+    # upload-model
+    p_ulm = sub.add_parser("upload-model", help="Upload a local model file to models directory")
+    p_ulm.add_argument("--file", required=True, help="Path to the local model file")
+    p_ulm.add_argument("--dir", required=True, help="Target subdirectory under models/ (e.g. checkpoints, loras)")
+    p_ulm.add_argument("--name", dest="filename", help="Filename to save as (default: derived from file path)")
+    p_ulm.add_argument("--resume", action="store_true", help="Resume a previously interrupted upload")
+    p_ulm.add_argument("name", nargs="?", default="main", help="Installation name")
+    p_ulm.set_defaults(func=cmd_upload_model)
 
     # workflow-models
     p_wfm = sub.add_parser("workflow-models", help="Download models referenced in a workflow template")
