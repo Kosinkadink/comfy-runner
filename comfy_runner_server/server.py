@@ -1677,7 +1677,13 @@ def create_app() -> Any:
         def _restart() -> None:
             time.sleep(1)
             log.info("Self-update: restarting server process...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            if sys.platform == "win32":
+                # os.execv on Windows doesn't preserve venv sys.path;
+                # spawn a new process and exit instead.
+                subprocess.Popen([sys.executable] + sys.argv)
+                os._exit(0)
+            else:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
 
         threading.Thread(target=_restart, daemon=True).start()
         return jsonify({
