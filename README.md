@@ -165,6 +165,27 @@ comfy_runner.py deploy [name] --pull
 
 Using `--branch` persists the branch name so `--pull` can re-fetch it later. The deploy command automatically stops the instance before deploying, installs changed requirements, restarts if it was running, and captures a post-update snapshot.
 
+### Model Downloads & Uploads
+
+```bash
+# Download a model by URL (auto-detects HuggingFace/ModelScope for auth)
+comfy_runner.py download-model --url https://huggingface.co/.../model.safetensors --dir checkpoints [name]
+
+# Download with an explicit auth token (not stored)
+comfy_runner.py download-model --url https://huggingface.co/.../model.safetensors --dir checkpoints --token hf_... [name]
+
+# Upload a model to a remote comfy-runner server (with progress + hash verification)
+comfy_runner.py remote upload-model --server https://mybox.ts.net:9189 --file model.safetensors --dir checkpoints [name]
+
+# Resume an interrupted remote upload
+comfy_runner.py remote upload-model --server https://mybox.ts.net:9189 --file model.safetensors --dir checkpoints --resume [name]
+
+# Use SHA-256 instead of BLAKE3 for integrity verification
+comfy_runner.py remote upload-model --server https://mybox.ts.net:9189 --file model.safetensors --dir checkpoints --hash-type sha256 [name]
+```
+
+Downloads support `HF_TOKEN` and `MODELSCOPE_TOKEN` environment variables for automatic authentication. Uploads compute a BLAKE3 hash locally, stream the file to the server, and verify the hash on the server side. Staging files from interrupted uploads are automatically cleaned up after 24 hours.
+
 ### Tunneling
 
 Expose a running ComfyUI instance's port to the internet via ngrok or Tailscale Funnel.
