@@ -221,3 +221,91 @@ class RemoteRunner:
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         """POST /job/{job_id}/cancel"""
         return self._request("POST", f"/job/{job_id}/cancel")
+
+    # ------------------------------------------------------------------
+    # Upload
+    # ------------------------------------------------------------------
+
+    def upload_model(
+        self,
+        name: str,
+        file_path: str,
+        directory: str,
+        filename: str = "",
+        offset: int = 0,
+        expected_hash: str = "",
+        hash_type: str = "blake3",
+        on_progress: Any = None,
+    ) -> dict[str, Any]:
+        """POST /{name}/upload-model — multipart file upload.
+
+        Streams the file to the remote server. If *on_progress* is
+        provided, it is called with (bytes_sent, total_bytes) periodically.
+        """
+        import os
+
+        total_size = os.path.getsize(file_path)
+        send_size = total_size - offset
+
+        data: dict[str, str] = {"directory": directory}
+        if filename:
+            data["name"] = filename
+        if offset:
+            data["offset"] = str(offset)
+        if expected_hash:
+            data["hash"] = expected_hash
+            data["hash_type"] = hash_type
+
+        url = f"{self.base_url}/{name}/upload-model"
+
+        with open(file_path, "rb") as f:
+            if offset > 0:
+                f.seek(offset)
+
+            if on_progress:
+                stream = _ProgressReader(f, send_size, on_progress)
+            else:
+                stream = f
+
+            resp = requests.post(
+                url,
+                data=data,
+                files={"file": (filename or os.path.basename(file_path), stream)},
+                timeout=None,  # no timeout for large uploads
+            )
+
+        try:
+            result = resp.json()
+        except requests.JSONDecodeError:
+            raise RuntimeError(f"Server returned invalid JSON: {resp.text[:500]}")
+
+        if not resp.ok or not result.get("ok"):
+            raise RuntimeError(f"Upload failed: {result.get('error', resp.text[:500])}")
+
+        return result
+
+    def get_upload_status(
+        self, name: str, directory: str, filename: str,
+    ) -> dict[str, Any]:
+        """GET /{name}/upload-model/status"""
+        return self._request(
+            "GET", f"/{name}/upload-model/status",
+            params={"directory": directory, "name": filename},
+        )
+
+
+class _ProgressReader:
+    """File wrapper that calls on_progress(bytes_sent, total) during read."""
+
+    def __init__(self, stream: Any, total: int, callback: Any) -> None:
+        self._stream = stream
+        self._total = total
+        self._sent = 0
+        self._callback = callback
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._stream.read(size)
+        if data:
+            self._sent += len(data)
+            self._callback(self._sent, self._total)
+        return data

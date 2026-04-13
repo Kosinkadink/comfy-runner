@@ -1615,6 +1615,110 @@ def _hash_with_progress(
     return h.hexdigest()
 
 
+def cmd_remote_upload(args: argparse.Namespace) -> None:
+    """Upload a model file to a remote comfy-runner server."""
+    from comfy_runner.hosted.remote import RemoteRunner
+    from comfy_runner.upload import compute_file_hash
+
+    try:
+        file_path = Path(args.file)
+        if not file_path.is_file():
+            raise RuntimeError(f"File not found: {file_path}")
+
+        server = args.server
+        name = args.name
+        directory = args.dir
+        filename = args.filename or file_path.name
+        hash_type = getattr(args, "hash_type", "blake3") or "blake3"
+        file_size = file_path.stat().st_size
+
+        remote = RemoteRunner(server)
+
+        # Check for resume
+        offset = 0
+        if args.resume:
+            status = remote.get_upload_status(name, directory, filename)
+            if status.get("complete"):
+                if args.json:
+                    print(json.dumps({"ok": True, "skipped": True, "path": f"{directory}/{filename}"}))
+                else:
+                    console.print(f"[dim]Already exists on server: {directory}/{filename}[/dim]")
+                return
+            if status.get("exists") and not status.get("complete"):
+                offset = status.get("bytes_received", 0)
+
+        if args.json:
+            file_hash = compute_file_hash(file_path, hash_type)
+            result = remote.upload_model(
+                name, str(file_path), directory,
+                filename=filename, offset=offset,
+                expected_hash=file_hash, hash_type=hash_type,
+            )
+            print(json.dumps({"ok": True, **result}, indent=2))
+            return
+
+        from rich.progress import (
+            BarColumn,
+            DownloadColumn,
+            Progress,
+            TextColumn,
+            TransferSpeedColumn,
+            TimeRemainingColumn,
+        )
+
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            # Step 1: Hash locally
+            hash_task = progress.add_task(f"Hashing ({hash_type})", total=file_size)
+            file_hash = _hash_with_progress(file_path, hash_type, progress, hash_task)
+            progress.update(hash_task, description=f"[green]✓[/green] Hash ({hash_type})")
+
+            # Step 2: Upload to server
+            send_size = file_size - offset
+            desc = f"Uploading {filename}"
+            if offset > 0:
+                desc = f"Resuming {filename}"
+            upload_task = progress.add_task(desc, total=send_size)
+
+            def _on_progress(sent: int, total: int) -> None:
+                progress.update(upload_task, completed=sent)
+
+            result = remote.upload_model(
+                name, str(file_path), directory,
+                filename=filename, offset=offset,
+                expected_hash=file_hash, hash_type=hash_type,
+                on_progress=_on_progress,
+            )
+
+            if result.get("skipped"):
+                progress.update(upload_task, description=f"[dim]Skipped (exists)[/dim]")
+            else:
+                progress.update(upload_task, description=f"[green]✓[/green] {filename}")
+
+        if result.get("skipped"):
+            console.print(f"[dim]Already exists: {directory}/{filename}[/dim]")
+        else:
+            size_mb = result.get("size", 0) / 1048576
+            h = result.get("hash", "")
+            console.print(
+                f"[green]✓[/green] {directory}/{filename}  "
+                f"[dim]{size_mb:.1f} MB  {hash_type}:{h[:16]}…  → {server}[/dim]"
+            )
+
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
 def cmd_workflow_models(args: argparse.Namespace) -> None:
     """Download models referenced in a workflow template."""
     from comfy_runner.workflow_models import (
@@ -2663,6 +2767,21 @@ def main(argv: list[str] | None = None) -> None:
                         help="Hash algorithm for integrity verification (default: blake3)")
     p_ulm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_ulm.set_defaults(func=cmd_upload_model)
+
+    # remote
+    p_remote = sub.add_parser("remote", help="Operations on a remote comfy-runner server")
+    remote_sub = p_remote.add_subparsers(dest="remote_action")
+
+    p_remote_upload = remote_sub.add_parser("upload-model", help="Upload a model file to a remote server")
+    p_remote_upload.add_argument("--server", required=True, help="Remote server URL (e.g. https://mybox.ts.net:9189)")
+    p_remote_upload.add_argument("--file", required=True, help="Path to the local model file")
+    p_remote_upload.add_argument("--dir", required=True, help="Target subdirectory under models/ (e.g. checkpoints)")
+    p_remote_upload.add_argument("--name", dest="filename", help="Filename to save as (default: derived from file path)")
+    p_remote_upload.add_argument("--resume", action="store_true", help="Resume a previously interrupted upload")
+    p_remote_upload.add_argument("--hash-type", dest="hash_type", choices=["blake3", "sha256"], default="blake3",
+                                 help="Hash algorithm for integrity verification (default: blake3)")
+    p_remote_upload.add_argument("name", nargs="?", default="main", help="Installation name on the remote server")
+    p_remote_upload.set_defaults(func=cmd_remote_upload)
 
     # workflow-models
     p_wfm = sub.add_parser("workflow-models", help="Download models referenced in a workflow template")
