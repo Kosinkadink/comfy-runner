@@ -295,7 +295,7 @@ Start the server:
 ```bash
 comfy_runner.py server --host 127.0.0.1 --port 9189
 comfy_runner.py server --tailscale         # expose via tailscale serve (HTTPS over tailnet)
-comfy_runner.py server --tunnels           # enable per-instance tunnel start/stop API endpoints
+comfy_runner.py server --tunnels           # enable tunnel API (tailscale funnel / ngrok for public internet exposure)
 comfy_runner.py server --keep-instances    # keep instances running on shutdown
 ```
 

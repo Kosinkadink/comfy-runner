@@ -729,7 +729,7 @@ def cmd_server(args: argparse.Namespace) -> None:
     port = args.port
     tailscale_active = False
 
-    # --tunnels: enable tunnel endpoints for per-instance port exposure
+    # --tunnels: enable tunnel API (tailscale funnel / ngrok for public internet exposure)
     tunnels_active = args.tunnels
     if tunnels_active:
         from comfy_runner_server.server import set_tunnels_enabled
@@ -2460,7 +2460,7 @@ def main(argv: list[str] | None = None) -> None:
     p_server.add_argument("--tailscale", action="store_true",
                           help="Expose via tailscale serve (tailnet-private)")
     p_server.add_argument("--tunnels", action="store_true",
-                          help="Enable tunnel endpoints (tailscale serve per instance port)")
+                           help="Enable tunnel API endpoints (tailscale funnel for public internet exposure)")
     p_server.add_argument("--keep-instances", action="store_true",
                           help="Don't stop ComfyUI instances when server shuts down")
     p_server.set_defaults(func=cmd_server)
