@@ -1361,6 +1361,8 @@ def create_app() -> Any:
             filename = uploaded.filename or "upload"
 
         offset = int(request.form.get("offset", "0"))
+        expected_hash = request.form.get("hash", "")
+        hash_type = request.form.get("hash_type", "blake3")
 
         try:
             models_dir = resolve_models_dir(record["path"])
@@ -1368,6 +1370,8 @@ def create_app() -> Any:
             result = receive_upload(
                 models_dir, directory, filename, file_stream,
                 offset=offset,
+                expected_hash=expected_hash,
+                hash_type=hash_type,
             )
             return jsonify({"ok": True, **result})
         except (ValueError, RuntimeError) as e:

@@ -755,6 +755,8 @@ _ROUTES: list[dict[str, Any]] = [
                             "directory": {"type": "string", "description": "Target subdirectory under models/"},
                             "name": {"type": "string", "description": "Override filename (default: original filename)"},
                             "offset": {"type": "integer", "description": "Byte offset for resuming (default: 0)"},
+                            "hash": {"type": "string", "description": "Expected file hash for integrity verification"},
+                            "hash_type": {"type": "string", "enum": ["blake3", "sha256"], "description": "Hash algorithm (default: blake3)"},
                         },
                     }
                 }
@@ -765,6 +767,8 @@ _ROUTES: list[dict[str, Any]] = [
             "size": {"type": "integer"},
             "resumed": {"type": "boolean"},
             "skipped": {"type": "boolean"},
+            "hash": {"type": "string", "description": "File hash (computed or verified)"},
+            "hash_type": {"type": "string"},
         }),
     },
     {

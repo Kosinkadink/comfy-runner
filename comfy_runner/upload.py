@@ -1,8 +1,10 @@
-"""Model file upload with resumable staging.
+"""Model file upload with resumable staging and integrity verification.
 
 Handles streaming uploads to a staging directory, with support for
 resuming interrupted uploads. Staging files are `.part` files that
 get atomically moved to the final models directory on completion.
+
+Supports SHA-256 and BLAKE3 hash verification.
 """
 
 from __future__ import annotations
@@ -13,7 +15,11 @@ import time
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
+import blake3 as _blake3
+
 from .config import CONFIG_DIR
+
+HASH_ALGORITHMS = ("sha256", "blake3")
 
 
 STAGING_DIR = CONFIG_DIR / "upload-staging"
@@ -153,12 +159,38 @@ def delete_staging(directory: str, name: str) -> bool:
     return existed
 
 
+def compute_file_hash(path: Path, algorithm: str = "blake3") -> str:
+    """Compute the hash of a file on disk.
+
+    *algorithm* must be one of ``HASH_ALGORITHMS``.
+    """
+    if algorithm not in HASH_ALGORITHMS:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm!r}. Use one of {HASH_ALGORITHMS}")
+
+    chunk_size = 256 * 1024
+
+    if algorithm == "blake3":
+        h = _blake3.blake3()
+        with open(path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                h.update(chunk)
+        return h.hexdigest()
+    else:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                h.update(chunk)
+        return h.hexdigest()
+
+
 def receive_upload(
     models_dir: Path,
     directory: str,
     name: str,
     stream: BinaryIO,
     offset: int = 0,
+    expected_hash: str = "",
+    hash_type: str = "blake3",
     send_output: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Stream an upload to staging and move to final location on completion.
@@ -166,8 +198,11 @@ def receive_upload(
     *stream* is any file-like object (e.g. request.files['file']).
     *offset* is the byte position in the final file where this data starts
     (0 for new uploads, >0 for resumptions).
+    *expected_hash* — if provided, the completed file's hash is verified
+    before moving to the final location.  *hash_type* selects the algorithm
+    (``sha256`` or ``blake3``, default ``blake3``).
 
-    Returns dict with: path, size, resumed, staged_bytes.
+    Returns dict with: path, size, resumed, hash, hash_type.
     """
     from .workflow_models import _validate_model_path
 
@@ -179,6 +214,9 @@ def receive_upload(
             "size": final_path.stat().st_size,
             "skipped": True,
         }
+
+    if expected_hash and hash_type not in HASH_ALGORITHMS:
+        raise ValueError(f"Unsupported hash_type: {hash_type!r}. Use one of {HASH_ALGORITHMS}")
 
     # Clean stale uploads before starting a new one
     cleanup_stale_staging(send_output=send_output)
@@ -194,20 +232,16 @@ def receive_upload(
             raise ValueError(
                 f"Offset {offset} exceeds existing partial size {current_size}"
             )
-        # Truncate to offset in case of partial writes past the offset
         if current_size != offset:
             with open(part, "r+b") as f:
                 f.truncate(offset)
     elif offset == 0:
-        # Fresh upload — remove any existing partial
         part.unlink(missing_ok=True)
 
     out = send_output or (lambda _: None)
 
-    # Stream to staging file
     mode = "ab" if offset > 0 else "wb"
-    chunk_size = 256 * 1024  # 256KB chunks
-    bytes_written = 0
+    chunk_size = 256 * 1024
 
     with open(part, mode) as f:
         while True:
@@ -215,13 +249,33 @@ def receive_upload(
             if not chunk:
                 break
             f.write(chunk)
-            bytes_written += chunk_size
 
     total_size = part.stat().st_size
     _write_meta(directory, name)
 
     if send_output:
         out(f"  Received {total_size / 1048576:.1f} MB\n")
+
+    # Verify hash if provided
+    if expected_hash:
+        if send_output:
+            out(f"  Verifying {hash_type} hash...\n")
+        actual_hash = compute_file_hash(part, hash_type)
+        if actual_hash != expected_hash.lower():
+            part.unlink(missing_ok=True)
+            _meta_path(directory, name).unlink(missing_ok=True)
+            raise ValueError(
+                f"Hash mismatch: expected {expected_hash}, got {actual_hash}. "
+                f"Upload deleted."
+            )
+        if send_output:
+            out(f"  ✓ Hash verified\n")
+
+    # Compute hash for response (if not already computed)
+    if not expected_hash:
+        actual_hash = compute_file_hash(part, hash_type)
+    else:
+        actual_hash = expected_hash.lower()
 
     # Move to final location
     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,4 +289,6 @@ def receive_upload(
         "path": f"{directory}/{name}",
         "size": total_size,
         "resumed": resumed,
+        "hash": actual_hash,
+        "hash_type": hash_type,
     }

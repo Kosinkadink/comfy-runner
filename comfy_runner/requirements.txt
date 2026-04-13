@@ -1,3 +1,4 @@
 requests
 py7zr
 multivolumefile
+blake3

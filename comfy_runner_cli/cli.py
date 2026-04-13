@@ -1461,7 +1461,11 @@ def cmd_download_model(args: argparse.Namespace) -> None:
 def cmd_upload_model(args: argparse.Namespace) -> None:
     """Upload a model file to an installation's models directory."""
     from comfy_runner.config import get_installation
-    from comfy_runner.upload import get_upload_status, receive_upload
+    from comfy_runner.upload import (
+        compute_file_hash,
+        get_upload_status,
+        receive_upload,
+    )
     from comfy_runner.workflow_models import resolve_models_dir
 
     try:
@@ -1475,7 +1479,9 @@ def cmd_upload_model(args: argparse.Namespace) -> None:
 
         directory = args.dir
         filename = args.filename or file_path.name
+        hash_type = getattr(args, "hash_type", "blake3") or "blake3"
         models_dir = resolve_models_dir(record["path"])
+        file_size = file_path.stat().st_size
 
         # Check if resuming
         offset = 0
@@ -1489,27 +1495,77 @@ def cmd_upload_model(args: argparse.Namespace) -> None:
                 return
             if status.get("exists") and not status.get("complete"):
                 offset = status["bytes_received"]
-                if not args.json:
-                    console.print(f"Resuming from {offset / 1048576:.1f} MB")
-
-        if not args.json:
-            console.print(f"Uploading [bold]{filename}[/bold] → {directory}/")
-
-        with open(file_path, "rb") as f:
-            if offset > 0:
-                f.seek(offset)
-            result = receive_upload(
-                models_dir, directory, filename, f,
-                offset=offset,
-                send_output=None if args.json else _output,
-            )
 
         if args.json:
+            # JSON mode — minimal output
+            file_hash = compute_file_hash(file_path, hash_type)
+            with open(file_path, "rb") as f:
+                if offset > 0:
+                    f.seek(offset)
+                result = receive_upload(
+                    models_dir, directory, filename, f,
+                    offset=offset,
+                    expected_hash=file_hash,
+                    hash_type=hash_type,
+                )
             print(json.dumps({"ok": True, **result}, indent=2))
-        elif result.get("skipped"):
+            return
+
+        # Pretty mode with progress bars
+        from rich.progress import (
+            BarColumn,
+            DownloadColumn,
+            Progress,
+            TextColumn,
+            TransferSpeedColumn,
+            TimeRemainingColumn,
+        )
+
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            # Step 1: Hash the source file
+            hash_task = progress.add_task(f"Hashing ({hash_type})", total=file_size)
+            file_hash = _hash_with_progress(file_path, hash_type, progress, hash_task)
+            progress.update(hash_task, description=f"[green]✓[/green] Hash ({hash_type})")
+
+            # Step 2: Copy to models dir
+            remaining = file_size - offset
+            desc = f"Uploading {filename}"
+            if offset > 0:
+                desc = f"Resuming {filename}"
+            copy_task = progress.add_task(desc, total=remaining)
+
+            with open(file_path, "rb") as f:
+                if offset > 0:
+                    f.seek(offset)
+                wrapper = _ProgressStream(f, progress, copy_task)
+                result = receive_upload(
+                    models_dir, directory, filename, wrapper,
+                    offset=offset,
+                    expected_hash=file_hash,
+                    hash_type=hash_type,
+                )
+
+            if result.get("skipped"):
+                progress.update(copy_task, description=f"[dim]Skipped (exists)[/dim]")
+            else:
+                progress.update(copy_task, description=f"[green]✓[/green] {filename}")
+
+        # Summary
+        if result.get("skipped"):
             console.print(f"[dim]Already exists: {directory}/{filename}[/dim]")
         else:
-            console.print("[green]✓ Done[/green]")
+            size_mb = result["size"] / 1048576
+            console.print(
+                f"[green]✓[/green] {directory}/{filename}  "
+                f"[dim]{size_mb:.1f} MB  {hash_type}:{result['hash'][:16]}…[/dim]"
+            )
 
     except Exception as e:
         if args.json:
@@ -1517,6 +1573,46 @@ def cmd_upload_model(args: argparse.Namespace) -> None:
             sys.exit(1)
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
+
+
+class _ProgressStream:
+    """Wrapper around a file stream that updates a rich progress bar."""
+
+    def __init__(self, stream: Any, progress: Any, task_id: Any) -> None:
+        self._stream = stream
+        self._progress = progress
+        self._task_id = task_id
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._stream.read(size)
+        if data:
+            self._progress.advance(self._task_id, len(data))
+        return data
+
+
+def _hash_with_progress(
+    path: Path, algorithm: str, progress: Any, task_id: Any,
+) -> str:
+    """Hash a file while updating a rich progress bar."""
+    import blake3 as _b3
+
+    chunk_size = 1024 * 1024  # 1MB for speed
+
+    if algorithm == "blake3":
+        h = _b3.blake3()
+    else:
+        import hashlib
+        h = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+            progress.advance(task_id, len(chunk))
+
+    return h.hexdigest()
 
 
 def cmd_workflow_models(args: argparse.Namespace) -> None:
@@ -2563,6 +2659,8 @@ def main(argv: list[str] | None = None) -> None:
     p_ulm.add_argument("--dir", required=True, help="Target subdirectory under models/ (e.g. checkpoints, loras)")
     p_ulm.add_argument("--name", dest="filename", help="Filename to save as (default: derived from file path)")
     p_ulm.add_argument("--resume", action="store_true", help="Resume a previously interrupted upload")
+    p_ulm.add_argument("--hash-type", dest="hash_type", choices=["blake3", "sha256"], default="blake3",
+                        help="Hash algorithm for integrity verification (default: blake3)")
     p_ulm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_ulm.set_defaults(func=cmd_upload_model)
 
