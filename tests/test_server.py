@@ -250,6 +250,55 @@ class TestFlaskApp:
         assert "total_memory_gb" in si
         assert "disk_free_gb" in si
 
+    def test_stream_job_404_for_nonexistent(self, client):
+        resp = client.get("/job/does-not-exist/stream")
+        data = resp.get_json()
+        assert resp.status_code == 404
+        assert data["ok"] is False
+
+    def test_stream_job_emits_output_and_done(self, client):
+        """Stream endpoint returns SSE events for a completed job."""
+        import threading
+        from comfy_runner_server.server import _jobs
+
+        job_id = _jobs.create(label="stream-test")
+
+        def _bg():
+            time.sleep(0.3)
+            job = _jobs.get(job_id)
+            job["output"].append("line 1\n")
+            time.sleep(0.3)
+            job["output"].append("line 2\n")
+            _jobs.finish(job_id, {"ok": True}, job["output"])
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+        resp = client.get(f"/job/{job_id}/stream")
+        assert resp.status_code == 200
+        assert resp.content_type.startswith("text/event-stream")
+
+        text = resp.get_data(as_text=True)
+        events = [l for l in text.strip().split("\n") if l.startswith("data: ")]
+        assert len(events) >= 3  # at least 2 output + 1 done
+
+        # Last event should be done
+        last = json.loads(events[-1].removeprefix("data: "))
+        assert last["type"] == "done"
+
+    def test_stream_job_emits_error(self, client):
+        """Stream endpoint returns error event for a failed job."""
+        from comfy_runner_server.server import _jobs
+
+        job_id = _jobs.create(label="fail-test")
+        _jobs.fail(job_id, "something broke", [])
+
+        resp = client.get(f"/job/{job_id}/stream")
+        text = resp.get_data(as_text=True)
+        events = [l for l in text.strip().split("\n") if l.startswith("data: ")]
+        last = json.loads(events[-1].removeprefix("data: "))
+        assert last["type"] == "error"
+        assert "something broke" in last["error"]
+
     def test_unknown_route_returns_json_not_html(self, client):
         resp = client.get("/this/route/does/not/exist")
         assert resp.status_code == 404

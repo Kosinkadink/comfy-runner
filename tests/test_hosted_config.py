@@ -6,6 +6,7 @@ import pytest
 
 from comfy_runner.hosted.config import (
     get_hosted_config,
+    get_modal_credentials,
     get_provider_config,
     get_runpod_api_key,
     get_volume_config,
@@ -141,3 +142,33 @@ class TestRunpodApiKey:
         monkeypatch.setenv("RUNPOD_API_KEY", "")
         set_provider_config("runpod", {"api_key": "cfg"})
         assert get_runpod_api_key() == "cfg"
+
+
+# ---------------------------------------------------------------------------
+# get_modal_credentials — env → config fallback
+# ---------------------------------------------------------------------------
+
+class TestModalCredentials:
+    def test_env_vars_take_precedence(self, tmp_config_dir, monkeypatch):
+        set_provider_config("modal", {"key": "cfg-key", "secret": "cfg-secret"})
+        monkeypatch.setenv("MODAL_KEY", "env-key")
+        monkeypatch.setenv("MODAL_SECRET", "env-secret")
+        assert get_modal_credentials() == ("env-key", "env-secret")
+
+    def test_falls_back_to_config(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("MODAL_KEY", raising=False)
+        monkeypatch.delenv("MODAL_SECRET", raising=False)
+        set_provider_config("modal", {"key": "cfg-key", "secret": "cfg-secret"})
+        assert get_modal_credentials() == ("cfg-key", "cfg-secret")
+
+    def test_returns_empty_when_neither_set(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("MODAL_KEY", raising=False)
+        monkeypatch.delenv("MODAL_SECRET", raising=False)
+        assert get_modal_credentials() == ("", "")
+
+    def test_partial_env_falls_back_to_config(self, tmp_config_dir, monkeypatch):
+        """If only one env var is set, fall back to config for both."""
+        monkeypatch.setenv("MODAL_KEY", "env-key")
+        monkeypatch.delenv("MODAL_SECRET", raising=False)
+        set_provider_config("modal", {"key": "cfg-key", "secret": "cfg-secret"})
+        assert get_modal_credentials() == ("cfg-key", "cfg-secret")

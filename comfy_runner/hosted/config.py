@@ -22,6 +22,13 @@ DEFAULT_RUNPOD_CONFIG: dict[str, Any] = {
 }
 
 
+DEFAULT_MODAL_CONFIG: dict[str, Any] = {
+    "key": "",
+    "secret": "",
+    "default_gpu": "L40S",
+}
+
+
 def get_hosted_config() -> dict[str, Any]:
     """Return the full hosted config dict, defaulting to ``{}``."""
     config = load_config()
@@ -116,6 +123,20 @@ def get_runpod_api_key() -> str:
     if token:
         return token
     return get_provider_config("runpod").get("api_key", "")
+
+
+def get_modal_credentials() -> tuple[str, str]:
+    """Get Modal proxy auth credentials (key, secret).
+
+    Checks env vars ``MODAL_KEY`` and ``MODAL_SECRET`` first,
+    then falls back to the hosted config.
+    """
+    key = os.environ.get("MODAL_KEY", "")
+    secret = os.environ.get("MODAL_SECRET", "")
+    if key and secret:
+        return key, secret
+    cfg = get_provider_config("modal")
+    return cfg.get("key", ""), cfg.get("secret", "")
 
 
 # ---------------------------------------------------------------------------
