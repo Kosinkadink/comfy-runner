@@ -257,7 +257,7 @@ class TailscaleTunnel:
         self._pid = pid
 
     def start(self, port: int) -> str:
-        if not shutil.which("tailscale"):
+        if not _find_tailscale():
             raise RuntimeError("tailscale binary not found on PATH.")
 
         self._port = port
@@ -351,20 +351,35 @@ class TailscaleTunnel:
 # Tailscale helpers — hostname detection + serve management
 # ---------------------------------------------------------------------------
 
+def _find_tailscale() -> str | None:
+    """Locate the tailscale CLI binary, including macOS app bundle path."""
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    if sys.platform == "darwin":
+        mac_path = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        if os.path.isfile(mac_path) and os.access(mac_path, os.X_OK):
+            return mac_path
+    return None
+
+
 def _run_tailscale(
     args: list[str],
     timeout: int = 10,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run a tailscale CLI command with platform-appropriate flags."""
+    binary = _find_tailscale()
+    if not binary:
+        raise RuntimeError("tailscale binary not found on PATH.")
     kwargs: dict[str, Any] = {"capture_output": True, "timeout": timeout}
     if sys.platform == "win32":
         kwargs["creationflags"] = _NO_WINDOW
-    return subprocess.run(["tailscale", *args], **kwargs)
+    return subprocess.run([binary, *args], **kwargs)
 
 
 def get_tailscale_hostname() -> str | None:
     """Return the machine's Tailscale FQDN (e.g. 'mybox.tailnet-name.ts.net'), or None."""
-    if not shutil.which("tailscale"):
+    if not _find_tailscale():
         return None
     try:
         result = _run_tailscale(["status", "--json"])
@@ -394,7 +409,7 @@ def start_tailscale_serve(
 
     Returns the HTTPS URL. Raises RuntimeError on failure.
     """
-    if not shutil.which("tailscale"):
+    if not _find_tailscale():
         raise RuntimeError("tailscale binary not found on PATH.")
 
     hostname = get_tailscale_hostname()
@@ -523,7 +538,7 @@ def start_tailscale_serve_port(
     
     Returns the HTTPS URL. Raises RuntimeError on failure.
     """
-    if not shutil.which("tailscale"):
+    if not _find_tailscale():
         raise RuntimeError("tailscale binary not found on PATH.")
 
     hostname = get_tailscale_hostname()
@@ -570,7 +585,7 @@ def stop_tailscale_serve_port(
 
 def get_tailscale_serve_status() -> dict[str, Any]:
     """Check if tailscale serve is currently active. Returns status dict."""
-    if not shutil.which("tailscale"):
+    if not _find_tailscale():
         return {"active": False, "reason": "tailscale not installed"}
 
     try:
