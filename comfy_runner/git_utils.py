@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import subprocess
@@ -15,9 +16,20 @@ def _git_env() -> dict[str, str]:
     """Build environment for git commands.
 
     Disables interactive prompts so git never blocks on auth dialogs.
+    When a GitHub token is available, injects it via an HTTP Authorization
+    header (not URL rewriting) to avoid polluting Windows Credential Manager.
     """
+    from .config import get_github_token
+
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
+    token = get_github_token()
+    if token:
+        # Encode as Basic auth with x-access-token as username
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {basic}"
     return env
 
 

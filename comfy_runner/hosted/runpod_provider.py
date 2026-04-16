@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .config import get_github_token, get_provider_config, get_runpod_api_key
+from comfy_runner.config import get_github_token
+from .config import get_provider_config, get_runpod_api_key
 
 import os
 from .provider import PodInfo, VolumeInfo
