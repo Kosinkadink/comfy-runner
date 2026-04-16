@@ -12,23 +12,12 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDO
 
 
 def _git_env() -> dict[str, str]:
-    """Build environment for git commands with optional GitHub token auth.
+    """Build environment for git commands.
 
-    Injects GITHUB_TOKEN as HTTPS credentials via git config env vars,
-    enabling clone/fetch from private repos without a credential helper.
+    Disables interactive prompts so git never blocks on auth dialogs.
     """
-    from .config import get_github_token
-
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    token = get_github_token()
-    if token:
-        env["GIT_ASKPASS"] = "echo"
-        env["GIT_CONFIG_COUNT"] = "1"
-        env["GIT_CONFIG_KEY_0"] = (
-            f"url.https://x-access-token:{token}@github.com/.insteadOf"
-        )
-        env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
     return env
 
 
