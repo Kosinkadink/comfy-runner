@@ -9,20 +9,65 @@ comfy-runner is a Python toolkit for managing ComfyUI instances — installation
 
 ## Setup
 
-```powershell
-# Activate venv (Windows)
-comfy-runner\.venv\Scripts\python.exe comfy-runner\comfy_runner.py <command>
+**Always check the venv exists before using it:**
 
-# Or use the module form
-comfy-runner\.venv\Scripts\python.exe -m comfy_runner_cli <command>
+```powershell
+# Windows — check venv exists
+Test-Path comfy-runner\.venv\Scripts\python.exe
+
+# Linux/macOS — check venv exists
+test -f comfy-runner/.venv/bin/python
 ```
 
-If `.venv` doesn't exist, run `comfy-runner\setup_env.ps1` (Windows) or `comfy-runner/setup_env.sh` (Linux/macOS) first.
-
-Set `GITHUB_TOKEN` for GitHub API access (releases, manifests):
+If the venv is missing, create it first:
 
 ```powershell
-$env:GITHUB_TOKEN = (Get-Content githubtoken.txt -Raw).Trim(); comfy-runner\.venv\Scripts\python.exe comfy-runner\comfy_runner.py <command>; Remove-Item Env:\GITHUB_TOKEN
+# Windows
+powershell -ExecutionPolicy Bypass -File comfy-runner\setup_env.ps1
+
+# Linux/macOS
+chmod +x comfy-runner/setup_env.sh && comfy-runner/setup_env.sh
+```
+
+> **Windows note:** Always use `powershell -ExecutionPolicy Bypass -File` to run `.ps1` setup scripts. The default execution policy may block unsigned scripts with a `SecurityError`.
+
+Once the venv exists, run commands with:
+
+```powershell
+# Windows
+comfy-runner\.venv\Scripts\python.exe comfy-runner\comfy_runner.py <command>
+
+# Linux/macOS
+comfy-runner/.venv/bin/python comfy-runner/comfy_runner.py <command>
+```
+
+### GitHub Token
+
+Set `GITHUB_TOKEN` for GitHub API access (releases, manifests). Try these sources in order:
+
+1. **`githubtoken.txt`** — Search the workspace root and parent directories. Use `Test-Path` (Windows) or `test -f` (Unix) to verify. Do not assume a hardcoded path.
+   ```powershell
+   $env:GITHUB_TOKEN = (Get-Content githubtoken.txt -Raw).Trim()
+   ```
+
+2. **`gh` CLI** (if installed):
+   ```powershell
+   $env:GITHUB_TOKEN = (gh auth token)
+   ```
+
+3. **Git credential manager** — Falls back to the OS credential store (works on Windows with Git Credential Manager, macOS with Keychain):
+   ```powershell
+   # Windows (PowerShell)
+   $env:GITHUB_TOKEN = ("protocol=https`nhost=github.com`n" | git credential fill | Select-String "password=(.+)" | ForEach-Object { $_.Matches[0].Groups[1].Value })
+   ```
+   ```bash
+   # Linux/macOS
+   export GITHUB_TOKEN=$(echo -e "protocol=https\nhost=github.com\n" | git credential fill | grep ^password= | cut -d= -f2)
+   ```
+
+After setting the token, run commands and clean up:
+```powershell
+comfy-runner\.venv\Scripts\python.exe comfy-runner\comfy_runner.py <command>; Remove-Item Env:\GITHUB_TOKEN
 ```
 
 ## Tailscale Resolution
@@ -38,9 +83,20 @@ Users often provide bare device names (e.g., "deploy to mybox") or short hostnam
    If this fails, Tailscale is not installed or not running.
 
 2. **Get the MagicDNS suffix:**
+
+   **Windows (PowerShell):**
    ```powershell
-   tailscale status --json | python -c "import json,sys; print(json.load(sys.stdin)['MagicDNSSuffix'])"
+   $tsStatus = tailscale status --json | ConvertFrom-Json
+   $tsStatus.MagicDNSSuffix
    ```
+
+   **Linux/macOS:**
+   ```bash
+   tailscale status --json | python3 -c "import json,sys; print(json.load(sys.stdin)['MagicDNSSuffix'])"
+   ```
+
+   > **Do NOT** pipe `tailscale status --json` to `python -c` on Windows — PowerShell's pipeline encoding (UTF-8 BOM) causes `JSONDecodeError`. Use `ConvertFrom-Json` instead, which is a native PowerShell cmdlet and avoids encoding issues entirely.
+
    This returns something like `tailnet-name.ts.net`.
 
 3. **Construct the full FQDN URL:**
@@ -61,7 +117,65 @@ Users often provide bare device names (e.g., "deploy to mybox") or short hostnam
 - **Never use short hostnames** like `https://mybox:9189` — TLS cert is issued for the FQDN.
 - **Default runner server port is 9189** unless configured otherwise.
 
-## CLI Quick Reference
+## Remote Server Operations (HTTP API)
+
+The local CLI `deploy` command only works on **local** installations. To deploy to a **remote** comfy-runner server (e.g., over Tailscale), use the HTTP API directly — there is no `remote deploy` CLI command.
+
+### Remote deploy workflow
+
+1. **Resolve the server URL** (see Tailscale Resolution above).
+
+2. **Check current state** before deploying (to preserve `launch_args`):
+
+   **Windows (PowerShell):**
+   ```powershell
+   Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/instance-name/info"
+   ```
+
+   **Linux/macOS:**
+   ```bash
+   curl -s https://mybox.tailnet.ts.net:9189/instance-name/info
+   ```
+
+3. **Trigger the deploy:**
+
+   **Windows (PowerShell):**
+   ```powershell
+   $body = @{ pr = 1234 } | ConvertTo-Json
+   $resp = Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/instance-name/deploy" -Method Post -Body $body -ContentType "application/json"
+   $resp.job_id   # deploy is async — save the job_id
+   ```
+
+   **Linux/macOS:**
+   ```bash
+   curl -s -X POST https://mybox.tailnet.ts.net:9189/instance-name/deploy \
+     -H "Content-Type: application/json" -d '{"pr": 1234}'
+   ```
+
+   The deploy body accepts: `pr`, `branch`, `tag`, `commit`, `latest` (bool), `pull` (bool), `reset` (bool), `launch_args`, `github_token`.
+
+4. **Poll the job until complete:**
+
+   ```powershell
+   Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/job/$($resp.job_id)"
+   ```
+
+   Repeat until `status` is `"completed"` or `"failed"`.
+
+### Other common remote operations
+
+| Operation | Method | Endpoint |
+|-----------|--------|----------|
+| List installations | GET | `/installations` |
+| Installation status | GET | `/{name}/status` |
+| Start | POST | `/{name}/start` |
+| Stop | POST | `/{name}/stop` |
+| View logs | GET | `/{name}/logs?lines=50` |
+| Self-update server | POST | `/self-update` |
+
+**For the full endpoint list, read the "API Endpoints" section in `comfy-runner/README.md`.** If the server is running, `GET /openapi.json` has the complete auto-generated spec.
+
+## CLI Quick Reference (Local Only)
 
 ### Installation Management
 
@@ -189,8 +303,22 @@ If a server is running, fetch `GET /openapi.json` for the complete auto-generate
 
 2. **Tailscale FQDN required.** Always use the full MagicDNS FQDN (e.g., `https://mybox.tailnet-name.ts.net:9189`). See the Tailscale Resolution section above.
 
-3. **`--cuda-compat` for cloud GPUs.** The standalone environment bundles PyTorch for CUDA 13.0 (driver ≥ 580). Use `--cuda-compat` on `init`/`hosted init` to auto-detect and reinstall a compatible PyTorch.
+3. **Local CLI vs remote API.** The `deploy`, `start`, `stop`, etc. CLI commands operate on **local** installations only. For remote servers, use the HTTP API (`Invoke-RestMethod` on Windows, `curl` on Unix). There is no `remote deploy` CLI subcommand — only `remote upload-model` exists.
 
-4. **`--json` flag.** All CLI commands support `--json` for machine-readable output.
+4. **`--cuda-compat` for cloud GPUs.** The standalone environment bundles PyTorch for CUDA 13.0 (driver ≥ 580). Use `--cuda-compat` on `init`/`hosted init` to auto-detect and reinstall a compatible PyTorch.
 
-5. **OpenAPI spec.** When unsure about API parameters, fetch `/openapi.json` from the running server.
+5. **`--json` flag.** All CLI commands support `--json` for machine-readable output.
+
+6. **OpenAPI spec.** When unsure about API parameters, fetch `/openapi.json` from the running server.
+
+## Windows PowerShell Notes
+
+Amp on Windows always runs commands in **PowerShell 7 (pwsh)**, regardless of whether the user launched Amp from `cmd.exe`, Windows PowerShell 5.1, or pwsh. This means:
+
+- **`&&` works** — PS 7 supports pipeline chain operators (`&&`, `||`). Do not avoid them or use `;` as a workaround (`;` runs the second command even if the first fails).
+- **`ConvertFrom-Json` / `ConvertTo-Json`** — Use these native cmdlets to parse and build JSON. Do not pipe JSON through `python -c` on Windows — PowerShell's pipeline encoding adds a UTF-8 BOM that causes `JSONDecodeError` in Python.
+- **`Invoke-RestMethod`** — Use this for HTTP API calls on Windows. It automatically parses JSON responses into PowerShell objects. Equivalent to `curl` on Unix.
+- **Execution policy** — Always run `.ps1` scripts with `powershell -ExecutionPolicy Bypass -File <script>` to avoid `SecurityError` from the default policy.
+- **Environment variables** — Use `$env:VAR_NAME` syntax (not `%VAR_NAME%` which is `cmd.exe` syntax).
+
+> **PS 7 vs PS 5.1:** Older Windows PowerShell 5.1 (`powershell.exe`) does NOT support `&&` and has different encoding defaults. Amp does not use PS 5.1, so do not write workarounds for it.
