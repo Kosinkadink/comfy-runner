@@ -121,6 +121,16 @@ Users often provide bare device names (e.g., "deploy to mybox") or short hostnam
 
 The local CLI `deploy` command only works on **local** installations. To deploy to a **remote** comfy-runner server (e.g., over Tailscale), use the HTTP API directly — there is no `remote deploy` CLI command.
 
+### Auto-init via deploy
+
+`POST /{name}/deploy` **auto-initializes** a missing installation. If the installation name doesn't exist on the remote server, deploy creates it first (picks the correct variant for the platform automatically), then proceeds with the deploy. This means you don't need a separate `init` step for remote servers — just deploy to any name and it will be created.
+
+```powershell
+# This creates the installation "myinstall" if it doesn't exist, then deploys
+$body = @{ latest = $true } | ConvertTo-Json
+Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/myinstall/deploy" -Method Post -Body $body -ContentType "application/json"
+```
+
 ### Remote deploy workflow
 
 1. **Resolve the server URL** (see Tailscale Resolution above).
@@ -162,6 +172,48 @@ The local CLI `deploy` command only works on **local** installations. To deploy 
 
    Repeat until `status` is `"completed"` or `"failed"`.
 
+### Installing pip packages remotely
+
+Pip packages can be installed on remote installations via the **snapshot import + restore** mechanism:
+
+1. **Save a snapshot** of the current state:
+   ```powershell
+   Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/instance-name/snapshot/save" -Method Post
+   ```
+
+2. **Export the snapshot** to get the envelope:
+   ```powershell
+   $snapshot = Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/instance-name/snapshot/<filename>/export"
+   ```
+
+3. **Modify the envelope** to add/change pip packages in the `pipPackages` field.
+
+4. **Import the modified envelope with restore:**
+   ```powershell
+   $body = @{ envelope = $modifiedEnvelope; restore = $true } | ConvertTo-Json -Depth 10
+   Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/instance-name/snapshot/import" -Method Post -Body $body -ContentType "application/json"
+   ```
+
+5. **Manually trigger restore** if needed:
+   ```powershell
+   $body = @{ id = "<filename>" } | ConvertTo-Json
+   Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/instance-name/snapshot/restore" -Method Post -Body $body -ContentType "application/json"
+   ```
+
+### ComfyUI proxy and queue management
+
+All ComfyUI API endpoints are accessible via the `/{name}/comfyui/{path}` proxy on the runner server. This lets you interact with ComfyUI without exposing its port directly.
+
+| Operation | Method | Endpoint |
+|-----------|--------|----------|
+| Queue a workflow | POST | `/{name}/comfyui/prompt` |
+| Check history | GET | `/{name}/comfyui/history/{prompt_id}` |
+| Interrupt execution | POST | `/{name}/comfyui/interrupt` |
+| Clear queue | POST | `/{name}/comfyui/queue` (body: `{"clear": true}`) |
+| System stats | GET | `/{name}/comfyui/system_stats` |
+| List outputs | GET | `/{name}/outputs` |
+| Download an output | GET | `/{name}/outputs/{filename}` |
+
 ### Other common remote operations
 
 | Operation | Method | Endpoint |
@@ -172,6 +224,8 @@ The local CLI `deploy` command only works on **local** installations. To deploy 
 | Stop | POST | `/{name}/stop` |
 | View logs | GET | `/{name}/logs?lines=50` |
 | Self-update server | POST | `/self-update` |
+
+> **Log session filtering:** The `?session=` parameter on the logs endpoint may return accumulated logs rather than session-specific logs. Don't rely on it for isolating specific session data.
 
 **For the full endpoint list, read the "API Endpoints" section in `comfy-runner/README.md`.** If the server is running, `GET /openapi.json` has the complete auto-generated spec.
 
@@ -189,6 +243,8 @@ The local CLI `deploy` command only works on **local** installations. To deploy 
 | `config show` | View global config |
 | `config set <key> <value>` | Set global config value |
 | `releases` | List available releases |
+
+> **Platform-aware variant selection:** `comfy_runner.py releases` only shows variants compatible with the current platform. To see all variants (e.g., `mac-mps` from Windows), query the GitHub API directly.
 
 ### Process Control
 
@@ -310,6 +366,12 @@ If a server is running, fetch `GET /openapi.json` for the complete auto-generate
 5. **`--json` flag.** All CLI commands support `--json` for machine-readable output.
 
 6. **OpenAPI spec.** When unsure about API parameters, fetch `/openapi.json` from the running server.
+
+7. **Deploy auto-inits.** Remote `POST /{name}/deploy` auto-creates missing installations — no separate `init` call needed.
+
+8. **`releases` is platform-filtered.** The CLI only shows variants for the current OS. Use the GitHub API to see cross-platform variants.
+
+9. **Log `?session=` is unreliable.** The session filter on the logs endpoint may return accumulated logs, not session-specific data.
 
 ## Windows PowerShell Notes
 
