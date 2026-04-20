@@ -1429,7 +1429,7 @@ def create_app() -> Any:
     # ------------------------------------------------------------------
     @app.route("/<name>/move-model", methods=["POST"])
     def route_move_model(name: str) -> Any:
-        from comfy_runner.workflow_models import resolve_models_dir
+        from comfy_runner.workflow_models import resolve_models_dir, _validate_model_path
 
         record, err = _get_record(name)
         if not record:
@@ -1450,15 +1450,9 @@ def create_app() -> Any:
 
         try:
             models_dir = resolve_models_dir(record["path"])
-            models_root = models_dir.resolve()
 
-            src = (models_dir / from_directory / filename).resolve()
-            dst = (models_dir / to_directory / filename).resolve()
-
-            if not src.is_relative_to(models_root):
-                return _err("Invalid source path: escapes models directory")
-            if not dst.is_relative_to(models_root):
-                return _err("Invalid destination path: escapes models directory")
+            src = _validate_model_path(models_dir, from_directory, filename)
+            dst = _validate_model_path(models_dir, to_directory, filename)
 
             if not src.is_file():
                 return _err(f"Source not found: {from_directory}/{filename}", 404)
@@ -1482,7 +1476,10 @@ def create_app() -> Any:
                 "from_directory": from_directory,
                 "to_directory": to_directory,
             })
+        except ValueError as e:
+            return _err(str(e))
         except Exception as e:
+            log.error("Move/copy failed for '%s': %s", name, e)
             return _err(str(e))
 
     # ------------------------------------------------------------------
