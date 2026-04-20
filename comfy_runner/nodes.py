@@ -6,7 +6,10 @@ import json
 import shutil
 import subprocess
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore[no-redef]
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
