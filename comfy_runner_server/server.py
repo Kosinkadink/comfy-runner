@@ -1425,6 +1425,67 @@ def create_app() -> Any:
         return jsonify({"ok": True, "removed": removed})
 
     # ------------------------------------------------------------------
+    # POST /<name>/move-model
+    # ------------------------------------------------------------------
+    @app.route("/<name>/move-model", methods=["POST"])
+    def route_move_model(name: str) -> Any:
+        from comfy_runner.workflow_models import resolve_models_dir
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        from_directory = body.get("from_directory", "")
+        to_directory = body.get("to_directory", "")
+        filename = body.get("name", "")
+        copy = body.get("copy", False)
+
+        if not from_directory:
+            return _err("Missing 'from_directory' field")
+        if not to_directory:
+            return _err("Missing 'to_directory' field")
+        if not filename:
+            return _err("Missing 'name' field")
+
+        try:
+            models_dir = resolve_models_dir(record["path"])
+            models_root = models_dir.resolve()
+
+            src = (models_dir / from_directory / filename).resolve()
+            dst = (models_dir / to_directory / filename).resolve()
+
+            if not src.is_relative_to(models_root):
+                return _err("Invalid source path: escapes models directory")
+            if not dst.is_relative_to(models_root):
+                return _err("Invalid destination path: escapes models directory")
+
+            if not src.is_file():
+                return _err(f"Source not found: {from_directory}/{filename}", 404)
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if dst.exists():
+                return _err(f"Destination already exists: {to_directory}/{filename}")
+
+            import shutil
+            if copy:
+                shutil.copy2(str(src), str(dst))
+            else:
+                shutil.move(str(src), str(dst))
+
+            action = "copied" if copy else "moved"
+            return jsonify({
+                "ok": True,
+                "action": action,
+                "name": filename,
+                "from_directory": from_directory,
+                "to_directory": to_directory,
+            })
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # POST /<name>/workflow-models  (async — returns job_id)
     # ------------------------------------------------------------------
     @app.route("/<name>/workflow-models", methods=["POST"])
