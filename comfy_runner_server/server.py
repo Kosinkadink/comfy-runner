@@ -1764,6 +1764,22 @@ def create_app() -> Any:
         if already_up_to_date:
             return jsonify({"ok": True, "updated": False, "message": pull_output})
 
+        # Install any new/changed dependencies before restarting
+        req_file = repo_dir / "requirements.txt"
+        deps_output = ""
+        if req_file.exists():
+            try:
+                pip_result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=120,
+                )
+                deps_output = pip_result.stdout.strip()
+                if pip_result.returncode != 0:
+                    log.warning("pip install failed during self-update: %s", pip_result.stderr.strip())
+            except Exception as e:
+                log.warning("pip install failed during self-update: %s", e)
+
         # Schedule restart after response is sent
         def _restart() -> None:
             time.sleep(1)
