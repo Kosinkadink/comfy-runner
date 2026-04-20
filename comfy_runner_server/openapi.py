@@ -820,6 +820,40 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
     {
+        "path": "/{name}/move-model",
+        "method": "post",
+        "tags": ["Models"],
+        "summary": "Move or copy a model",
+        "description": (
+            "Moves or copies a model file between subdirectories under models/. "
+            "Set copy=true to copy instead of move. Fails if the destination already exists."
+        ),
+        "parameters": [_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["from_directory", "to_directory", "name"],
+                        "properties": {
+                            "from_directory": {"type": "string", "description": "Source subdirectory under models/ (e.g. 'diffusion_models')"},
+                            "to_directory": {"type": "string", "description": "Destination subdirectory under models/ (e.g. 'checkpoints')"},
+                            "name": {"type": "string", "description": "Filename to move or copy"},
+                            "copy": {"type": "boolean", "description": "If true, copy instead of move (default: false)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Model moved/copied", {
+            "action": {"type": "string", "enum": ["moved", "copied"]},
+            "name": {"type": "string"},
+            "from_directory": {"type": "string"},
+            "to_directory": {"type": "string"},
+        }),
+    },
+    {
         "path": "/{name}/workflow-models",
         "method": "post",
         "tags": ["Models"],
