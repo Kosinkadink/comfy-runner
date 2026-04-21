@@ -269,6 +269,20 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
     {
+        "path": "/{name}/unlock",
+        "method": "post",
+        "tags": ["Process"],
+        "summary": "Force-release installation lock",
+        "description": (
+            "Replaces the in-memory lock for this installation with a fresh one. "
+            "Use when an installation is stuck in 'busy' state due to a hung job."
+        ),
+        "parameters": [_NAME_PARAM],
+        "responses": _ok_response("Lock reset", {
+            "lock_reset": {"type": "boolean", "description": "True if a lock existed and was replaced"},
+        }),
+    },
+    {
         "path": "/{name}",
         "method": "delete",
         "tags": ["Installations"],
