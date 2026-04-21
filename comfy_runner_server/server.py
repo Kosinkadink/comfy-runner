@@ -75,6 +75,18 @@ def _err(msg: str, status: int = 400) -> tuple[Any, int]:
     return jsonify({"ok": False, "error": msg}), status
 
 
+def _validate_env_dict(env: Any) -> str | None:
+    """Return an error message if *env* is not a valid ``dict[str, str]``, else None."""
+    if env is None:
+        return None
+    if not isinstance(env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in env.items()
+    ):
+        return "'env' must be a dict of string key-value pairs"
+    return None
+
+
 def _get_record(name: str) -> tuple[dict | None, str]:
     """Get an installation record, returning (record, error_msg)."""
     from comfy_runner.config import get_installation
@@ -639,12 +651,9 @@ def create_app() -> Any:
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
         env_overrides = body.get("env")
-        if env_overrides is not None:
-            if not isinstance(env_overrides, dict) or not all(
-                isinstance(k, str) and isinstance(v, str)
-                for k, v in env_overrides.items()
-            ):
-                return _err("'env' must be a dict of string key-value pairs")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"restart {name}")
 
@@ -775,12 +784,9 @@ def create_app() -> Any:
         for key in allowed_keys:
             if key in body:
                 if key == "env":
-                    val = body[key]
-                    if not isinstance(val, dict) or not all(
-                        isinstance(k, str) and isinstance(v, str)
-                        for k, v in val.items()
-                    ):
-                        return _err("'env' must be a dict of string key-value pairs")
+                    env_err = _validate_env_dict(body[key])
+                    if env_err:
+                        return _err(env_err)
                 record[key] = body[key]
                 updated[key] = body[key]
 
@@ -1592,12 +1598,9 @@ def create_app() -> Any:
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
         env_overrides = body.get("env")
-        if env_overrides is not None:
-            if not isinstance(env_overrides, dict) or not all(
-                isinstance(k, str) and isinstance(v, str)
-                for k, v in env_overrides.items()
-            ):
-                return _err("'env' must be a dict of string key-value pairs")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"start {name}")
 

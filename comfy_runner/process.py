@@ -335,6 +335,17 @@ def _redact_cmd_line(cmd: str, args: list[str]) -> str:
     return " ".join(parts)
 
 
+def _merge_env(
+    record_env: dict[str, str] | None,
+    overrides: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Merge persisted env vars with runtime overrides. Returns None if empty."""
+    merged = dict(record_env or {})
+    if overrides:
+        merged.update(overrides)
+    return merged or None
+
+
 def spawn_comfyui(
     install_path: str | Path,
     extra_args: str = "",
@@ -537,10 +548,7 @@ def start_installation(
     if extra_args:
         launch_args = f"{launch_args} {extra_args}".strip()
 
-    # Merge persisted env vars with runtime overrides
-    merged_env = dict(record.get("env", {}) or {})
-    if env_overrides:
-        merged_env.update(env_overrides)
+    merged_env = _merge_env(record.get("env"), env_overrides)
 
     if send_output:
         send_output(f"Starting '{name}'...\n")
@@ -814,10 +822,7 @@ def start_foreground(
     if extra_args:
         launch_args = f"{launch_args} {extra_args}".strip()
 
-    # Merge persisted env vars with runtime overrides
-    merged_env = dict(record.get("env", {}) or {})
-    if env_overrides:
-        merged_env.update(env_overrides)
+    merged_env = _merge_env(record.get("env"), env_overrides)
 
     result = spawn_comfyui(
         install_path=install_path,
