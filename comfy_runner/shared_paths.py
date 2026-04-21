@@ -172,16 +172,22 @@ def _list_subdirs(directory: str | Path) -> list[str]:
     return result
 
 
-def discover_extra_model_folders(install_path: str | Path) -> list[str]:
-    """Scan the installation's models dirs for non-canonical folder types.
+def discover_extra_model_folders(
+    install_path: str | Path,
+    shared_dir: str | Path | None = None,
+) -> list[str]:
+    """Scan model dirs for non-canonical folder types.
 
-    Checks both ``{install}/ComfyUI/models`` (standalone layout) and
-    ``{install}/models`` (portable).  Returns sorted list of extra names.
+    Checks the installation's models dirs (``{install}/ComfyUI/models``
+    and ``{install}/models``) plus the shared models dir if provided.
+    Returns sorted list of extra names.
     """
     candidates = [
         Path(install_path) / "ComfyUI" / "models",
         Path(install_path) / "models",
     ]
+    if shared_dir:
+        candidates.append(Path(shared_dir).resolve() / "models")
     seen: set[str] = set()
     for d in candidates:
         for name in _list_subdirs(d):

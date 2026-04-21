@@ -550,7 +550,7 @@ def start_installation(
     pre_extras: set[str] | None = None
     if shared_dir:
         from .shared_paths import discover_extra_model_folders
-        pre_extras = discover_extra_model_folders(install_path)
+        pre_extras = discover_extra_model_folders(install_path, shared_dir)
 
     try:
         result = spawn_comfyui(
