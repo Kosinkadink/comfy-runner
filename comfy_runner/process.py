@@ -344,6 +344,7 @@ def spawn_comfyui(
     stdout: Any = None,
     stderr: Any = None,
     send_output: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Spawn the ComfyUI process.
 
@@ -396,7 +397,7 @@ def spawn_comfyui(
         send_output(f"> {cmd_line}\n\n")
 
     # Spawn with PYTHONIOENCODING=utf-8 (mirrors Desktop 2.0)
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", **(env_overrides or {})}
 
     kwargs: dict[str, Any] = {
         "cwd": launch["cwd"],
@@ -506,6 +507,7 @@ def start_installation(
     port_conflict: str = "auto",
     extra_args: str | None = None,
     send_output: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Start a ComfyUI installation in background mode. Returns running state dict."""
     record = get_installation(name)
@@ -535,6 +537,11 @@ def start_installation(
     if extra_args:
         launch_args = f"{launch_args} {extra_args}".strip()
 
+    # Merge persisted env vars with runtime overrides
+    merged_env = dict(record.get("env", {}) or {})
+    if env_overrides:
+        merged_env.update(env_overrides)
+
     if send_output:
         send_output(f"Starting '{name}'...\n")
 
@@ -562,6 +569,7 @@ def start_installation(
             stdout=log_fh,
             stderr=log_fh,
             send_output=send_output,
+            env_overrides=merged_env or None,
         )
     except Exception:
         log_fh.close()
@@ -622,6 +630,7 @@ def start_installation(
                 stdout=log_fh2,
                 stderr=log_fh2,
                 send_output=send_output,
+                env_overrides=merged_env or None,
             )
             log_fh2.close()
             wait_for_ready(
@@ -773,6 +782,7 @@ def start_foreground(
     port_conflict: str = "auto",
     extra_args: str | None = None,
     send_output: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Start ComfyUI and stream output to send_output, blocking until exit.
 
@@ -804,6 +814,11 @@ def start_foreground(
     if extra_args:
         launch_args = f"{launch_args} {extra_args}".strip()
 
+    # Merge persisted env vars with runtime overrides
+    merged_env = dict(record.get("env", {}) or {})
+    if env_overrides:
+        merged_env.update(env_overrides)
+
     result = spawn_comfyui(
         install_path=install_path,
         extra_args=launch_args,
@@ -813,6 +828,7 @@ def start_foreground(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         send_output=send_output,
+        env_overrides=merged_env or None,
     )
 
     proc = result["process"]
