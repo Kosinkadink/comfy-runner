@@ -777,7 +777,7 @@ def cmd_server(args: argparse.Namespace) -> None:
             except Exception:
                 pass
 
-    # Auto-start instances with autostart=True
+    # Auto-start instances with autostart=True and restore persistent tunnels
     from comfy_runner.installations import show_list
     from comfy_runner.process import get_status, start_installation
     autostart_instances = [
@@ -791,12 +791,13 @@ def cmd_server(args: argparse.Namespace) -> None:
             try:
                 status = get_status(name)
                 if status.get("running"):
-                    console.print(f"  [dim]{name}: already running on port {status.get('port')}[/dim]")
-                    continue
-                console.print(f"  Starting [cyan]{name}[/cyan]...")
-                result = start_installation(name, send_output=_output)
-                port = result.get("port")
-                console.print(f"  ✓ [cyan]{name}[/cyan] started on port {port}")
+                    port = status.get("port")
+                    console.print(f"  [dim]{name}: already running on port {port}[/dim]")
+                else:
+                    console.print(f"  Starting [cyan]{name}[/cyan]...")
+                    result = start_installation(name, send_output=_output)
+                    port = result.get("port")
+                    console.print(f"  ✓ [cyan]{name}[/cyan] started on port {port}")
                 # Register tailscale serve if in tailscale mode
                 if tailscale_active and port:
                     try:
@@ -804,21 +805,23 @@ def cmd_server(args: argparse.Namespace) -> None:
                         start_tailscale_serve_port(port, send_output=_output)
                     except Exception as e:
                         console.print(f"  [dim]⚠ Tailscale serve for {name}: {e}[/dim]")
-                # Restore persistent tunnel if configured
+                # Restore persistent tunnel if configured (skip if already active)
                 tunnel_provider = inst.get("tunnel_provider")
                 if tunnel_provider:
-                    try:
-                        from comfy_runner.tunnel import start_tunnel
-                        tunnel_domain = inst.get("tunnel_domain", "")
-                        tunnel_result = start_tunnel(
-                            name=name,
-                            provider=tunnel_provider,
-                            send_output=_output,
-                            domain=tunnel_domain,
-                        )
-                        console.print(f"  ✓ Tunnel: {tunnel_result.get('url')}")
-                    except Exception as e:
-                        console.print(f"  [dim]⚠ Tunnel restore for {name}: {e}[/dim]")
+                    from comfy_runner.tunnel import get_tunnel_url
+                    if not get_tunnel_url(name):
+                        try:
+                            from comfy_runner.tunnel import start_tunnel
+                            tunnel_domain = inst.get("tunnel_domain", "")
+                            tunnel_result = start_tunnel(
+                                name=name,
+                                provider=tunnel_provider,
+                                send_output=_output,
+                                domain=tunnel_domain,
+                            )
+                            console.print(f"  ✓ Tunnel: {tunnel_result.get('url')}")
+                        except Exception as e:
+                            console.print(f"  [dim]⚠ Tunnel restore for {name}: {e}[/dim]")
             except Exception as e:
                 console.print(f"  [red]✗ {name}: {e}[/red]")
 

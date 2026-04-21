@@ -50,7 +50,7 @@ def generate_unit(
     if port != 9189:
         args.extend(["--port", str(port)])
 
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
     working_dir = str(Path(script).parent)
 
     return f"""\

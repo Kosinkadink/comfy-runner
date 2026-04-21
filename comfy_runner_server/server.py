@@ -775,8 +775,8 @@ def create_app() -> Any:
                     record[key] = body[key]
                     updated[key] = body[key]
                 else:
-                    record[key] = body[key]
-                    updated[key] = body[key]
+                    record[key] = str(body[key]) if body[key] is not None else ""
+                    updated[key] = record[key]
 
         if not updated:
             return _err(f"No valid keys. Allowed: {', '.join(sorted(allowed_keys))}")
