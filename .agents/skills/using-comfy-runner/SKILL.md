@@ -239,7 +239,7 @@ All ComfyUI API endpoints are accessible via the `/{name}/comfyui/{path}` proxy 
 | `list` | List all installations |
 | `info [name]` | Show installation details |
 | `rm <name>` | Remove an installation |
-| `set <name> <key> <value>` | Set config on an installation |
+| `set <name> <key> <value>` | Set config on an installation (launch_args, autostart, tunnel_provider, tunnel_domain) |
 | `config show` | View global config |
 | `config set <key> <value>` | Set global config value |
 | `releases` | List available releases |
@@ -341,6 +341,9 @@ Pass `--cuda-compat` to `hosted init` when the cloud host has older NVIDIA drive
 comfy_runner.py server --host 127.0.0.1 --port 9189
 comfy_runner.py server --tailscale       # expose via tailscale serve
 comfy_runner.py server --tunnels         # enable tunnel API
+comfy_runner.py service install          # install systemd service (auto-start on boot)
+comfy_runner.py service status           # show service state
+comfy_runner.py service uninstall        # remove systemd service
 ```
 
 ## HTTP API Summary
@@ -372,6 +375,8 @@ If a server is running, fetch `GET /openapi.json` for the complete auto-generate
 8. **`releases` is platform-filtered.** The CLI only shows variants for the current OS. Use the GitHub API to see cross-platform variants.
 
 9. **Log `?session=` is unreliable.** The session filter on the logs endpoint may return accumulated logs, not session-specific data.
+
+10. **Autostart + persistent tunnels.** Use `set <name> autostart true` to auto-start instances on server boot. Use `set <name> tunnel_provider ngrok` and `set <name> tunnel_domain <domain>` for persistent tunnel assignments. The server restores these on every startup.
 
 ## Windows PowerShell Notes
 
