@@ -28,6 +28,7 @@ HEALTH_ENDPOINT = "/api/system_stats"
 HEALTH_TIMEOUT_S = 300
 HEALTH_POLL_INTERVAL_S = 1.0
 STOP_TIMEOUT_S = 10
+PORT_RELEASE_TIMEOUT_S = 5
 
 # Sensitive arg names whose *values* should be redacted in logged commands
 _SENSITIVE_ARG_RE_STR = r"^--(api[-_]?key|token|secret|password|auth)$"
@@ -208,6 +209,38 @@ def find_available_port(
             if lock is None:
                 return port
     return None
+
+
+def wait_for_port_release(
+    port: int,
+    timeout_s: float = PORT_RELEASE_TIMEOUT_S,
+    send_output: Callable[[str], None] | None = None,
+) -> bool:
+    """Wait until a port is no longer in use. Returns True if released."""
+    if not is_port_in_use(port):
+        return True
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(0.3)
+        if not is_port_in_use(port):
+            return True
+    if send_output:
+        send_output(f"⚠ Port {port} still in use after {timeout_s}s\n")
+    return False
+
+
+def kill_port_occupants(
+    port: int,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Find and kill any processes listening on a port."""
+    pids = find_pids_by_port(port)
+    if not pids:
+        return
+    if send_output:
+        send_output(f"Killing stale process(es) on port {port}: {pids}\n")
+    for pid in pids:
+        kill_process_tree(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +550,7 @@ def start_installation(
     pre_extras: set[str] | None = None
     if shared_dir:
         from .shared_paths import discover_extra_model_folders
-        pre_extras = discover_extra_model_folders(install_path)
+        pre_extras = discover_extra_model_folders(install_path, shared_dir)
 
     try:
         result = spawn_comfyui(
@@ -539,12 +572,19 @@ def start_installation(
     # prevents rotate_log() from renaming it on next restart.
     log_fh.close()
 
-    # Wait for health check
-    wait_for_ready(
-        port=result["port"],
-        pid=result["pid"],
-        send_output=send_output,
-    )
+    # Wait for health check — kill the process if it never becomes ready
+    try:
+        wait_for_ready(
+            port=result["port"],
+            pid=result["pid"],
+            send_output=send_output,
+        )
+    except RuntimeError:
+        # Clean up the spawned process so it doesn't linger
+        kill_process_tree(result["pid"])
+        _remove_pidfile(install_path)
+        remove_port_lock(result["port"])
+        raise
 
     # Post-boot: check if custom nodes created new model folders
     if shared_dir and pre_extras is not None:
@@ -564,6 +604,10 @@ def start_installation(
                 time.sleep(0.3)
             _remove_pidfile(install_path)
             remove_port_lock(result["port"])
+            # Kill orphaned children and wait for port release before respawn
+            if is_port_in_use(result["port"]):
+                kill_port_occupants(result["port"], send_output=send_output)
+            wait_for_port_release(result["port"], send_output=send_output)
 
             # Append to current log and respawn (YAML was already rewritten by sync)
             log_fh2 = open(log_file, "a", encoding="utf-8")
@@ -643,6 +687,10 @@ def stop_installation(
     _remove_pidfile(install_path)
     if port:
         remove_port_lock(port)
+        # Kill any orphaned child processes still holding the port
+        if is_port_in_use(port):
+            kill_port_occupants(port, send_output=send_output)
+        wait_for_port_release(port, send_output=send_output)
 
 
 def get_status(name: str) -> dict[str, Any]:

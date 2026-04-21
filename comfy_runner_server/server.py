@@ -244,6 +244,15 @@ def _get_install_lock(name: str) -> threading.Lock:
         return _install_locks[name]
 
 
+def _force_release_lock(name: str) -> bool:
+    """Replace a stuck lock with a fresh one. Returns True if a lock existed."""
+    with _install_locks_guard:
+        if name in _install_locks:
+            _install_locks[name] = threading.Lock()
+            return True
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Flask app factory
 # ---------------------------------------------------------------------------
@@ -698,6 +707,14 @@ def create_app() -> Any:
             return jsonify({"ok": True, "was_running": True, "output": lines})
         except Exception as e:
             return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /<name>/unlock — force-release a stuck installation lock
+    # ------------------------------------------------------------------
+    @app.route("/<name>/unlock", methods=["POST"])
+    def route_unlock(name: str) -> Any:
+        had_lock = _force_release_lock(name)
+        return jsonify({"ok": True, "lock_reset": had_lock})
 
     # ------------------------------------------------------------------
     # DELETE /<name>
