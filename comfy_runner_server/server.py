@@ -451,6 +451,7 @@ def create_app() -> Any:
                 "head_commit": record.get("head_commit"),
                 "python_version": record.get("python_version"),
                 "launch_args": record.get("launch_args"),
+                "env": record.get("env", {}),
                 "created_at": record.get("created_at"),
                 "deployed_pr": record.get("deployed_pr"),
                 "deployed_branch": record.get("deployed_branch"),
@@ -638,6 +639,12 @@ def create_app() -> Any:
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
         env_overrides = body.get("env")
+        if env_overrides is not None:
+            if not isinstance(env_overrides, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in env_overrides.items()
+            ):
+                return _err("'env' must be a dict of string key-value pairs")
 
         job_id = _jobs.create(label=f"restart {name}")
 
@@ -763,10 +770,17 @@ def create_app() -> Any:
             return _err(err, 404)
 
         body = request.get_json(silent=True) or {}
-        allowed_keys = {"launch_args"}
+        allowed_keys = {"launch_args", "env"}
         updated = {}
         for key in allowed_keys:
             if key in body:
+                if key == "env":
+                    val = body[key]
+                    if not isinstance(val, dict) or not all(
+                        isinstance(k, str) and isinstance(v, str)
+                        for k, v in val.items()
+                    ):
+                        return _err("'env' must be a dict of string key-value pairs")
                 record[key] = body[key]
                 updated[key] = body[key]
 
@@ -1578,6 +1592,12 @@ def create_app() -> Any:
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
         env_overrides = body.get("env")
+        if env_overrides is not None:
+            if not isinstance(env_overrides, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in env_overrides.items()
+            ):
+                return _err("'env' must be a dict of string key-value pairs")
 
         job_id = _jobs.create(label=f"start {name}")
 

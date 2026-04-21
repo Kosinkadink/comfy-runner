@@ -284,10 +284,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     port = args.port
     extra = args.extra_args
     pc = args.port_conflict
-    env_overrides = _parse_env_args(args.env)
 
     out = None if args.json else _output
     try:
+        env_overrides = _parse_env_args(args.env)
         if args.background:
             result = start_installation(
                 name=name,
@@ -361,8 +361,8 @@ def cmd_restart(args: argparse.Namespace) -> None:
 
     name = args.name
     out = None if args.json else _output
-    env_overrides = _parse_env_args(args.env)
     try:
+        env_overrides = _parse_env_args(args.env)
         # Unserve old port before stopping
         status = get_status(name)
         if status.get("port"):
