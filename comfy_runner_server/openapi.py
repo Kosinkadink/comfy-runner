@@ -407,6 +407,13 @@ _ROUTES: list[dict[str, Any]] = [
                                     "Only applies when the installation doesn't exist yet and is created automatically."
                                 ),
                             },
+                            "variant": {
+                                "type": "string",
+                                "description": (
+                                    "Force a specific variant for auto-init (e.g. 'linux-nvidia', 'win-nvidia'). "
+                                    "Only applies when the installation doesn't exist yet."
+                                ),
+                            },
                         },
                     }
                 }

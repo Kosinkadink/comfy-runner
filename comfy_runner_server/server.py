@@ -530,6 +530,7 @@ def create_app() -> Any:
                     out(f"Installation '{name}' not found — initializing...\n")
                     try:
                         cuda_compat = body.get("cuda_compat", False)
+                        variant = body.get("variant")
                         from comfy_runner.hosted.config import get_provider_config
                         prov_cfg = get_provider_config("runpod")
                         cache_releases = prov_cfg.get("cache_releases")
@@ -538,6 +539,7 @@ def create_app() -> Any:
                             cache_kw["max_cache_entries"] = cache_releases
                         init_installation(
                             name=name, send_output=out, cuda_compat=cuda_compat,
+                            variant=variant,
                             **cache_kw,
                         )
                     except Exception as e:
