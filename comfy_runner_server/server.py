@@ -1847,14 +1847,29 @@ def create_app() -> Any:
         import sys
 
         repo_dir = Path(__file__).resolve().parent.parent
+        body = request.get_json(silent=True) or {}
+        force = body.get("force", False)
 
-        # git pull
+        # git pull (or force-reset)
         try:
-            result = subprocess.run(
-                ["git", "pull", "--ff-only"],
+            # Always fetch first
+            subprocess.run(
+                ["git", "fetch", "--all"],
                 cwd=str(repo_dir),
                 capture_output=True, text=True, timeout=30,
             )
+            if force:
+                result = subprocess.run(
+                    ["git", "reset", "--hard", "origin/main"],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=30,
+                )
+            else:
+                result = subprocess.run(
+                    ["git", "pull", "--ff-only"],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=30,
+                )
             pull_output = result.stdout.strip()
             if result.returncode != 0:
                 return _err(f"git pull failed: {result.stderr.strip()}")
