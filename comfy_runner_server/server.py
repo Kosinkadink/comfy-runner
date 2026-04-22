@@ -75,6 +75,18 @@ def _err(msg: str, status: int = 400) -> tuple[Any, int]:
     return jsonify({"ok": False, "error": msg}), status
 
 
+def _validate_env_dict(env: Any) -> str | None:
+    """Return an error message if *env* is not a valid ``dict[str, str]``, else None."""
+    if env is None:
+        return None
+    if not isinstance(env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in env.items()
+    ):
+        return "'env' must be a dict of string key-value pairs"
+    return None
+
+
 def _get_record(name: str) -> tuple[dict | None, str]:
     """Get an installation record, returning (record, error_msg)."""
     from comfy_runner.config import get_installation
@@ -451,6 +463,7 @@ def create_app() -> Any:
                 "head_commit": record.get("head_commit"),
                 "python_version": record.get("python_version"),
                 "launch_args": record.get("launch_args"),
+                "env": record.get("env", {}),
                 "created_at": record.get("created_at"),
                 "deployed_pr": record.get("deployed_pr"),
                 "deployed_branch": record.get("deployed_branch"),
@@ -637,6 +650,10 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
+        env_overrides = body.get("env")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"restart {name}")
 
@@ -661,7 +678,7 @@ def create_app() -> Any:
                 except RuntimeError:
                     pass
 
-                result = start_installation(name, port_override=running_port, extra_args=extra_args, send_output=out)
+                result = start_installation(name, port_override=running_port, extra_args=extra_args, env_overrides=env_overrides, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
@@ -762,7 +779,7 @@ def create_app() -> Any:
             return _err(err, 404)
 
         body = request.get_json(silent=True) or {}
-        allowed_keys = {"launch_args", "autostart", "tunnel_provider", "tunnel_domain"}
+        allowed_keys = {"launch_args", "autostart", "tunnel_provider", "tunnel_domain", "env"}
         updated = {}
         for key in allowed_keys:
             if key in body:
@@ -772,6 +789,12 @@ def create_app() -> Any:
                 elif key == "tunnel_provider":
                     if body[key] not in ("ngrok", "tailscale", ""):
                         return _err(f"Invalid tunnel_provider: '{body[key]}'. Use ngrok, tailscale, or empty string.")
+                    record[key] = body[key]
+                    updated[key] = body[key]
+                elif key == "env":
+                    env_err = _validate_env_dict(body[key])
+                    if env_err:
+                        return _err(env_err)
                     record[key] = body[key]
                     updated[key] = body[key]
                 else:
@@ -1585,6 +1608,10 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
+        env_overrides = body.get("env")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"start {name}")
 
@@ -1606,7 +1633,7 @@ def create_app() -> Any:
                 rec = get_installation(name)
                 install_path = rec["path"] if rec else ""
 
-                result = start_installation(name, extra_args=extra_args, send_output=out)
+                result = start_installation(name, extra_args=extra_args, env_overrides=env_overrides, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
