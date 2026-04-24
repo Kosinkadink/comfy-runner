@@ -38,30 +38,40 @@ def deploy_latest(
 
     # Match the variant this install was created with
     variant_id = record.get("variant")
-    if not variant_id:
-        raise RuntimeError(
-            "No variant recorded for this installation. Cannot resolve manifest."
-        )
+    is_adhoc = variant_id == "adhoc-build"
 
-    manifest = next((m for m in manifests if m["id"] == variant_id), None)
-    if not manifest:
-        raise RuntimeError(
-            f"Variant '{variant_id}' not found in release {tag}. "
-            f"Available: {[m['id'] for m in manifests]}"
-        )
+    if is_adhoc:
+        # Ad-hoc builds don't have a matching variant in the release.
+        # All variants share the same comfyui_ref, so grab from any.
+        manifest = manifests[0] if manifests else None
+        if not manifest:
+            raise RuntimeError(f"No variant manifests found in release {tag}.")
+    else:
+        if not variant_id:
+            raise RuntimeError(
+                "No variant recorded for this installation. Cannot resolve manifest."
+            )
+        manifest = next((m for m in manifests if m["id"] == variant_id), None)
+        if not manifest:
+            raise RuntimeError(
+                f"Variant '{variant_id}' not found in release {tag}. "
+                f"Available: {[m['id'] for m in manifests]}"
+            )
 
     comfyui_ref = manifest.get("comfyui_ref")
     if not comfyui_ref:
         raise RuntimeError(f"Manifest for '{variant_id}' has no comfyui_ref.")
 
-    # Guard: refuse if Python version changed (env update required)
-    new_py = manifest.get("python_version", "")
-    current_py = record.get("python_version", "")
-    if current_py and new_py and current_py != new_py:
-        raise RuntimeError(
-            f"Latest release requires Python {new_py}, but this install "
-            f"has {current_py}. A standalone env update is needed first."
-        )
+    # Guard: refuse if Python version changed (env update required).
+    # Skip for ad-hoc builds — the user controls their Python version.
+    if not is_adhoc:
+        new_py = manifest.get("python_version", "")
+        current_py = record.get("python_version", "")
+        if current_py and new_py and current_py != new_py:
+            raise RuntimeError(
+                f"Latest release requires Python {new_py}, but this install "
+                f"has {current_py}. A standalone env update is needed first."
+            )
 
     if send_output:
         send_output(f"ComfyUI ref: {comfyui_ref}\n")
