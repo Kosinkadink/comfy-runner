@@ -381,6 +381,18 @@ def create_app() -> Any:
         except Exception as e:
             return _err(str(e))
 
+    @app.route("/startup-log", methods=["GET"])
+    def route_startup_log() -> Any:
+        log_path = Path("/tmp/comfy-runner-startup.log")
+        if not log_path.is_file():
+            return _err("No startup log found", 404)
+        lines = int(request.args.get("lines", 200))
+        content = log_path.read_text(errors="replace")
+        all_lines = content.splitlines()
+        if lines > 0:
+            all_lines = all_lines[-lines:]
+        return jsonify({"ok": True, "lines": all_lines})
+
     # ------------------------------------------------------------------
     # GET /status — aggregate status (all installations)
     # ------------------------------------------------------------------

@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# Log all output to a file for debugging
+STARTUP_LOG="/tmp/comfy-runner-startup.log"
+exec > >(tee -a "${STARTUP_LOG}") 2>&1
+
 INSTALL_DIR="/opt/comfy-runner"
 VENV_DIR="${INSTALL_DIR}/.venv"
 SERVER_HOST="0.0.0.0"
