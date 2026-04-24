@@ -1,0 +1,261 @@
+"""Tests for comfy_runner.testing.runner — test orchestration."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from comfy_runner.testing.client import ComfyTestClient, OutputFile, PromptResult
+from comfy_runner.testing.runner import (
+    SuiteRun,
+    WorkflowResult,
+    _apply_overrides,
+    run_suite,
+    run_workflow,
+)
+from comfy_runner.testing.suite import load_suite
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_suite_dir(tmp_path: Path) -> Path:
+    suite_dir = tmp_path / "suite"
+    suite_dir.mkdir()
+    (suite_dir / "suite.json").write_text(json.dumps({"name": "Test"}))
+    wf_dir = suite_dir / "workflows"
+    wf_dir.mkdir()
+    (wf_dir / "wf1.json").write_text(json.dumps({
+        "1": {"class_type": "KSampler", "inputs": {"seed": 0}},
+    }))
+    (wf_dir / "wf2.json").write_text(json.dumps({
+        "1": {"class_type": "EmptyLatentImage", "inputs": {}},
+    }))
+    return suite_dir
+
+
+def _mock_prompt_result(prompt_id: str = "p1") -> PromptResult:
+    return PromptResult(
+        prompt_id=prompt_id,
+        status="success",
+        outputs={"9": [OutputFile(node_id="9", filename="out.png", subfolder="", type="output")]},
+        execution_time=1.5,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _apply_overrides
+# ---------------------------------------------------------------------------
+
+class TestApplyOverrides:
+    def test_seed_override(self):
+        wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 20}},
+            "2": {"class_type": "Other", "inputs": {"noise_seed": 0}},
+        }
+        result = _apply_overrides(wf, {"seed": 42})
+        assert result["1"]["inputs"]["seed"] == 42
+        assert result["2"]["inputs"]["noise_seed"] == 42
+        assert result["1"]["inputs"]["steps"] == 20
+
+    def test_no_overrides(self):
+        wf = {"1": {"inputs": {"seed": 5}}}
+        result = _apply_overrides(wf, {})
+        assert result["1"]["inputs"]["seed"] == 5
+
+    def test_seed_none_skips(self):
+        wf = {"1": {"inputs": {"seed": 5}}}
+        result = _apply_overrides(wf, {"seed": None})
+        assert result["1"]["inputs"]["seed"] == 5
+
+
+# ---------------------------------------------------------------------------
+# WorkflowResult
+# ---------------------------------------------------------------------------
+
+class TestWorkflowResult:
+    def test_passed_true(self):
+        r = WorkflowResult(
+            workflow_name="test",
+            workflow_path=Path("test.json"),
+            prompt_result=_mock_prompt_result(),
+        )
+        assert r.passed is True
+
+    def test_passed_false_no_result(self):
+        r = WorkflowResult(
+            workflow_name="test",
+            workflow_path=Path("test.json"),
+            error="failed",
+        )
+        assert r.passed is False
+
+    def test_passed_false_with_error(self):
+        r = WorkflowResult(
+            workflow_name="test",
+            workflow_path=Path("test.json"),
+            prompt_result=_mock_prompt_result(),
+            error="something wrong",
+        )
+        assert r.passed is False
+
+
+# ---------------------------------------------------------------------------
+# TestRun
+# ---------------------------------------------------------------------------
+
+class TestSuiteRun:
+    def test_summary(self):
+        run = SuiteRun(
+            suite_name="Test",
+            suite_path=Path("/suite"),
+            output_dir=Path("/out"),
+            started_at=0.0,
+            finished_at=2.5,
+            results=[
+                WorkflowResult("w1", Path("w1.json"), prompt_result=_mock_prompt_result()),
+                WorkflowResult("w2", Path("w2.json"), error="boom"),
+            ],
+        )
+        assert run.total == 2
+        assert run.passed == 1
+        assert run.failed == 1
+        assert run.duration == 2.5
+
+        s = run.summary()
+        assert s["suite"] == "Test"
+        assert s["total"] == 2
+        assert s["passed"] == 1
+        assert s["failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# run_workflow
+# ---------------------------------------------------------------------------
+
+class TestRunWorkflow:
+    def test_success(self, tmp_path):
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.return_value = _mock_prompt_result()
+
+        wf_path = tmp_path / "wf.json"
+        wf_path.write_text(json.dumps({"1": {"inputs": {}}}))
+
+        out_dir = tmp_path / "output"
+        result = run_workflow(client, wf_path, out_dir)
+
+        assert result.passed is True
+        assert result.workflow_name == "wf"
+        client.run_workflow.assert_called_once()
+
+    def test_invalid_json(self, tmp_path):
+        client = MagicMock(spec=ComfyTestClient)
+        wf_path = tmp_path / "bad.json"
+        wf_path.write_text("not json")
+
+        result = run_workflow(client, wf_path, tmp_path / "output")
+        assert result.passed is False
+        assert "Failed to load workflow" in result.error
+
+    def test_runtime_error(self, tmp_path):
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.side_effect = RuntimeError("timeout")
+
+        wf_path = tmp_path / "wf.json"
+        wf_path.write_text(json.dumps({"1": {}}))
+
+        result = run_workflow(client, wf_path, tmp_path / "output")
+        assert result.passed is False
+        assert "timeout" in result.error
+
+    def test_applies_overrides(self, tmp_path):
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.return_value = _mock_prompt_result()
+
+        wf_path = tmp_path / "wf.json"
+        wf_path.write_text(json.dumps({"1": {"inputs": {"seed": 0}}}))
+
+        run_workflow(client, wf_path, tmp_path / "output", overrides={"seed": 99})
+
+        # Check the workflow passed to client had seed overridden
+        called_wf = client.run_workflow.call_args[0][0]
+        assert called_wf["1"]["inputs"]["seed"] == 99
+
+
+# ---------------------------------------------------------------------------
+# run_suite
+# ---------------------------------------------------------------------------
+
+class TestRunSuite:
+    def test_runs_all_workflows(self, tmp_path):
+        suite_dir = _make_suite_dir(tmp_path)
+        suite = load_suite(suite_dir)
+
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.return_value = _mock_prompt_result()
+
+        out_dir = tmp_path / "run_output"
+        test_run = run_suite(client, suite, out_dir)
+
+        assert test_run.total == 2
+        assert test_run.passed == 2
+        assert test_run.failed == 0
+        assert (out_dir / "summary.json").is_file()
+
+        summary = json.loads((out_dir / "summary.json").read_text())
+        assert summary["total"] == 2
+
+    def test_handles_mixed_results(self, tmp_path):
+        suite_dir = _make_suite_dir(tmp_path)
+        suite = load_suite(suite_dir)
+
+        client = MagicMock(spec=ComfyTestClient)
+        # First workflow succeeds, second fails
+        client.run_workflow.side_effect = [
+            _mock_prompt_result(),
+            RuntimeError("GPU OOM"),
+        ]
+
+        out_dir = tmp_path / "run_output"
+        test_run = run_suite(client, suite, out_dir)
+
+        assert test_run.total == 2
+        assert test_run.passed == 1
+        assert test_run.failed == 1
+
+    def test_applies_suite_overrides(self, tmp_path):
+        suite_dir = _make_suite_dir(tmp_path)
+        (suite_dir / "config.json").write_text(json.dumps({"overrides": {"seed": 42}}))
+        suite = load_suite(suite_dir)
+
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.return_value = _mock_prompt_result()
+
+        out_dir = tmp_path / "run_output"
+        run_suite(client, suite, out_dir)
+
+        # Verify seed was overridden in the first workflow call
+        first_call_wf = client.run_workflow.call_args_list[0][0][0]
+        assert first_call_wf["1"]["inputs"]["seed"] == 42
+
+    def test_marks_baseline_status(self, tmp_path):
+        suite_dir = _make_suite_dir(tmp_path)
+        bl_dir = suite_dir / "baselines" / "wf1"
+        bl_dir.mkdir(parents=True)
+        (bl_dir / "output_0.png").write_bytes(b"baseline")
+        suite = load_suite(suite_dir)
+
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.return_value = _mock_prompt_result()
+
+        out_dir = tmp_path / "run_output"
+        test_run = run_suite(client, suite, out_dir)
+
+        wf1_result = next(r for r in test_run.results if r.workflow_name == "wf1")
+        wf2_result = next(r for r in test_run.results if r.workflow_name == "wf2")
+        assert wf1_result.has_baseline is True
+        assert wf2_result.has_baseline is False
