@@ -446,20 +446,44 @@ def _validate_pod_name(name: str) -> str | None:
     return None
 
 
-def _validate_suite_path(suite: str) -> str | None:
-    """Validate a suite path from a request body.
+_SUITES_DIR = Path("test-suites")
 
-    Ensures the path resolves to an existing directory containing suite.json.
-    Returns an error message if invalid, else None.
+
+def _get_suites_dir() -> Path:
+    """Return the managed test-suites directory, creating if needed."""
+    d = _SUITES_DIR.resolve()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _resolve_suite(suite: str) -> tuple[Path, str | None]:
+    """Resolve a suite name or path to an absolute path.
+
+    If ``suite`` is a bare name (no separators), look in the managed
+    suites directory.  Otherwise treat it as a literal path.
+
+    Returns ``(resolved_path, error_message)``.  error_message is None
+    on success.
     """
+    from safe_file import is_safe_path_component
+
     if not suite:
-        return "'suite' is required"
+        return Path(), "'suite' is required"
+
+    # Bare name → managed directory
+    if is_safe_path_component(suite):
+        candidate = _get_suites_dir() / suite
+        if candidate.is_dir() and (candidate / "suite.json").is_file():
+            return candidate.resolve(), None
+        return Path(), f"Suite '{suite}' not found on server"
+
+    # Literal path (backward compat for direct local use)
     suite_path = Path(suite).resolve()
     if not suite_path.is_dir():
-        return f"Suite directory not found: {suite}"
+        return Path(), f"Suite directory not found: {suite}"
     if not (suite_path / "suite.json").is_file():
-        return f"Not a valid test suite (missing suite.json): {suite}"
-    return None
+        return Path(), f"Not a valid test suite (missing suite.json): {suite}"
+    return suite_path, None
 
 
 _DASHBOARD_HTML = """\
@@ -2675,6 +2699,194 @@ def create_app() -> Any:
             _remove_pod_lock(name)
 
     # ==================================================================
+    # Central Orchestration — Suite Management
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /suites — list available test suites
+    # ------------------------------------------------------------------
+    @app.route("/suites", methods=["GET"])
+    def route_suites_list() -> Any:
+        suites_dir = _get_suites_dir()
+        result = []
+        for d in sorted(suites_dir.iterdir()):
+            suite_json = d / "suite.json"
+            if d.is_dir() and suite_json.is_file():
+                import json as _json
+                try:
+                    meta = _json.loads(suite_json.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
+                workflows_dir = d / "workflows"
+                workflow_count = len(list(workflows_dir.glob("*.json"))) if workflows_dir.is_dir() else 0
+                runs_dir = d / "runs"
+                run_count = len(list(runs_dir.iterdir())) if runs_dir.is_dir() else 0
+                result.append({
+                    "name": d.name,
+                    "title": meta.get("name", d.name),
+                    "description": meta.get("description", ""),
+                    "required_models": meta.get("required_models", []),
+                    "workflow_count": workflow_count,
+                    "run_count": run_count,
+                })
+        return jsonify({"ok": True, "suites": result})
+
+    # ------------------------------------------------------------------
+    # GET /suites/<name> — get suite details
+    # ------------------------------------------------------------------
+    @app.route("/suites/<name>", methods=["GET"])
+    def route_suites_get(name: str) -> Any:
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(name):
+            return _err(f"Invalid suite name: '{name}'")
+
+        suite_dir = _get_suites_dir() / name
+        suite_json = suite_dir / "suite.json"
+        if not suite_dir.is_dir() or not suite_json.is_file():
+            return _err(f"Suite '{name}' not found", 404)
+
+        import json as _json
+        meta = _json.loads(suite_json.read_text(encoding="utf-8"))
+
+        config = {}
+        config_path = suite_dir / "config.json"
+        if config_path.is_file():
+            config = _json.loads(config_path.read_text(encoding="utf-8"))
+
+        workflows = []
+        workflows_dir = suite_dir / "workflows"
+        if workflows_dir.is_dir():
+            for wf in sorted(workflows_dir.glob("*.json")):
+                workflows.append(wf.name)
+
+        runs = []
+        runs_dir = suite_dir / "runs"
+        if runs_dir.is_dir():
+            for rd in sorted(runs_dir.iterdir(), reverse=True):
+                if rd.is_dir():
+                    runs.append(rd.name)
+
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "suite": meta,
+            "config": config,
+            "workflows": workflows,
+            "runs": runs,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /suites/<name> — upload/update a suite (preserves runs/)
+    # ------------------------------------------------------------------
+    @app.route("/suites/<name>", methods=["POST"])
+    def route_suites_upload(name: str) -> Any:
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(name):
+            return _err(f"Invalid suite name: '{name}'")
+
+        body = request.get_json(silent=True) or {}
+        suite_meta = body.get("suite")
+        if not suite_meta or not isinstance(suite_meta, dict):
+            return _err("'suite' is required (object with suite.json contents)")
+
+        workflows = body.get("workflows")
+        if not workflows or not isinstance(workflows, dict):
+            return _err("'workflows' is required (object mapping filename → workflow JSON)")
+
+        suite_dir = _get_suites_dir() / name
+        suite_dir.mkdir(parents=True, exist_ok=True)
+
+        import json as _json
+
+        # Write suite.json
+        (suite_dir / "suite.json").write_text(
+            _json.dumps(suite_meta, indent=2), encoding="utf-8"
+        )
+
+        # Write config.json (optional)
+        config = body.get("config")
+        if config and isinstance(config, dict):
+            (suite_dir / "config.json").write_text(
+                _json.dumps(config, indent=2), encoding="utf-8"
+            )
+
+        # Write workflows — replace all workflow files
+        wf_dir = suite_dir / "workflows"
+        if wf_dir.is_dir():
+            for old_wf in wf_dir.glob("*.json"):
+                old_wf.unlink()
+        wf_dir.mkdir(exist_ok=True)
+
+        for wf_name, wf_data in workflows.items():
+            if not is_safe_path_component(wf_name):
+                return _err(f"Invalid workflow filename: '{wf_name}'")
+            (wf_dir / wf_name).write_text(
+                _json.dumps(wf_data, indent=2), encoding="utf-8"
+            )
+
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "workflows": list(workflows.keys()),
+            "message": f"Suite '{name}' uploaded ({len(workflows)} workflow(s))",
+        })
+
+    # ------------------------------------------------------------------
+    # DELETE /suites/<name> — remove a suite (preserves runs/)
+    # ------------------------------------------------------------------
+    @app.route("/suites/<name>", methods=["DELETE"])
+    def route_suites_delete(name: str) -> Any:
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(name):
+            return _err(f"Invalid suite name: '{name}'")
+
+        suite_dir = _get_suites_dir() / name
+        if not suite_dir.is_dir():
+            return _err(f"Suite '{name}' not found", 404)
+
+        force = request.args.get("force", "").lower() in ("true", "1", "yes")
+        runs_dir = suite_dir / "runs"
+        has_runs = runs_dir.is_dir() and any(runs_dir.iterdir())
+
+        if has_runs and not force:
+            run_count = len(list(runs_dir.iterdir()))
+            return _err(
+                f"Suite '{name}' has {run_count} test run(s). "
+                f"Add ?force=true to delete the suite definition and keep runs, "
+                f"or ?force=true&include_runs=true to delete everything."
+            )
+
+        include_runs = request.args.get("include_runs", "").lower() in ("true", "1", "yes")
+
+        # Remove definition files only (preserve runs/)
+        for f in ("suite.json", "config.json"):
+            p = suite_dir / f
+            if p.is_file():
+                p.unlink()
+
+        wf_dir = suite_dir / "workflows"
+        if wf_dir.is_dir():
+            import shutil
+            shutil.rmtree(wf_dir)
+
+        if include_runs and runs_dir.is_dir():
+            import shutil
+            shutil.rmtree(runs_dir)
+
+        # Remove the directory if empty
+        remaining = list(suite_dir.iterdir())
+        if not remaining:
+            suite_dir.rmdir()
+            return jsonify({"ok": True, "name": name, "action": "deleted"})
+
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "action": "definition_removed",
+            "message": f"Suite definition removed. Runs preserved in {name}/runs/",
+        })
+
+    # ==================================================================
     # Central Orchestration — Test Execution
     # ==================================================================
 
@@ -2684,8 +2896,8 @@ def create_app() -> Any:
     @app.route("/tests/run", methods=["POST"])
     def route_tests_run() -> Any:
         body = request.get_json(silent=True) or {}
-        suite = body.get("suite", "")
-        suite_err = _validate_suite_path(suite)
+        suite_name = body.get("suite", "")
+        suite_path, suite_err = _resolve_suite(suite_name)
         if suite_err:
             return _err(suite_err)
 
@@ -2704,7 +2916,7 @@ def create_app() -> Any:
         job_id = _jobs.create(label=f"test run {target.name}")
         _register_test_run(job_id, {
             "kind": "single",
-            "suite": suite,
+            "suite": suite_name,
             "targets": [target_body],
         })
 
@@ -2712,9 +2924,9 @@ def create_app() -> Any:
             from comfy_runner.testing.suite import load_suite
             out, lines = _make_collector(job_id)
             try:
-                s = load_suite(suite)
+                s = load_suite(str(suite_path))
                 run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-                out_dir = Path(suite) / "runs" / run_id
+                out_dir = suite_path / "runs" / run_id
 
                 result = target.run(
                     suite=s,
@@ -2749,8 +2961,8 @@ def create_app() -> Any:
         from comfy_runner.testing.fleet import run_fleet
 
         body = request.get_json(silent=True) or {}
-        suite = body.get("suite", "")
-        suite_err = _validate_suite_path(suite)
+        suite_name = body.get("suite", "")
+        suite_path, suite_err = _resolve_suite(suite_name)
         if suite_err:
             return _err(suite_err)
 
@@ -2771,7 +2983,7 @@ def create_app() -> Any:
         job_id = _jobs.create(label=f"fleet test ({len(targets)} targets)")
         _register_test_run(job_id, {
             "kind": "fleet",
-            "suite": suite,
+            "suite": suite_name,
             "targets": target_bodies,
         })
 
@@ -2779,11 +2991,11 @@ def create_app() -> Any:
             out, lines = _make_collector(job_id)
             try:
                 run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-                out_dir = Path(suite) / "runs" / f"fleet-{run_id}"
+                out_dir = suite_path / "runs" / f"fleet-{run_id}"
 
                 fleet_result = run_fleet(
                     targets=targets,
-                    suite_path=suite,
+                    suite_path=str(suite_path),
                     output_dir=out_dir,
                     timeout=timeout,
                     max_workers=max_workers,
