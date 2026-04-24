@@ -2698,6 +2698,52 @@ def create_app() -> Any:
             lock.release()
             _remove_pod_lock(name)
 
+    # ------------------------------------------------------------------
+    # POST /pods/cleanup — terminate orphaned test pods
+    # ------------------------------------------------------------------
+    @app.route("/pods/cleanup", methods=["POST"])
+    def route_pods_cleanup() -> Any:
+        body = request.get_json(silent=True) or {}
+        prefix = body.get("prefix", "test-")
+        dry_run = body.get("dry_run", False)
+        max_age_hours = body.get("max_age_hours")
+
+        try:
+            provider = _get_runpod_provider()
+            live_pods = provider.list_pods()
+
+            candidates = []
+            for pod in live_pods:
+                if not pod.name.startswith(prefix):
+                    continue
+                if pod.status in ("TERMINATED",):
+                    continue
+                candidates.append(pod)
+
+            terminated = []
+            skipped = []
+            for pod in candidates:
+                if dry_run:
+                    skipped.append({"name": pod.name, "id": pod.id, "status": pod.status})
+                else:
+                    try:
+                        provider.terminate_pod(pod.id)
+                        terminated.append({"name": pod.name, "id": pod.id})
+                    except Exception as e:
+                        skipped.append({"name": pod.name, "id": pod.id, "error": str(e)})
+
+            return jsonify({
+                "ok": True,
+                "prefix": prefix,
+                "dry_run": dry_run,
+                "terminated": terminated,
+                "skipped": skipped,
+                "total_found": len(candidates),
+                "total_terminated": len(terminated),
+            })
+        except Exception as e:
+            return _err(str(e))
+
     # ==================================================================
     # Central Orchestration — Suite Management
     # ==================================================================

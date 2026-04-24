@@ -1367,6 +1367,39 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
 
+    {
+        "path": "/pods/cleanup",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Terminate orphaned test pods",
+        "description": (
+            "Find and terminate RunPod pods matching a name prefix (default: 'test-'). "
+            "Useful for cleaning up orphaned ephemeral test pods. "
+            "Use dry_run to preview without terminating."
+        ),
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "prefix": {"type": "string", "default": "test-", "description": "Pod name prefix to match"},
+                            "dry_run": {"type": "boolean", "default": False, "description": "List matching pods without terminating"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Cleanup result", {
+            "prefix": {"type": "string"},
+            "dry_run": {"type": "boolean"},
+            "total_found": {"type": "integer"},
+            "total_terminated": {"type": "integer"},
+            "terminated": {"type": "array", "items": {"type": "object"}},
+            "skipped": {"type": "array", "items": {"type": "object"}},
+        }),
+    },
+
     # ── Tests (Central Orchestration) ────────────────────────────────
     {
         "path": "/tests/run",

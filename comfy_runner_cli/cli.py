@@ -3298,6 +3298,35 @@ def _station_pods(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
 
+    elif pod_action == "cleanup":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            prefix = getattr(args, "prefix", "test-")
+            dry_run = getattr(args, "dry_run", False)
+            body = {"prefix": prefix, "dry_run": dry_run}
+            data = runner._request("POST", "/pods/cleanup", json=body)
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                found = data.get("total_found", 0)
+                terminated = data.get("total_terminated", 0)
+                if dry_run:
+                    console.print(f"[yellow]Dry run:[/yellow] found {found} pod(s) matching prefix '{prefix}'")
+                    for p in data.get("skipped", []):
+                        console.print(f"  {p['name']} ({p.get('status', '?')})")
+                elif terminated > 0:
+                    console.print(f"[green]✓ Terminated {terminated} pod(s)[/green] matching prefix '{prefix}'")
+                    for p in data.get("terminated", []):
+                        console.print(f"  {p['name']}")
+                else:
+                    console.print(f"[dim]No pods found matching prefix '{prefix}'[/dim]")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     else:
         args._parser_station_pods.print_help()
 
@@ -4179,6 +4208,10 @@ def main(argv: list[str] | None = None) -> None:
 
     p_st_pod_terminate = st_pods_sub.add_parser("terminate", help="Terminate a pod permanently")
     p_st_pod_terminate.add_argument("pod_name", help="Pod name")
+
+    p_st_pod_cleanup = st_pods_sub.add_parser("cleanup", help="Terminate orphaned test pods")
+    p_st_pod_cleanup.add_argument("--prefix", default="test-", help="Pod name prefix to match (default: test-)")
+    p_st_pod_cleanup.add_argument("--dry-run", action="store_true", help="List matching pods without terminating")
 
     p_st_pods.set_defaults(_parser_station_pods=p_st_pods)
 
