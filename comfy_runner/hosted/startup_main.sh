@@ -42,30 +42,34 @@ fi
 
 # ── 2. Tailscale auto-join ────────────────────────────────────────────
 
+SERVER_TAILSCALE=""
 if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
     log "Installing Tailscale..."
-    curl -fsSL https://tailscale.com/install.sh | sh
+    if curl -fsSL https://tailscale.com/install.sh | sh; then
+        TAILSCALE_STATE="/var/lib/tailscale"
+        if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+            TAILSCALE_STATE="/workspace/.tailscale"
+            mkdir -p "${TAILSCALE_STATE}"
+        fi
+        mkdir -p /var/run/tailscale
+        tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock &
+        # Wait for tailscaled socket to become available (up to 10s)
+        for i in $(seq 1 20); do
+            [ -S /var/run/tailscale/tailscaled.sock ] && break
+            sleep 0.5
+        done
 
-    TAILSCALE_STATE="/var/lib/tailscale"
-    if [ -d "/workspace" ] && [ -w "/workspace" ]; then
-        TAILSCALE_STATE="/workspace/.tailscale"
-        mkdir -p "${TAILSCALE_STATE}"
+        TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
+        TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
+        if tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}"; then
+            log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+            SERVER_TAILSCALE="--tailscale"
+        else
+            log "WARNING: tailscale up failed (exit $?) — continuing without Tailscale"
+        fi
+    else
+        log "WARNING: Tailscale install failed — continuing without Tailscale"
     fi
-    mkdir -p /var/run/tailscale
-    tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock &
-    # Wait for tailscaled socket to become available (up to 10s)
-    for i in $(seq 1 20); do
-        [ -S /var/run/tailscale/tailscaled.sock ] && break
-        sleep 0.5
-    done
-
-    TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
-    TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
-    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}"
-    log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
-    SERVER_TAILSCALE="--tailscale"
-else
-    SERVER_TAILSCALE=""
 fi
 
 # ── 3. Create venv and install requirements ──────────────────────────
