@@ -182,6 +182,7 @@ _ROUTES: list[dict[str, Any]] = [
             "system_info": {
                 "type": "object",
                 "properties": {
+                    "comfy_runner_commit": {"type": "string", "nullable": True, "description": "Short git commit hash of the comfy-runner server"},
                     "platform": {"type": "string"},
                     "arch": {"type": "string"},
                     "os_distro": {"type": "string"},
