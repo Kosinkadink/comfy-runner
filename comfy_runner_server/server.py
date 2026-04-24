@@ -2411,7 +2411,10 @@ def create_app() -> Any:
                 # Check if pod already exists
                 rec = get_pod_record("runpod", name)
                 if rec:
-                    pod = provider.get_pod(rec["id"])
+                    try:
+                        pod = provider.get_pod(rec["id"])
+                    except Exception:
+                        pod = None  # Pod gone from RunPod — stale record
                     if pod and pod.status not in ("TERMINATED", "EXITED"):
                         if pod.status != "RUNNING":
                             out(f"Pod '{name}' exists but is {pod.status}, starting...\n")
@@ -2689,7 +2692,10 @@ def create_app() -> Any:
             return _err(f"Pod '{name}' is busy")
         try:
             provider = _get_runpod_provider()
-            provider.terminate_pod(rec["id"])
+            try:
+                provider.terminate_pod(rec["id"])
+            except Exception:
+                pass  # Pod may already be gone on RunPod
             remove_pod_record("runpod", name)
             return jsonify({"ok": True, "name": name, "action": "terminated"})
         except Exception as e:
