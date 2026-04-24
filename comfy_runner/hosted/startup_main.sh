@@ -40,7 +40,29 @@ if ! command -v 7z &>/dev/null; then
     apt-get update -qq && apt-get install -y -qq p7zip-full && rm -rf /var/lib/apt/lists/*
 fi
 
-# ── 2. Create venv and install requirements ──────────────────────────
+# ── 2. Tailscale auto-join ────────────────────────────────────────────
+
+if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
+    log "Installing Tailscale..."
+    curl -fsSL https://tailscale.com/install.sh | sh
+
+    TAILSCALE_STATE="/var/lib/tailscale"
+    if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+        TAILSCALE_STATE="/workspace/.tailscale"
+        mkdir -p "${TAILSCALE_STATE}"
+    fi
+    tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock &
+    sleep 2
+
+    TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
+    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}"
+    log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+    SERVER_TAILSCALE="--tailscale"
+else
+    SERVER_TAILSCALE=""
+fi
+
+# ── 3. Create venv and install requirements ──────────────────────────
 
 cd "${INSTALL_DIR}"
 
@@ -53,9 +75,10 @@ log "Installing requirements..."
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
 "${VENV_DIR}/bin/pip" install --quiet -r requirements.txt
 
-# ── 3. Start comfy-runner server ─────────────────────────────────────
+# ── 4. Start comfy-runner server ─────────────────────────────────────
 
 log "Starting comfy-runner server on ${SERVER_HOST}:${SERVER_PORT}..."
 exec "${VENV_DIR}/bin/python" -m comfy_runner_server \
     --host "${SERVER_HOST}" \
-    --port "${SERVER_PORT}"
+    --port "${SERVER_PORT}" \
+    ${SERVER_TAILSCALE}

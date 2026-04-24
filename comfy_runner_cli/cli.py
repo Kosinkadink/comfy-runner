@@ -2038,17 +2038,23 @@ def _hosted_pod(args: argparse.Namespace) -> None:
 
             server_url = f"https://{pod.id}-9189.proxy.runpod.net"
             comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+            ts_url = provider.get_pod_tailscale_url(args.name)
             if args.json:
-                print(json.dumps({"ok": True, "pod": {
+                pod_info: dict = {
                     "id": pod.id, "name": pod.name, "status": pod.status,
                     "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
                     "cost_per_hr": pod.cost_per_hr, "image": pod.image,
                     "server_url": server_url, "comfy_url": comfy_url,
-                }}, indent=2))
+                }
+                if isinstance(ts_url, str):
+                    pod_info["tailscale_url"] = ts_url
+                print(json.dumps({"ok": True, "pod": pod_info}, indent=2))
             else:
-                console.print(f"✓ Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
-                console.print(f"  Server: {server_url}")
-                console.print(f"  ComfyUI: {comfy_url}")
+                console.print(f"Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+                console.print(f"  Server:    {server_url}")
+                console.print(f"  ComfyUI:   {comfy_url}")
+                if isinstance(ts_url, str):
+                    console.print(f"  Tailscale: {ts_url}")
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2271,24 +2277,27 @@ def _hosted_init(args: argparse.Namespace) -> None:
 
         server_url = f"https://{pod.id}-9189.proxy.runpod.net"
         comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+        ts_url = provider.get_pod_tailscale_url(args.name)
 
         if args.json:
-            result: dict = {
-                "ok": True,
-                "pod": {
-                    "id": pod.id, "name": pod.name, "status": pod.status,
-                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
-                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
-                    "server_url": server_url, "comfy_url": comfy_url,
-                },
+            pod_info: dict = {
+                "id": pod.id, "name": pod.name, "status": pod.status,
+                "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+                "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+                "server_url": server_url, "comfy_url": comfy_url,
             }
+            if isinstance(ts_url, str):
+                pod_info["tailscale_url"] = ts_url
+            result: dict = {"ok": True, "pod": pod_info}
             if volume_id:
                 result["volume"] = {"id": volume_id, "name": volume_name}
             print(json.dumps(result, indent=2))
         else:
-            console.print(f"✓ Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
-            console.print(f"  Server:  {server_url}")
-            console.print(f"  ComfyUI: {comfy_url}")
+            console.print(f"Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+            console.print(f"  Server:    {server_url}")
+            console.print(f"  ComfyUI:   {comfy_url}")
+            if isinstance(ts_url, str):
+                console.print(f"  Tailscale: {ts_url}")
             console.print()
             console.print("[dim]The pod is booting comfy-runner server. Once ready, use the server URL[/dim]")
             console.print("[dim]to deploy, start ComfyUI, etc. via the API.[/dim]")
@@ -2302,7 +2311,10 @@ def _hosted_init(args: argparse.Namespace) -> None:
 
 
 def _resolve_server_url(pod_name: str) -> str:
-    """Resolve a pod name to its comfy-runner server URL."""
+    """Resolve a pod name to its comfy-runner server URL.
+
+    Prefers Tailscale FQDN when configured, falls back to RunPod proxy.
+    """
     from comfy_runner.hosted.config import get_pod_record
     rec = get_pod_record("runpod", pod_name)
     if not rec:
@@ -2310,6 +2322,15 @@ def _resolve_server_url(pod_name: str) -> str:
             f"No pod record for '{pod_name}'. "
             f"Create one with 'hosted init' or 'hosted pod create'."
         )
+    # Prefer Tailscale URL when configured
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+    try:
+        provider = RunPodProvider()
+        ts_url = provider.get_pod_tailscale_url(pod_name)
+        if isinstance(ts_url, str):
+            return ts_url
+    except RuntimeError:
+        pass
     return f"https://{rec['id']}-9189.proxy.runpod.net"
 
 
