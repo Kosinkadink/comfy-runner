@@ -118,6 +118,14 @@ def get_runpod_api_key() -> str:
     return get_provider_config("runpod").get("api_key", "")
 
 
+def get_tailscale_auth_key() -> str:
+    """Get Tailscale auth key from env var ``TAILSCALE_AUTH_KEY``, then config."""
+    token = os.environ.get("TAILSCALE_AUTH_KEY", "")
+    if token:
+        return token
+    return get_provider_config("runpod").get("tailscale_auth_key", "")
+
+
 # ---------------------------------------------------------------------------
 # Pod registry — track created pods by name
 # ---------------------------------------------------------------------------

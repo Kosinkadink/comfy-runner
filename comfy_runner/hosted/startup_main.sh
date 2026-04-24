@@ -60,7 +60,8 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
     done
 
     TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
-    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}"
+    TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
+    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}"
     log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
     SERVER_TAILSCALE="--tailscale"
 else
