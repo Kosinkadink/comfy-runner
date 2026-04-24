@@ -381,6 +381,18 @@ def create_app() -> Any:
         except Exception as e:
             return _err(str(e))
 
+    @app.route("/startup-log", methods=["GET"])
+    def route_startup_log() -> Any:
+        log_path = Path("/tmp/comfy-runner-startup.log")
+        if not log_path.is_file():
+            return _err("No startup log found", 404)
+        lines = int(request.args.get("lines", 200))
+        content = log_path.read_text(errors="replace")
+        all_lines = content.splitlines()
+        if lines > 0:
+            all_lines = all_lines[-lines:]
+        return jsonify({"ok": True, "lines": all_lines})
+
     # ------------------------------------------------------------------
     # GET /status — aggregate status (all installations)
     # ------------------------------------------------------------------
@@ -1844,6 +1856,156 @@ def create_app() -> Any:
     @app.route("/stop", methods=["POST"])
     def route_stop_default() -> Any:
         return route_stop(_default_name())
+
+    # ------------------------------------------------------------------
+    # POST /test/run — run test suite (async)
+    # ------------------------------------------------------------------
+    @app.route("/test/run", methods=["POST"])
+    def route_test_run() -> Any:
+        from comfy_runner.installations import show_list
+
+        body = request.get_json(silent=True) or {}
+        suite_path = body.get("suite")
+        if not suite_path:
+            return _err("'suite' is required", 400)
+
+        name = body.get("name")
+        if not name:
+            installs = show_list()
+            if not installs:
+                return _err("No installations available", 400)
+            name = installs[0]["name"]
+
+        timeout = body.get("timeout", 600)
+        http_timeout = body.get("http_timeout", 30)
+        formats = body.get("formats", "json,html,markdown")
+
+        if not isinstance(timeout, int) or timeout <= 0:
+            return _err("'timeout' must be a positive integer", 400)
+        if not isinstance(http_timeout, int) or http_timeout <= 0:
+            return _err("'http_timeout' must be a positive integer", 400)
+        if not isinstance(formats, str) or not formats.strip():
+            return _err("'formats' must be a non-empty string", 400)
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        from comfy_runner.process import get_status
+        status = get_status(name)
+        if not status.get("running"):
+            return _err(f"Installation '{name}' is not running", 503)
+
+        suite_basename = Path(suite_path).name
+        job_id = _jobs.create(label=f"test run {suite_basename} on {name}")
+
+        def _run() -> None:
+            out, lines = _make_collector(job_id)
+            try:
+                from comfy_runner.testing.client import ComfyTestClient
+                from comfy_runner.testing.runner import run_suite
+                from comfy_runner.testing.suite import load_suite
+                from comfy_runner.testing.report import build_report, write_report
+
+                try:
+                    suite = load_suite(suite_path)
+                except ValueError as e:
+                    _jobs.fail(job_id, str(e), lines)
+                    return
+
+                # Re-check status inside the thread to get current port
+                cur_status = get_status(name)
+                if not cur_status.get("running"):
+                    _jobs.fail(job_id, f"Installation '{name}' stopped before test could start", lines)
+                    return
+                port = cur_status["port"]
+
+                comfy_url = f"http://127.0.0.1:{port}"
+                client = ComfyTestClient(comfy_url, timeout=http_timeout)
+
+                from datetime import datetime, timezone
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                out_dir = Path(suite_path) / "runs" / run_id
+
+                suite_run = run_suite(client, suite, out_dir, timeout=timeout, send_output=out)
+                report = build_report(suite_run, target_info={"name": name, "url": comfy_url})
+
+                formats_list = [f.strip() for f in formats.split(",")]
+                written = write_report(report, out_dir, formats=formats_list)
+
+                result = {
+                    "run_id": run_id,
+                    "suite_name": suite.name,
+                    "output_dir": str(out_dir),
+                    "total": report.total,
+                    "passed": report.passed,
+                    "failed": report.failed,
+                    "duration": report.duration,
+                    "report_files": {fmt: str(p) for fmt, p in written.items()},
+                    "report": report.to_dict(),
+                }
+                _jobs.finish(job_id, result, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # GET /test/results/<run_id> — retrieve test run results
+    # ------------------------------------------------------------------
+    @app.route("/test/results/<run_id>", methods=["GET"])
+    def route_test_results(run_id: str) -> Any:
+        from safe_file import is_safe_path_component
+
+        suite = request.args.get("suite")
+        if not suite:
+            return _err("'suite' query parameter is required", 400)
+
+        if not is_safe_path_component(run_id):
+            return _err("Invalid run_id", 400)
+
+        suite_path = Path(suite).resolve()
+        run_dir = suite_path / "runs" / run_id
+        if not run_dir.resolve().is_relative_to(suite_path):
+            return _err("Invalid run_id", 400)
+        if not run_dir.is_dir():
+            return _err(f"Run '{run_id}' not found", 404)
+
+        fmt = request.args.get("format")
+        if fmt == "json":
+            import json as _json
+            report_file = run_dir / "report.json"
+            if not report_file.is_file():
+                return _err("report.json not found in run directory", 404)
+            data = _json.loads(report_file.read_text(encoding="utf-8"))
+            return jsonify({"ok": True, "run_id": run_id, "report": data})
+
+        files = [
+            {"name": f.name, "size": f.stat().st_size}
+            for f in sorted(run_dir.iterdir()) if f.is_file()
+        ]
+        return jsonify({"ok": True, "run_id": run_id, "output_dir": str(run_dir), "files": files})
+
+    # ------------------------------------------------------------------
+    # GET /test/suites — list available test suites
+    # ------------------------------------------------------------------
+    @app.route("/test/suites", methods=["GET"])
+    def route_test_suites() -> Any:
+        from comfy_runner.testing.suite import discover_suites
+
+        search_dir = Path(request.args.get("dir", "."))
+        suites = discover_suites(search_dir)
+        return jsonify({"ok": True, "suites": [
+            {
+                "name": s.name,
+                "path": str(s.path),
+                "description": s.description,
+                "workflows": len(s.workflows),
+                "required_models": s.required_models,
+            }
+            for s in suites
+        ]})
 
     # ------------------------------------------------------------------
     # POST /self-update — git pull and restart the server process

@@ -1,10 +1,14 @@
-"""Allow running as `python -m comfy_runner_server`."""
-import argparse
-from comfy_runner_server.server import run_server
+"""Allow running as `python -m comfy_runner_server`.
 
-parser = argparse.ArgumentParser(prog="comfy-runner-server")
-parser.add_argument("--listen", "--host", default="127.0.0.1",
-                    help="Bind address (default: 127.0.0.1)")
-parser.add_argument("--port", "-p", type=int, default=9189)
-args = parser.parse_args()
-run_server(host=args.listen, port=args.port)
+Delegates to the CLI's ``server`` subcommand so that argument parsing,
+tailscale setup, shutdown handlers, and all other server logic is
+defined in exactly one place.
+"""
+import sys
+
+from comfy_runner_cli.cli import main
+
+# Forward all args to the CLI's "server" subcommand.
+# e.g. `python -m comfy_runner_server --listen 0.0.0.0 --tailscale`
+#   → `comfy-runner server --listen 0.0.0.0 --tailscale`
+main(["server"] + sys.argv[1:])

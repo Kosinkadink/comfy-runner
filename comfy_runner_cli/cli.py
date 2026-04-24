@@ -7,6 +7,13 @@ import json
 import sys
 from pathlib import Path
 
+# Ensure UTF-8 output on Windows to prevent encoding errors with Unicode
+# characters (Rich markup symbols, emoji, etc.) on legacy codepages like cp1252.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+
 from rich.console import Console
 from rich.table import Table
 
@@ -1762,6 +1769,459 @@ def cmd_workflow_models(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test commands
+# ---------------------------------------------------------------------------
+
+def cmd_test(args: argparse.Namespace) -> None:
+    """Dispatch test subcommands."""
+    action = getattr(args, "test_action", None)
+
+    if action == "run":
+        _test_run(args)
+    elif action == "list":
+        _test_list(args)
+    elif action == "baseline":
+        _test_baseline(args)
+    elif action == "report":
+        _test_report(args)
+    elif action == "fleet":
+        _test_fleet(args)
+    else:
+        args._parser_test.print_help()
+
+
+def _test_run(args: argparse.Namespace) -> None:
+    """Run a test suite against a ComfyUI instance."""
+    # RunPod one-shot mode
+    if getattr(args, "runpod", False):
+        if args.target:
+            msg = "Cannot use --target with --runpod"
+            if args.json:
+                print(json.dumps({"ok": False, "error": msg}, indent=2))
+            else:
+                console.print(f"[red]Error: {msg}[/red]")
+            sys.exit(1)
+        return _test_run_runpod(args)
+
+    if not args.target:
+        if args.json:
+            print(json.dumps({"ok": False, "error": "--target is required (or use --runpod)"}, indent=2))
+        else:
+            console.print("[red]Error: --target is required (or use --runpod)[/red]")
+        sys.exit(1)
+
+    from comfy_runner.testing.client import ComfyTestClient
+    from comfy_runner.testing.report import build_report, render_console, write_report
+    from comfy_runner.testing.runner import run_suite
+    from comfy_runner.testing.suite import load_suite
+
+    try:
+        suite = load_suite(args.suite)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    target_url = args.target
+    # If target looks like a pod name (no ://), resolve it
+    if "://" not in target_url:
+        try:
+            target_url = _resolve_server_url(target_url)
+        except RuntimeError:
+            pass
+        # Assume it's a direct ComfyUI URL if resolution fails
+        if "://" not in target_url:
+            target_url = f"http://{target_url}"
+
+    client = ComfyTestClient(target_url, timeout=args.http_timeout)
+    out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / _run_id()
+    send_output = None if args.json else (lambda t: console.print(t, end=""))
+
+    try:
+        suite_run = run_suite(
+            client, suite, out_dir,
+            timeout=args.timeout,
+            send_output=send_output,
+        )
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    target_info = {"name": args.target, "url": target_url}
+    report = build_report(suite_run, target_info=target_info)
+
+    if args.json:
+        from comfy_runner.testing.report import render_json
+        print(render_json(report))
+    else:
+        console.print()
+        console.print(render_console(report))
+        formats = [f.strip() for f in args.format.split(",")]
+        written = write_report(report, out_dir, formats=formats)
+        for fmt, path in written.items():
+            console.print(f"  [dim]{fmt}: {path}[/dim]")
+
+
+def _test_run_runpod(args: argparse.Namespace) -> None:
+    """Run tests on an ephemeral RunPod pod (provision → deploy → test → teardown)."""
+    from comfy_runner.testing.runpod import RunPodTestConfig, run_on_runpod
+
+    config = RunPodTestConfig(
+        suite_path=args.suite,
+        gpu_type=getattr(args, "gpu", None),
+        image=getattr(args, "image", None),
+        volume_id=getattr(args, "volume_id", None),
+        pr=getattr(args, "pr", None),
+        branch=getattr(args, "branch", None),
+        commit=getattr(args, "commit", None),
+        pod_name=getattr(args, "pod_name", None),
+        timeout=args.timeout,
+        http_timeout=args.http_timeout,
+        formats=args.format,
+        terminate=not getattr(args, "no_terminate", False),
+        install_name=getattr(args, "install_name", None) or "main",
+    )
+
+    send_output = None if args.json else (lambda t: console.print(t, end=""))
+
+    try:
+        result = run_on_runpod(config, send_output=send_output)
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        output: dict[str, object] = {
+            "ok": result.error is None,
+            "pod_id": result.pod_id,
+            "pod_name": result.pod_name,
+            "server_url": result.server_url,
+            "terminated": result.terminated,
+        }
+        if result.error:
+            output["error"] = result.error
+        if result.deploy_result:
+            output["deploy"] = result.deploy_result
+        if result.test_result:
+            output["test"] = result.test_result
+        print(json.dumps(output, indent=2))
+    else:
+        if result.error:
+            console.print(f"\n[red]Error: {result.error}[/red]")
+        elif result.test_result:
+            tr = result.test_result
+            total = tr.get("total", 0)
+            passed = tr.get("passed", 0)
+            failed = tr.get("failed", 0)
+            console.print(f"\n[bold]Results:[/bold] {passed}/{total} passed", end="")
+            if failed:
+                console.print(f", [red]{failed} failed[/red]")
+            else:
+                console.print()
+            if tr.get("output_dir"):
+                console.print(f"  Output: {tr['output_dir']}")
+        if result.terminated:
+            console.print(f"  [dim]Pod '{result.pod_name}' terminated[/dim]")
+
+    if result.error:
+        sys.exit(1)
+
+
+def _test_list(args: argparse.Namespace) -> None:
+    """List available test suites."""
+    from comfy_runner.testing.suite import discover_suites
+
+    search_dir = Path(args.dir) if args.dir else Path(".")
+    suites = discover_suites(search_dir)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "suites": [
+                {
+                    "name": s.name,
+                    "path": str(s.path),
+                    "description": s.description,
+                    "workflows": len(s.workflows),
+                    "required_models": s.required_models,
+                }
+                for s in suites
+            ],
+        }, indent=2))
+    else:
+        if not suites:
+            console.print("[dim]No test suites found.[/dim]")
+            return
+        table = Table(title="Test Suites")
+        table.add_column("Name", style="cyan")
+        table.add_column("Workflows", justify="right")
+        table.add_column("Path", style="dim")
+        table.add_column("Description")
+        for s in suites:
+            table.add_row(s.name, str(len(s.workflows)), str(s.path), s.description)
+        console.print(table)
+
+
+def _test_baseline(args: argparse.Namespace) -> None:
+    """Approve test outputs as new baselines."""
+    import shutil
+
+    from comfy_runner.testing.suite import load_suite
+
+    try:
+        suite = load_suite(args.suite)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        msg = f"Run directory not found: {run_dir}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    # Determine which workflows to approve
+    if args.approve_all:
+        workflow_names = [wf.stem for wf in suite.workflows]
+    elif args.workflow:
+        # Sanitize to prevent path traversal from user input
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(args.workflow):
+            msg = f"Invalid workflow name: {args.workflow!r}"
+            if args.json:
+                print(json.dumps({"ok": False, "error": msg}, indent=2))
+            else:
+                console.print(f"[red]{msg}[/red]")
+            sys.exit(1)
+        workflow_names = [args.workflow]
+    else:
+        msg = "Specify --workflow <name> or --approve-all"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    baselines_dir = suite.baselines_dir
+    approved: list[str] = []
+    skipped: list[str] = []
+    collisions: list[str] = []
+
+    for wf_name in workflow_names:
+        wf_run_dir = run_dir / wf_name
+        if not wf_run_dir.is_dir():
+            skipped.append(wf_name)
+            continue
+
+        # Collect all output files from subdirectories (node_id dirs)
+        output_files = [f for f in wf_run_dir.rglob("*") if f.is_file()]
+        if not output_files:
+            skipped.append(wf_name)
+            continue
+
+        bl_dir = baselines_dir / wf_name
+        bl_dir.mkdir(parents=True, exist_ok=True)
+
+        seen_names: set[str] = set()
+        for src in output_files:
+            safe_name = src.name
+            if safe_name in seen_names:
+                collisions.append(f"{wf_name}/{safe_name}")
+            seen_names.add(safe_name)
+            dest = bl_dir / safe_name
+            shutil.copy2(str(src), str(dest))
+
+        approved.append(wf_name)
+
+    if args.json:
+        result: dict[str, object] = {
+            "ok": True,
+            "approved": approved,
+            "skipped": skipped,
+        }
+        if collisions:
+            result["collisions"] = collisions
+        print(json.dumps(result, indent=2))
+    else:
+        for name in approved:
+            console.print(f"  [green]✓[/green] {name}")
+        for name in skipped:
+            console.print(f"  [dim]- {name} (no outputs)[/dim]")
+        for c in collisions:
+            console.print(f"  [yellow]⚠ collision: {c} (last copy wins)[/yellow]")
+        if approved:
+            console.print(f"\n[green]Approved {len(approved)} baseline(s)[/green]")
+        else:
+            console.print("[yellow]No baselines approved[/yellow]")
+
+
+def _test_report(args: argparse.Namespace) -> None:
+    """Regenerate reports from a previous run's summary.json."""
+    from comfy_runner.testing.report import (
+        SuiteReport,
+        write_report,
+    )
+
+    run_dir = Path(args.run_dir)
+    summary_path = run_dir / "summary.json"
+    report_path = run_dir / "report.json"
+
+    # Try report.json first (richer), fall back to summary.json
+    source = report_path if report_path.is_file() else summary_path
+    if not source.is_file():
+        msg = f"No summary.json or report.json in {run_dir}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    try:
+        with open(source, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        msg = f"Failed to read {source}: {e}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    # Build a SuiteReport from the JSON data
+    try:
+        if "suite_name" in data:
+            # It's a full report.json
+            report = SuiteReport(**{
+                k: data[k] for k in ("suite_name", "timestamp", "duration",
+                                      "total", "passed", "failed")
+            })
+        else:
+            # It's a summary.json (simpler)
+            from datetime import datetime, timezone
+            report = SuiteReport(
+                suite_name=data.get("suite", "unknown"),
+                timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                duration=data.get("duration", 0),
+                total=data.get("total", 0),
+                passed=data.get("passed", 0),
+                failed=data.get("failed", 0),
+            )
+    except (KeyError, TypeError) as e:
+        msg = f"Malformed report data in {source}: {e}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    formats = [f.strip() for f in args.format.split(",")]
+    written = write_report(report, run_dir, formats=formats)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "files": {k: str(v) for k, v in written.items()},
+        }, indent=2))
+    else:
+        for fmt, path in written.items():
+            console.print(f"  [green]✓[/green] {fmt}: {path}")
+
+
+def _run_id() -> str:
+    """Generate a timestamped run ID."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _test_fleet(args: argparse.Namespace) -> None:
+    """Run a test suite across multiple targets in parallel."""
+    from comfy_runner.testing.fleet import (
+        parse_target_spec,
+        render_fleet_console,
+        run_fleet,
+    )
+
+    # Parse target specs
+    target_specs: list[str] = args.target
+    if not target_specs:
+        msg = "At least one --target is required"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]Error: {msg}[/red]")
+        sys.exit(1)
+
+    targets = []
+    for spec in target_specs:
+        try:
+            target = parse_target_spec(spec)
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+        # Apply shared deploy options to ephemeral targets
+        from comfy_runner.testing.fleet import EphemeralTarget
+        if isinstance(target, EphemeralTarget):
+            if getattr(args, "pr", None) is not None:
+                target._pr = args.pr
+            elif getattr(args, "branch", None):
+                target._branch = args.branch
+            elif getattr(args, "commit", None):
+                target._commit = args.commit
+
+        targets.append(target)
+
+    out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / f"fleet-{_run_id()}"
+    send_output = None if args.json else (lambda t: console.print(t, end=""))
+
+    try:
+        fleet_result = run_fleet(
+            targets=targets,
+            suite_path=args.suite,
+            output_dir=out_dir,
+            timeout=args.timeout,
+            max_workers=getattr(args, "max_workers", None),
+            send_output=send_output,
+            formats=args.format,
+        )
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        output = {"ok": fleet_result.targets_failed == 0}
+        output.update(fleet_result.to_dict())
+        print(json.dumps(output, indent=2))
+    else:
+        console.print()
+        console.print(render_fleet_console(fleet_result))
+        console.print(f"\n  [dim]Output: {out_dir}[/dim]")
+
+    if fleet_result.targets_failed > 0:
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Hosted commands
 # ---------------------------------------------------------------------------
 
@@ -1984,6 +2444,19 @@ def _resolve_pod_id(raw: str) -> str:
     return raw
 
 
+def _build_pod_info(pod: Any, server_url: str, comfy_url: str, ts_url: Any) -> dict:
+    """Build a JSON-serializable pod info dict (shared by init and pod create)."""
+    info: dict = {
+        "id": pod.id, "name": pod.name, "status": pod.status,
+        "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+        "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+        "server_url": server_url, "comfy_url": comfy_url,
+    }
+    if isinstance(ts_url, str):
+        info["tailscale_url"] = ts_url
+    return info
+
+
 def _hosted_pod(args: argparse.Namespace) -> None:
     """Handle hosted pod create/list/show/start/stop/terminate/url."""
     from comfy_runner.hosted.runpod_provider import RunPodProvider
@@ -2038,17 +2511,16 @@ def _hosted_pod(args: argparse.Namespace) -> None:
 
             server_url = f"https://{pod.id}-9189.proxy.runpod.net"
             comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+            ts_url = provider.get_pod_tailscale_url(args.name)
+            pod_info = _build_pod_info(pod, server_url, comfy_url, ts_url)
             if args.json:
-                print(json.dumps({"ok": True, "pod": {
-                    "id": pod.id, "name": pod.name, "status": pod.status,
-                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
-                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
-                    "server_url": server_url, "comfy_url": comfy_url,
-                }}, indent=2))
+                print(json.dumps({"ok": True, "pod": pod_info}, indent=2))
             else:
-                console.print(f"✓ Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
-                console.print(f"  Server: {server_url}")
-                console.print(f"  ComfyUI: {comfy_url}")
+                console.print(f"Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+                console.print(f"  Server:    {server_url}")
+                console.print(f"  ComfyUI:   {comfy_url}")
+                if "tailscale_url" in pod_info:
+                    console.print(f"  Tailscale: {pod_info['tailscale_url']}")
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2271,24 +2743,20 @@ def _hosted_init(args: argparse.Namespace) -> None:
 
         server_url = f"https://{pod.id}-9189.proxy.runpod.net"
         comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
+        ts_url = provider.get_pod_tailscale_url(args.name)
+        pod_info = _build_pod_info(pod, server_url, comfy_url, ts_url)
 
         if args.json:
-            result: dict = {
-                "ok": True,
-                "pod": {
-                    "id": pod.id, "name": pod.name, "status": pod.status,
-                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
-                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
-                    "server_url": server_url, "comfy_url": comfy_url,
-                },
-            }
+            result: dict = {"ok": True, "pod": pod_info}
             if volume_id:
                 result["volume"] = {"id": volume_id, "name": volume_name}
             print(json.dumps(result, indent=2))
         else:
-            console.print(f"✓ Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
-            console.print(f"  Server:  {server_url}")
-            console.print(f"  ComfyUI: {comfy_url}")
+            console.print(f"Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
+            console.print(f"  Server:    {server_url}")
+            console.print(f"  ComfyUI:   {comfy_url}")
+            if "tailscale_url" in pod_info:
+                console.print(f"  Tailscale: {pod_info['tailscale_url']}")
             console.print()
             console.print("[dim]The pod is booting comfy-runner server. Once ready, use the server URL[/dim]")
             console.print("[dim]to deploy, start ComfyUI, etc. via the API.[/dim]")
@@ -2302,7 +2770,10 @@ def _hosted_init(args: argparse.Namespace) -> None:
 
 
 def _resolve_server_url(pod_name: str) -> str:
-    """Resolve a pod name to its comfy-runner server URL."""
+    """Resolve a pod name to its comfy-runner server URL.
+
+    Prefers Tailscale FQDN when configured, falls back to RunPod proxy.
+    """
     from comfy_runner.hosted.config import get_pod_record
     rec = get_pod_record("runpod", pod_name)
     if not rec:
@@ -2310,6 +2781,15 @@ def _resolve_server_url(pod_name: str) -> str:
             f"No pod record for '{pod_name}'. "
             f"Create one with 'hosted init' or 'hosted pod create'."
         )
+    # Prefer Tailscale URL when configured
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+    try:
+        provider = RunPodProvider()
+        ts_url = provider.get_pod_tailscale_url(pod_name)
+        if isinstance(ts_url, str):
+            return ts_url
+    except RuntimeError:
+        pass
     return f"https://{rec['id']}-9189.proxy.runpod.net"
 
 
@@ -2786,6 +3266,78 @@ def main(argv: list[str] | None = None) -> None:
     p_wfm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_wfm.add_argument("--dry-run", action="store_true", help="List models without downloading")
     p_wfm.set_defaults(func=cmd_workflow_models)
+
+    # test
+    p_test = sub.add_parser("test", help="Run regression tests against ComfyUI")
+    test_sub = p_test.add_subparsers(dest="test_action")
+
+    # test run
+    p_test_run = test_sub.add_parser("run", help="Run a test suite")
+    p_test_run.add_argument("suite", help="Path to test suite directory")
+    p_test_run.add_argument("--target", "-t",
+                            help="ComfyUI target (URL, host:port, or pod name; required unless --runpod)")
+    p_test_run.add_argument("--output", "-o", help="Output directory (default: suite/runs/<timestamp>)")
+    p_test_run.add_argument("--timeout", type=int, default=600,
+                            help="Per-workflow timeout in seconds (default: 600)")
+    p_test_run.add_argument("--http-timeout", type=int, default=30,
+                            help="HTTP request timeout in seconds (default: 30)")
+    p_test_run.add_argument("--format", default="json,html,markdown",
+                            help="Report formats: json,html,markdown,console (default: json,html,markdown)")
+    # RunPod one-shot options
+    p_test_run.add_argument("--runpod", action="store_true",
+                            help="Run on an ephemeral RunPod pod (provision → deploy → test → teardown)")
+    p_test_run.add_argument("--gpu", help="GPU type for RunPod pod (e.g. 'NVIDIA L40S')")
+    p_test_run.add_argument("--image", help="Docker image for RunPod pod")
+    p_test_run.add_argument("--volume-id", help="Attach an existing RunPod network volume")
+    deploy_group = p_test_run.add_mutually_exclusive_group()
+    deploy_group.add_argument("--pr", type=int, help="Deploy a PR before testing")
+    deploy_group.add_argument("--branch", help="Deploy a branch before testing")
+    deploy_group.add_argument("--commit", help="Deploy a commit before testing")
+    p_test_run.add_argument("--pod-name", help="Pod name (reuse existing or name new pod)")
+    p_test_run.add_argument("--no-terminate", action="store_true",
+                            help="Keep the pod running after tests complete")
+    p_test_run.add_argument("--install-name", default="main",
+                            help="Installation name on the remote pod (default: main)")
+
+    # test list
+    p_test_list = test_sub.add_parser("list", help="Discover available test suites")
+    p_test_list.add_argument("--dir", "-d", help="Directory to search (default: current)")
+
+    # test baseline
+    p_test_baseline = test_sub.add_parser("baseline", help="Approve test outputs as new baselines")
+    p_test_baseline.add_argument("suite", help="Path to test suite directory")
+    p_test_baseline.add_argument("run_dir", help="Path to a test run output directory")
+    baseline_group = p_test_baseline.add_mutually_exclusive_group()
+    baseline_group.add_argument("--workflow", "-w", help="Approve a specific workflow")
+    baseline_group.add_argument("--approve-all", action="store_true",
+                                help="Approve all workflows in the run")
+
+    # test report
+    p_test_report = test_sub.add_parser("report", help="Regenerate reports from a previous run")
+    p_test_report.add_argument("run_dir", help="Path to a test run output directory")
+    p_test_report.add_argument("--format", default="json,html,markdown",
+                               help="Report formats (default: json,html,markdown)")
+
+    # test fleet
+    p_test_fleet = test_sub.add_parser("fleet", help="Run a test suite across multiple targets in parallel")
+    p_test_fleet.add_argument("suite", help="Path to test suite directory")
+    p_test_fleet.add_argument("--target", "-t", action="append", required=True,
+                              help="Target spec: local:<url>, remote:<server_url>, runpod:<gpu_type> (repeatable)")
+    p_test_fleet.add_argument("--output", "-o", help="Output directory (default: suite/runs/fleet-<timestamp>)")
+    p_test_fleet.add_argument("--timeout", type=int, default=600,
+                              help="Per-workflow timeout in seconds (default: 600)")
+    p_test_fleet.add_argument("--http-timeout", type=int, default=30,
+                              help="HTTP request timeout in seconds (default: 30)")
+    p_test_fleet.add_argument("--format", default="json,html,markdown",
+                              help="Report formats (default: json,html,markdown)")
+    p_test_fleet.add_argument("--max-workers", type=int, default=None,
+                              help="Max parallel workers (default: min(targets, 4))")
+    fleet_deploy_group = p_test_fleet.add_mutually_exclusive_group()
+    fleet_deploy_group.add_argument("--pr", type=int, help="Deploy a PR before testing (ephemeral targets)")
+    fleet_deploy_group.add_argument("--branch", help="Deploy a branch before testing (ephemeral targets)")
+    fleet_deploy_group.add_argument("--commit", help="Deploy a commit before testing (ephemeral targets)")
+
+    p_test.set_defaults(func=cmd_test, _parser_test=p_test)
 
     # hosted
     p_hosted = sub.add_parser("hosted", help="Manage hosted GPU deployments (RunPod, etc.)")

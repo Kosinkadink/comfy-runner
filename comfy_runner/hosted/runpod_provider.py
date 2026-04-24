@@ -102,6 +102,13 @@ class RunPodProvider:
         github_token = get_github_token()
         if github_token:
             pod_env["GITHUB_TOKEN"] = github_token
+        # Pass Tailscale auth key for automatic tailnet join
+        from .config import get_tailscale_auth_key
+        ts_auth_key = get_tailscale_auth_key()
+        if ts_auth_key:
+            pod_env["TAILSCALE_AUTH_KEY"] = ts_auth_key
+            # Use pod name as Tailscale hostname for easy identification
+            pod_env["TAILSCALE_HOSTNAME"] = f"comfy-{name}"
         if env is not None:
             pod_env.update(env)
         if pod_env:
@@ -135,6 +142,19 @@ class RunPodProvider:
         if pod is None or pod.status != "RUNNING":
             return None
         return f"https://{pod_id}-{port}.proxy.runpod.net"
+
+    def get_pod_tailscale_url(self, pod_name: str, port: int = 9189) -> str | None:
+        """Return the Tailscale URL for a pod, or None if tailscale is not configured."""
+        from .config import get_tailscale_auth_key
+        if not get_tailscale_auth_key():
+            return None
+        ts_domain = get_provider_config("runpod").get("tailscale_domain", "")
+        if not ts_domain:
+            return None
+        # Use HTTP — Tailscale in userspace-networking mode (required on RunPod)
+        # doesn't support tailscale serve (HTTPS proxy), but the Tailscale
+        # tunnel itself provides encryption.
+        return f"http://comfy-{pod_name}.{ts_domain}:{port}"
 
     # ------------------------------------------------------------------
     # Volume methods

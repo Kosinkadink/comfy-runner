@@ -1107,6 +1107,87 @@ _ROUTES: list[dict[str, Any]] = [
             "updated": {"type": "object"},
         }),
     },
+
+    # ── Testing ──────────────────────────────────────────────────────
+    {
+        "path": "/test/run",
+        "method": "post",
+        "tags": ["Testing"],
+        "summary": "Run a test suite (async)",
+        "description": (
+            "Queue a test suite execution against a running ComfyUI installation. "
+            "Returns a job_id immediately — poll GET /job/{job_id} to track progress. "
+            "When done, the job result contains the full report and output paths."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["suite"],
+                        "properties": {
+                            "suite": {"type": "string", "description": "Path to test suite directory on disk"},
+                            "name": {"type": "string", "description": "Installation name to test against (default: first installation)"},
+                            "timeout": {"type": "integer", "default": 600, "description": "Per-workflow timeout in seconds"},
+                            "http_timeout": {"type": "integer", "default": 30, "description": "HTTP request timeout in seconds"},
+                            "formats": {"type": "string", "default": "json,html,markdown", "description": "Comma-separated report formats"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Test run queued"),
+    },
+    {
+        "path": "/test/results/{run_id}",
+        "method": "get",
+        "tags": ["Testing"],
+        "summary": "Get test run results",
+        "description": (
+            "Retrieve results from a previous test run. Pass format=json to get the "
+            "full report inline. Requires the suite query parameter to locate the run directory."
+        ),
+        "parameters": [
+            {"name": "run_id", "in": "path", "required": True, "schema": {"type": "string"}, "description": "Run ID (timestamp directory name)"},
+            {"name": "suite", "in": "query", "required": True, "schema": {"type": "string"}, "description": "Path to the test suite directory"},
+            {"name": "format", "in": "query", "schema": {"type": "string"}, "description": "Return format (json to get report inline)"},
+        ],
+        "responses": _ok_response("Test results", {
+            "run_id": {"type": "string"},
+            "output_dir": {"type": "string", "description": "Present when format != json"},
+            "files": {"type": "array", "description": "Present when format != json", "items": {"type": "object", "properties": {
+                "name": {"type": "string"},
+                "size": {"type": "integer"},
+            }}},
+            "report": {"type": "object", "description": "Present when format=json"},
+        }),
+    },
+    {
+        "path": "/test/suites",
+        "method": "get",
+        "tags": ["Testing"],
+        "summary": "List available test suites",
+        "description": "Discover test suites in a directory. Each suite contains workflows and optional baselines for regression testing.",
+        "parameters": [
+            {"name": "dir", "in": "query", "schema": {"type": "string", "default": "."}, "description": "Directory to search for suites"},
+        ],
+        "responses": _ok_response("Suite list", {
+            "suites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "path": {"type": "string"},
+                        "description": {"type": "string"},
+                        "workflows": {"type": "integer"},
+                        "required_models": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        }),
+    },
 ]
 
 

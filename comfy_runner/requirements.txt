@@ -3,3 +3,5 @@ py7zr
 multivolumefile
 blake3
 tomli; python_version < "3.11"
+Pillow
+numpy

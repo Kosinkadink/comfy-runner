@@ -1,0 +1,5 @@
+{
+  "name": "Smoke Test",
+  "description": "Minimal smoke test — SD1.5 txt2img at 256x256",
+  "required_models": ["v1-5-pruned-emaonly-fp16.safetensors"]
+}
