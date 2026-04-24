@@ -283,32 +283,47 @@ def _register_test_run(job_id: str, meta: dict[str, Any]) -> None:
         }
 
 
-def _finish_test_run(job_id: str, updates: dict[str, Any]) -> None:
-    """Update a test run with final results."""
+def _finish_test_run(job_id: str, updates: dict[str, Any], status: str = "done") -> None:
+    """Update a test run with final results and persist status."""
     with _test_runs_lock:
         run = _test_runs.get(job_id)
         if run:
             run.update(updates)
+            run["status"] = status
             run["finished_at"] = time.time()
+
+
+_MAX_TEST_RUNS = 200
+
+
+def _gc_test_runs() -> None:
+    """Evict oldest test runs beyond the limit (caller must hold lock)."""
+    if len(_test_runs) <= _MAX_TEST_RUNS:
+        return
+    by_time = sorted(_test_runs.keys(), key=lambda k: _test_runs[k].get("created_at", 0))
+    to_remove = len(_test_runs) - _MAX_TEST_RUNS
+    for k in by_time[:to_remove]:
+        del _test_runs[k]
 
 
 def _list_test_runs(limit: int = 50) -> list[dict[str, Any]]:
     """Return test runs newest-first, merged with current job status."""
     with _test_runs_lock:
+        _gc_test_runs()
         runs = sorted(
             _test_runs.values(),
             key=lambda r: r.get("created_at", 0),
             reverse=True,
         )[:limit]
-    # Merge in current job status
+    # Merge in current job status — prefer persisted status over live job
     enriched = []
     for run in runs:
         entry = dict(run)
         job = _jobs.get(run["id"])
         if job:
             entry["status"] = job["status"]
-        else:
-            entry.setdefault("status", "expired")
+        elif "status" not in entry:
+            entry["status"] = "expired"
         enriched.append(entry)
     return enriched
 
@@ -327,9 +342,11 @@ def _get_pod_lock(name: str) -> threading.Lock:
 
 
 def _remove_pod_lock(name: str) -> None:
-    """Remove a pod lock entry after termination."""
+    """Remove a pod lock entry after termination (only if unlocked)."""
     with _pod_locks_guard:
-        _pod_locks.pop(name, None)
+        lock = _pod_locks.get(name)
+        if lock is not None and not lock.locked():
+            _pod_locks.pop(name, None)
 
 
 def _get_runpod_provider():
@@ -2718,7 +2735,7 @@ def create_app() -> Any:
                     **summary,
                 }, lines)
             except Exception as e:
-                _finish_test_run(job_id, {"error": str(e)})
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
                 _jobs.fail(job_id, str(e), lines)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -2785,7 +2802,7 @@ def create_app() -> Any:
                     **summary,
                 }, lines)
             except Exception as e:
-                _finish_test_run(job_id, {"error": str(e)})
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
                 _jobs.fail(job_id, str(e), lines)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -2819,8 +2836,8 @@ def create_app() -> Any:
                 entry["result"] = job["result"]
             if job.get("error"):
                 entry["error"] = job["error"]
-        else:
-            entry.setdefault("status", "expired")
+        elif "status" not in entry:
+            entry["status"] = "expired"
 
         return jsonify({"ok": True, **entry})
 
@@ -2860,7 +2877,11 @@ def create_app() -> Any:
             return _err("Report not available yet")
 
         # For html/markdown, look for the file
-        ext_map = {"html": "report.html", "markdown": "report.md"}
+        is_fleet = run.get("kind") == "fleet"
+        ext_map = {
+            "html": "fleet-report.html" if is_fleet else "report.html",
+            "markdown": "fleet-report.md" if is_fleet else "report.md",
+        }
         filename = ext_map.get(fmt)
         if not filename:
             return _err(f"Unknown format '{fmt}'. Expected: json, html, markdown")

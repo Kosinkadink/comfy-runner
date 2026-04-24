@@ -3074,7 +3074,10 @@ def _parse_station_target(spec: str) -> dict:
             url = f"http://{url}"
         return {"kind": "local", "url": url}
     elif spec.startswith("remote:"):
-        return {"kind": "remote", "pod_name": spec[7:]}
+        value = spec[7:]
+        if "://" in value:
+            return {"kind": "remote", "server_url": value}
+        return {"kind": "remote", "pod_name": value}
     elif spec.startswith("runpod:"):
         return {"kind": "runpod", "gpu_type": spec[7:]}
     else:
