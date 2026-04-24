@@ -1762,6 +1762,261 @@ def cmd_workflow_models(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test commands
+# ---------------------------------------------------------------------------
+
+def cmd_test(args: argparse.Namespace) -> None:
+    """Dispatch test subcommands."""
+    action = getattr(args, "test_action", None)
+
+    if action == "run":
+        _test_run(args)
+    elif action == "list":
+        _test_list(args)
+    elif action == "baseline":
+        _test_baseline(args)
+    elif action == "report":
+        _test_report(args)
+    else:
+        args._parser_test.print_help()
+
+
+def _test_run(args: argparse.Namespace) -> None:
+    """Run a test suite against a ComfyUI instance."""
+    from comfy_runner.testing.client import ComfyTestClient
+    from comfy_runner.testing.report import build_report, render_console, write_report
+    from comfy_runner.testing.runner import run_suite
+    from comfy_runner.testing.suite import load_suite
+
+    try:
+        suite = load_suite(args.suite)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    target_url = args.target
+    # If target looks like a pod name (no ://), resolve it
+    if "://" not in target_url:
+        try:
+            target_url = _resolve_server_url(target_url)
+        except RuntimeError:
+            pass
+        # Assume it's a direct ComfyUI URL if resolution fails
+        if "://" not in target_url:
+            target_url = f"http://{target_url}"
+
+    client = ComfyTestClient(target_url, timeout=args.http_timeout)
+    out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / _run_id()
+    send_output = None if args.json else (lambda t: console.print(t, end=""))
+
+    try:
+        suite_run = run_suite(
+            client, suite, out_dir,
+            timeout=args.timeout,
+            send_output=send_output,
+        )
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    target_info = {"name": args.target, "url": target_url}
+    report = build_report(suite_run, target_info=target_info)
+
+    if args.json:
+        from comfy_runner.testing.report import render_json
+        print(render_json(report))
+    else:
+        console.print()
+        console.print(render_console(report))
+        formats = [f.strip() for f in args.format.split(",")]
+        written = write_report(report, out_dir, formats=formats)
+        for fmt, path in written.items():
+            console.print(f"  [dim]{fmt}: {path}[/dim]")
+
+
+def _test_list(args: argparse.Namespace) -> None:
+    """List available test suites."""
+    from comfy_runner.testing.suite import discover_suites
+
+    search_dir = Path(args.dir) if args.dir else Path(".")
+    suites = discover_suites(search_dir)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "suites": [
+                {
+                    "name": s.name,
+                    "path": str(s.path),
+                    "description": s.description,
+                    "workflows": len(s.workflows),
+                    "required_models": s.required_models,
+                }
+                for s in suites
+            ],
+        }, indent=2))
+    else:
+        if not suites:
+            console.print("[dim]No test suites found.[/dim]")
+            return
+        table = Table(title="Test Suites")
+        table.add_column("Name", style="cyan")
+        table.add_column("Workflows", justify="right")
+        table.add_column("Path", style="dim")
+        table.add_column("Description")
+        for s in suites:
+            table.add_row(s.name, str(len(s.workflows)), str(s.path), s.description)
+        console.print(table)
+
+
+def _test_baseline(args: argparse.Namespace) -> None:
+    """Approve test outputs as new baselines."""
+    import shutil
+
+    from comfy_runner.testing.suite import load_suite
+
+    try:
+        suite = load_suite(args.suite)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        msg = f"Run directory not found: {run_dir}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    # Determine which workflows to approve
+    if args.approve_all:
+        workflow_names = [wf.stem for wf in suite.workflows]
+    elif args.workflow:
+        workflow_names = [args.workflow]
+    else:
+        msg = "Specify --workflow <name> or --approve-all"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    baselines_dir = suite.baselines_dir
+    approved: list[str] = []
+    skipped: list[str] = []
+
+    for wf_name in workflow_names:
+        wf_run_dir = run_dir / wf_name
+        if not wf_run_dir.is_dir():
+            skipped.append(wf_name)
+            continue
+
+        # Collect all output files from subdirectories (node_id dirs)
+        output_files = [f for f in wf_run_dir.rglob("*") if f.is_file()]
+        if not output_files:
+            skipped.append(wf_name)
+            continue
+
+        bl_dir = baselines_dir / wf_name
+        bl_dir.mkdir(parents=True, exist_ok=True)
+
+        for src in output_files:
+            dest = bl_dir / src.name
+            shutil.copy2(str(src), str(dest))
+
+        approved.append(wf_name)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "approved": approved,
+            "skipped": skipped,
+        }, indent=2))
+    else:
+        for name in approved:
+            console.print(f"  [green]✓[/green] {name}")
+        for name in skipped:
+            console.print(f"  [dim]- {name} (no outputs)[/dim]")
+        if approved:
+            console.print(f"\n[green]Approved {len(approved)} baseline(s)[/green]")
+        else:
+            console.print("[yellow]No baselines approved[/yellow]")
+
+
+def _test_report(args: argparse.Namespace) -> None:
+    """Regenerate reports from a previous run's summary.json."""
+    from comfy_runner.testing.report import (
+        SuiteReport,
+        write_report,
+    )
+
+    run_dir = Path(args.run_dir)
+    summary_path = run_dir / "summary.json"
+    report_path = run_dir / "report.json"
+
+    # Try report.json first (richer), fall back to summary.json
+    source = report_path if report_path.is_file() else summary_path
+    if not source.is_file():
+        msg = f"No summary.json or report.json in {run_dir}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(1)
+
+    with open(source, encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Build a SuiteReport from the JSON data
+    if "suite_name" in data:
+        # It's a full report.json
+        report = SuiteReport(**{
+            k: data[k] for k in ("suite_name", "timestamp", "duration",
+                                  "total", "passed", "failed")
+        })
+    else:
+        # It's a summary.json (simpler)
+        from datetime import datetime, timezone
+        report = SuiteReport(
+            suite_name=data.get("suite", "unknown"),
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            duration=data.get("duration", 0),
+            total=data.get("total", 0),
+            passed=data.get("passed", 0),
+            failed=data.get("failed", 0),
+        )
+
+    formats = [f.strip() for f in args.format.split(",")]
+    written = write_report(report, run_dir, formats=formats)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "files": {k: str(v) for k, v in written.items()},
+        }, indent=2))
+    else:
+        for fmt, path in written.items():
+            console.print(f"  [green]✓[/green] {fmt}: {path}")
+
+
+def _run_id() -> str:
+    """Generate a timestamped run ID."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+# ---------------------------------------------------------------------------
 # Hosted commands
 # ---------------------------------------------------------------------------
 
@@ -2806,6 +3061,43 @@ def main(argv: list[str] | None = None) -> None:
     p_wfm.add_argument("name", nargs="?", default="main", help="Installation name")
     p_wfm.add_argument("--dry-run", action="store_true", help="List models without downloading")
     p_wfm.set_defaults(func=cmd_workflow_models)
+
+    # test
+    p_test = sub.add_parser("test", help="Run regression tests against ComfyUI")
+    test_sub = p_test.add_subparsers(dest="test_action")
+
+    # test run
+    p_test_run = test_sub.add_parser("run", help="Run a test suite")
+    p_test_run.add_argument("suite", help="Path to test suite directory")
+    p_test_run.add_argument("--target", "-t", required=True,
+                            help="ComfyUI target (URL, host:port, or pod name)")
+    p_test_run.add_argument("--output", "-o", help="Output directory (default: suite/runs/<timestamp>)")
+    p_test_run.add_argument("--timeout", type=int, default=600,
+                            help="Per-workflow timeout in seconds (default: 600)")
+    p_test_run.add_argument("--http-timeout", type=int, default=30,
+                            help="HTTP request timeout in seconds (default: 30)")
+    p_test_run.add_argument("--format", default="json,html,markdown",
+                            help="Report formats: json,html,markdown,console (default: json,html,markdown)")
+
+    # test list
+    p_test_list = test_sub.add_parser("list", help="Discover available test suites")
+    p_test_list.add_argument("--dir", "-d", help="Directory to search (default: current)")
+
+    # test baseline
+    p_test_baseline = test_sub.add_parser("baseline", help="Approve test outputs as new baselines")
+    p_test_baseline.add_argument("suite", help="Path to test suite directory")
+    p_test_baseline.add_argument("run_dir", help="Path to a test run output directory")
+    p_test_baseline.add_argument("--workflow", "-w", help="Approve a specific workflow")
+    p_test_baseline.add_argument("--approve-all", action="store_true",
+                                 help="Approve all workflows in the run")
+
+    # test report
+    p_test_report = test_sub.add_parser("report", help="Regenerate reports from a previous run")
+    p_test_report.add_argument("run_dir", help="Path to a test run output directory")
+    p_test_report.add_argument("--format", default="json,html,markdown",
+                               help="Report formats (default: json,html,markdown)")
+
+    p_test.set_defaults(func=cmd_test, _parser_test=p_test)
 
     # hosted
     p_hosted = sub.add_parser("hosted", help="Manage hosted GPU deployments (RunPod, etc.)")
