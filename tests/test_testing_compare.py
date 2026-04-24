@@ -21,7 +21,7 @@ from comfy_runner.testing.compare import (
 
 class TestRegistry:
     def test_builtin_comparators_registered(self):
-        expected = {"existence", "file_size", "ssim", "phash", "pixel_mse", "metadata"}
+        expected = {"existence", "file_size", "ssim", "ahash", "pixel_mse", "metadata"}
         assert expected.issubset(set(REGISTRY.keys()))
 
     def test_get_comparator_exists(self):
@@ -194,11 +194,11 @@ class TestSSIM:
 
 
 @needs_pillow
-class TestPHash:
+class TestAHash:
     def test_identical_images(self, tmp_path):
         baseline = _make_image(tmp_path / "b.png", color=100)
         test = _make_image(tmp_path / "t.png", color=100)
-        result = compare_outputs(baseline, test, {"method": "phash", "threshold": 0.90})
+        result = compare_outputs(baseline, test, {"method": "ahash", "threshold": 0.90})
         assert result.passed is True
         assert result.score == 1.0
         assert result.details["hamming_distance"] == 0
@@ -211,7 +211,7 @@ class TestPHash:
         Image.fromarray(arr, "L").save(tmp_path / "b.png")
         Image.fromarray(255 - arr, "L").save(tmp_path / "t.png")
         result = compare_outputs(tmp_path / "b.png", tmp_path / "t.png",
-                                 {"method": "phash", "threshold": 0.90})
+                                 {"method": "ahash", "threshold": 0.90})
         assert result.details["hamming_distance"] > 0
 
 

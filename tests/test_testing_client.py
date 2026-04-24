@@ -218,6 +218,19 @@ class TestDownloadOutput:
         assert of.local_path == path
 
     @patch("comfy_runner.testing.client.requests.get")
+    def test_path_traversal_sanitized(self, mock_get, tmp_path):
+        resp = MagicMock()
+        resp.iter_content.return_value = [b"malicious"]
+        resp.raise_for_status = MagicMock()
+        mock_get.return_value = resp
+        client = ComfyTestClient("http://localhost:8188")
+        of = OutputFile(node_id="9", filename="../../../etc/passwd", subfolder="", type="output")
+        path = client.download_output(of, tmp_path)
+        # Should be saved as just "passwd" inside tmp_path, not escaping
+        assert path.parent == tmp_path
+        assert path.name == "passwd"
+
+    @patch("comfy_runner.testing.client.requests.get")
     def test_download_error(self, mock_get, tmp_path):
         mock_get.side_effect = requests.ConnectionError("refused")
         client = ComfyTestClient("http://localhost:8188")

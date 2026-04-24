@@ -10,7 +10,6 @@ import pytest
 from comfy_runner.testing.client import OutputFile, PromptResult
 from comfy_runner.testing.compare.registry import CompareResult
 from comfy_runner.testing.report import (
-    ComparisonEntry,
     SuiteReport,
     WorkflowReport,
     build_report,
@@ -20,7 +19,7 @@ from comfy_runner.testing.report import (
     render_markdown,
     write_report,
 )
-from comfy_runner.testing.runner import SuiteRun, WorkflowResult
+from comfy_runner.testing.runner import ComparisonEntry, SuiteRun, WorkflowResult
 
 
 # ---------------------------------------------------------------------------

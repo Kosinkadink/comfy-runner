@@ -20,21 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from .compare.registry import CompareResult
-from .runner import SuiteRun
+from .runner import ComparisonEntry, SuiteRun
 
 
 # ===================================================================
 # Shared data model
 # ===================================================================
-
-@dataclass
-class ComparisonEntry:
-    """A single baseline-vs-test file comparison."""
-
-    baseline_file: str
-    test_file: str
-    result: CompareResult
-
 
 @dataclass
 class WorkflowReport:
@@ -95,9 +86,12 @@ def build_report(
     Args:
         suite_run: Completed test run.
         comparisons: Map of workflow_name → list of ComparisonEntry.
+            If None, uses ``suite_run.comparisons`` (populated by
+            ``run_suite()`` when baselines are present).
         target_info: Optional metadata about the test target.
     """
-    comparisons = comparisons or {}
+    if comparisons is None:
+        comparisons = suite_run.comparisons
     workflows: list[WorkflowReport] = []
 
     for r in suite_run.results:
@@ -408,13 +402,9 @@ def render_html(report: SuiteReport) -> str:
 
 
 def _html_escape(s: str) -> str:
-    """Minimal HTML escaping."""
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+    """HTML-escape a string."""
+    import html
+    return html.escape(s, quote=True)
 
 
 # ===================================================================

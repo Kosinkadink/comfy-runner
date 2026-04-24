@@ -51,8 +51,13 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
         TAILSCALE_STATE="/workspace/.tailscale"
         mkdir -p "${TAILSCALE_STATE}"
     fi
+    mkdir -p /var/run/tailscale
     tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock &
-    sleep 2
+    # Wait for tailscaled socket to become available (up to 10s)
+    for i in $(seq 1 20); do
+        [ -S /var/run/tailscale/tailscaled.sock ] && break
+        sleep 0.5
+    done
 
     TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
     tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}"

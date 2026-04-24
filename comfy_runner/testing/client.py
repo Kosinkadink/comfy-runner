@@ -207,7 +207,9 @@ class ComfyTestClient:
             ) from exc
 
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / output_file.filename
+        # Sanitize filename to prevent path traversal from API responses
+        safe_name = Path(output_file.filename).name
+        dest = dest_dir / safe_name
         with open(dest, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)

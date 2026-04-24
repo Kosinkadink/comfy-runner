@@ -107,26 +107,45 @@ def _ssim(
     return result
 
 
-def _compute_ssim(a: Any, b: Any) -> float:
-    """Compute mean SSIM between two 2D numpy arrays.
+def _compute_ssim(a: Any, b: Any, win_size: int = 7) -> float:
+    """Compute mean SSIM between two 2D numpy arrays using local windows.
 
-    Uses the simplified SSIM formula with default constants.
+    Uses a sliding uniform window to compute local statistics, matching
+    the standard SSIM definition (spatial structural comparison).
     """
     import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
 
     C1 = (0.01 * 255) ** 2
     C2 = (0.03 * 255) ** 2
 
-    mu_a = a.mean()
-    mu_b = b.mean()
-    sigma_a_sq = a.var()
-    sigma_b_sq = b.var()
-    sigma_ab = ((a - mu_a) * (b - mu_b)).mean()
+    # If the image is too small for the window, fall back to global stats
+    if a.shape[0] < win_size or a.shape[1] < win_size:
+        mu_a = a.mean()
+        mu_b = b.mean()
+        sigma_a_sq = a.var()
+        sigma_b_sq = b.var()
+        sigma_ab = ((a - mu_a) * (b - mu_b)).mean()
+        num = (2 * mu_a * mu_b + C1) * (2 * sigma_ab + C2)
+        den = (mu_a ** 2 + mu_b ** 2 + C1) * (sigma_a_sq + sigma_b_sq + C2)
+        return float(num / den)
+
+    # Extract sliding windows
+    patches_a = sliding_window_view(a, (win_size, win_size))
+    patches_b = sliding_window_view(b, (win_size, win_size))
+
+    mu_a = patches_a.mean(axis=(-2, -1))
+    mu_b = patches_b.mean(axis=(-2, -1))
+    sigma_a_sq = patches_a.var(axis=(-2, -1))
+    sigma_b_sq = patches_b.var(axis=(-2, -1))
+    sigma_ab = ((patches_a - mu_a[..., None, None]) *
+                (patches_b - mu_b[..., None, None])).mean(axis=(-2, -1))
 
     numerator = (2 * mu_a * mu_b + C1) * (2 * sigma_ab + C2)
     denominator = (mu_a ** 2 + mu_b ** 2 + C1) * (sigma_a_sq + sigma_b_sq + C2)
 
-    return float(numerator / denominator)
+    ssim_map = numerator / denominator
+    return float(ssim_map.mean())
 
 
 def _save_ssim_diff(a: Any, b: Any, path: Path) -> None:
@@ -146,20 +165,22 @@ register("ssim", _ssim)
 
 
 # ---------------------------------------------------------------------------
-# phash — perceptual hash distance (requires Pillow)
+# ahash — average hash distance (requires Pillow)
 # ---------------------------------------------------------------------------
 
-def _phash(
+def _ahash(
     baseline: Path, test: Path, *, threshold: float = 0.90, **kwargs: Any,
 ) -> CompareResult:
-    """Compare images using a simple perceptual hash (DCT-based).
+    """Compare images using average hash (aHash).
 
-    Requires ``Pillow``.  Score is 1.0 - (hamming_distance / hash_bits).
+    Resizes to 8x8 grayscale and compares each pixel to the mean.
+    Score is ``1.0 - (hamming_distance / hash_bits)``.
+    Requires ``Pillow``.
     """
     from PIL import Image
 
-    hash_b = _compute_phash(Image.open(baseline))
-    hash_t = _compute_phash(Image.open(test))
+    hash_b = _compute_ahash(Image.open(baseline))
+    hash_t = _compute_ahash(Image.open(test))
 
     distance = bin(hash_b ^ hash_t).count("1")
     hash_bits = 64  # 8x8 hash
@@ -167,7 +188,7 @@ def _phash(
     passed = score >= threshold
 
     return CompareResult(
-        method="phash",
+        method="ahash",
         score=round(score, 4),
         passed=passed,
         threshold=threshold,
@@ -175,10 +196,10 @@ def _phash(
     )
 
 
-def _compute_phash(img: Any) -> int:
-    """Compute a 64-bit perceptual hash of an image.
+def _compute_ahash(img: Any) -> int:
+    """Compute a 64-bit average hash of an image.
 
-    Resizes to 8x8 grayscale, computes relative brightness to mean.
+    Resizes to 8x8 grayscale, compares each pixel to the mean brightness.
     """
     small = img.convert("L").resize((8, 8))
     pixels = list(small.tobytes())
@@ -188,7 +209,7 @@ def _compute_phash(img: Any) -> int:
         bits = (bits << 1) | (1 if px >= mean else 0)
     return bits
 
-register("phash", _phash)
+register("ahash", _ahash)
 
 
 # ---------------------------------------------------------------------------

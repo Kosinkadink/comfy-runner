@@ -1984,6 +1984,19 @@ def _resolve_pod_id(raw: str) -> str:
     return raw
 
 
+def _build_pod_info(pod: Any, server_url: str, comfy_url: str, ts_url: Any) -> dict:
+    """Build a JSON-serializable pod info dict (shared by init and pod create)."""
+    info: dict = {
+        "id": pod.id, "name": pod.name, "status": pod.status,
+        "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
+        "cost_per_hr": pod.cost_per_hr, "image": pod.image,
+        "server_url": server_url, "comfy_url": comfy_url,
+    }
+    if isinstance(ts_url, str):
+        info["tailscale_url"] = ts_url
+    return info
+
+
 def _hosted_pod(args: argparse.Namespace) -> None:
     """Handle hosted pod create/list/show/start/stop/terminate/url."""
     from comfy_runner.hosted.runpod_provider import RunPodProvider
@@ -2039,22 +2052,15 @@ def _hosted_pod(args: argparse.Namespace) -> None:
             server_url = f"https://{pod.id}-9189.proxy.runpod.net"
             comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
             ts_url = provider.get_pod_tailscale_url(args.name)
+            pod_info = _build_pod_info(pod, server_url, comfy_url, ts_url)
             if args.json:
-                pod_info: dict = {
-                    "id": pod.id, "name": pod.name, "status": pod.status,
-                    "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
-                    "cost_per_hr": pod.cost_per_hr, "image": pod.image,
-                    "server_url": server_url, "comfy_url": comfy_url,
-                }
-                if isinstance(ts_url, str):
-                    pod_info["tailscale_url"] = ts_url
                 print(json.dumps({"ok": True, "pod": pod_info}, indent=2))
             else:
                 console.print(f"Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
                 console.print(f"  Server:    {server_url}")
                 console.print(f"  ComfyUI:   {comfy_url}")
-                if isinstance(ts_url, str):
-                    console.print(f"  Tailscale: {ts_url}")
+                if "tailscale_url" in pod_info:
+                    console.print(f"  Tailscale: {pod_info['tailscale_url']}")
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2278,16 +2284,9 @@ def _hosted_init(args: argparse.Namespace) -> None:
         server_url = f"https://{pod.id}-9189.proxy.runpod.net"
         comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
         ts_url = provider.get_pod_tailscale_url(args.name)
+        pod_info = _build_pod_info(pod, server_url, comfy_url, ts_url)
 
         if args.json:
-            pod_info: dict = {
-                "id": pod.id, "name": pod.name, "status": pod.status,
-                "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
-                "cost_per_hr": pod.cost_per_hr, "image": pod.image,
-                "server_url": server_url, "comfy_url": comfy_url,
-            }
-            if isinstance(ts_url, str):
-                pod_info["tailscale_url"] = ts_url
             result: dict = {"ok": True, "pod": pod_info}
             if volume_id:
                 result["volume"] = {"id": volume_id, "name": volume_name}
@@ -2296,8 +2295,8 @@ def _hosted_init(args: argparse.Namespace) -> None:
             console.print(f"Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
             console.print(f"  Server:    {server_url}")
             console.print(f"  ComfyUI:   {comfy_url}")
-            if isinstance(ts_url, str):
-                console.print(f"  Tailscale: {ts_url}")
+            if "tailscale_url" in pod_info:
+                console.print(f"  Tailscale: {pod_info['tailscale_url']}")
             console.print()
             console.print("[dim]The pod is booting comfy-runner server. Once ready, use the server URL[/dim]")
             console.print("[dim]to deploy, start ComfyUI, etc. via the API.[/dim]")

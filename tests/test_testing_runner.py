@@ -259,3 +259,37 @@ class TestRunSuite:
         wf2_result = next(r for r in test_run.results if r.workflow_name == "wf2")
         assert wf1_result.has_baseline is True
         assert wf2_result.has_baseline is False
+
+    def test_compares_against_baselines(self, tmp_path):
+        suite_dir = _make_suite_dir(tmp_path)
+        # Create a baseline with matching filename
+        bl_dir = suite_dir / "baselines" / "wf1"
+        bl_dir.mkdir(parents=True)
+        (bl_dir / "out.png").write_bytes(b"baseline data")
+        suite = load_suite(suite_dir)
+
+        # Mock client that returns a result with a local_path set
+        out_dir = tmp_path / "run_output"
+        wf1_out = out_dir / "wf1" / "9"
+        wf1_out.mkdir(parents=True)
+        test_file = wf1_out / "out.png"
+        test_file.write_bytes(b"test data")
+
+        def _mock_run(wf, od, timeout=600):
+            result = _mock_prompt_result()
+            # Set local_path on the output file
+            result.outputs["9"][0].local_path = test_file
+            return result
+
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.side_effect = _mock_run
+
+        test_run = run_suite(client, suite, out_dir)
+
+        # wf1 has a baseline with matching filename → comparisons should be populated
+        assert "wf1" in test_run.comparisons
+        assert len(test_run.comparisons["wf1"]) == 1
+        assert test_run.comparisons["wf1"][0].result.method == "existence"
+        assert test_run.comparisons["wf1"][0].result.passed is True
+        # wf2 has no baseline → no comparisons
+        assert "wf2" not in test_run.comparisons

@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .client import ComfyTestClient, PromptResult
+from .client import ComfyTestClient, OutputFile, PromptResult
+from .compare.registry import CompareResult, _guess_mimetype, compare_outputs
 from .suite import Suite
 
 
@@ -33,6 +34,15 @@ class WorkflowResult:
 
 
 @dataclass
+class ComparisonEntry:
+    """A single baseline-vs-test file comparison result."""
+
+    baseline_file: str
+    test_file: str
+    result: CompareResult
+
+
+@dataclass
 class SuiteRun:
     """Aggregate result of running an entire test suite."""
 
@@ -40,6 +50,7 @@ class SuiteRun:
     suite_path: Path
     output_dir: Path
     results: list[WorkflowResult] = field(default_factory=list)
+    comparisons: dict[str, list[ComparisonEntry]] = field(default_factory=dict)
     started_at: float = 0.0
     finished_at: float = 0.0
 
@@ -220,6 +231,41 @@ def run_suite(
         )
         result.has_baseline = suite.has_baseline(wf_name)
         test_run.results.append(result)
+
+    # ── Compare outputs against baselines ──────────────────────────
+    for result in test_run.results:
+        wf_name = result.workflow_name
+        if not result.passed or not result.has_baseline or not result.output_dir:
+            continue
+        baseline_files = suite.get_baseline_files(wf_name)
+        if not baseline_files:
+            continue
+
+        # Build map of filename → test output path across all nodes
+        test_files: dict[str, Path] = {}
+        if result.prompt_result:
+            for files in result.prompt_result.outputs.values():
+                for f in files:
+                    if f.local_path and f.local_path.is_file():
+                        test_files[f.local_path.name] = f.local_path
+
+        entries: list[ComparisonEntry] = []
+        for bl_path in baseline_files:
+            test_path = test_files.get(bl_path.name)
+            if test_path is None:
+                # Try matching by position if names don't align
+                continue
+            mimetype = _guess_mimetype(bl_path)
+            cfg = suite.get_compare_config(mimetype)
+            cmp_result = compare_outputs(bl_path, test_path, cfg)
+            entries.append(ComparisonEntry(
+                baseline_file=bl_path.name,
+                test_file=test_path.name,
+                result=cmp_result,
+            ))
+
+        if entries:
+            test_run.comparisons[wf_name] = entries
 
     test_run.finished_at = time.monotonic()
 
