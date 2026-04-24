@@ -44,8 +44,17 @@ python -m comfy_runner_cli <command> [options]
 ### Installation Management
 
 ```bash
-# Create a new ComfyUI installation
-comfy_runner.py init --name main --variant gpu --release latest --dir ./installs
+# Create a new ComfyUI installation (pre-built release)
+comfy_runner.py init --name main --variant win-nvidia --dir ./installs
+comfy_runner.py init --name main --release v0.2.1       # specific release tag
+
+# Create an installation via ad-hoc build (any Python + PyTorch combo)
+comfy_runner.py init --name custom --build                          # auto-detect GPU, latest Python
+comfy_runner.py init --name custom --build --python-version 3.12    # specific Python
+comfy_runner.py init --name custom --build --cuda-tag cu128         # specific CUDA version
+comfy_runner.py init --name custom --build --gpu cpu                # CPU-only
+comfy_runner.py init --name custom --build --torch-version 2.5.1    # specific PyTorch version
+comfy_runner.py init --name custom --build --torch-spec torch==2.10.0+cu130 torchvision==0.25.0+cu130
 
 # List all installations (alias: ls)
 comfy_runner.py list
