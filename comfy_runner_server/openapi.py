@@ -59,6 +59,14 @@ _TEST_ID_PARAM: dict[str, Any] = {
     "description": "Test run ID (same as the job_id returned by POST /tests/run or /tests/fleet)",
 }
 
+_SUITE_NAME_PARAM: dict[str, Any] = {
+    "name": "name",
+    "in": "path",
+    "required": True,
+    "schema": {"type": "string"},
+    "description": "Test suite name",
+}
+
 
 def _ok_response(desc: str, extra_props: dict[str, Any] | None = None) -> dict:
     props: dict[str, Any] = {"ok": {"type": "boolean", "example": True}}
@@ -182,6 +190,7 @@ _ROUTES: list[dict[str, Any]] = [
             "system_info": {
                 "type": "object",
                 "properties": {
+                    "comfy_runner_commit": {"type": "string", "nullable": True, "description": "Short git commit hash of the comfy-runner server"},
                     "platform": {"type": "string"},
                     "arch": {"type": "string"},
                     "os_distro": {"type": "string"},
@@ -1376,7 +1385,7 @@ _ROUTES: list[dict[str, Any]] = [
                         "type": "object",
                         "required": ["suite", "target"],
                         "properties": {
-                            "suite": {"type": "string", "description": "Path to test suite directory"},
+                            "suite": {"type": "string", "description": "Suite name (resolved from server's managed suites directory) or filesystem path"},
                             "target": {
                                 "type": "object",
                                 "description": "Target to test against",
@@ -1417,7 +1426,7 @@ _ROUTES: list[dict[str, Any]] = [
                         "type": "object",
                         "required": ["suite", "targets"],
                         "properties": {
-                            "suite": {"type": "string", "description": "Path to test suite directory"},
+                            "suite": {"type": "string", "description": "Suite name (resolved from server's managed suites directory) or filesystem path"},
                             "targets": {
                                 "type": "array",
                                 "items": {
@@ -1528,6 +1537,101 @@ _ROUTES: list[dict[str, Any]] = [
                 "content": {"text/html": {"schema": {"type": "string"}}},
             },
         },
+    },
+
+    # ── Suites ────────────────────────────────────────────────────────
+    {
+        "path": "/suites",
+        "method": "get",
+        "tags": ["Suites"],
+        "summary": "List available test suites",
+        "description": "Returns all test suites on the server with metadata and run counts.",
+        "responses": _ok_response("Suite list", {
+            "suites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "required_models": {"type": "array", "items": {"type": "string"}},
+                        "workflow_count": {"type": "integer"},
+                        "run_count": {"type": "integer"},
+                    },
+                },
+            },
+        }),
+    },
+    {
+        "path": "/suites/{name}",
+        "method": "get",
+        "tags": ["Suites"],
+        "summary": "Get suite details",
+        "description": "Returns suite metadata, config, workflow filenames, and run IDs.",
+        "parameters": [_SUITE_NAME_PARAM],
+        "responses": _ok_response("Suite details", {
+            "name": {"type": "string"},
+            "suite": {"type": "object"},
+            "config": {"type": "object"},
+            "workflows": {"type": "array", "items": {"type": "string"}},
+            "runs": {"type": "array", "items": {"type": "string"}},
+        }),
+    },
+    {
+        "path": "/suites/{name}",
+        "method": "post",
+        "tags": ["Suites"],
+        "summary": "Upload or update a test suite",
+        "description": (
+            "Upload suite definition files. Preserves any existing test runs. "
+            "Replaces all workflow files."
+        ),
+        "parameters": [_SUITE_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["suite", "workflows"],
+                        "properties": {
+                            "suite": {"type": "object", "description": "suite.json contents"},
+                            "config": {"type": "object", "description": "config.json contents"},
+                            "workflows": {
+                                "type": "object",
+                                "additionalProperties": {"type": "object"},
+                                "description": "Map of filename → workflow JSON",
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Suite uploaded", {
+            "name": {"type": "string"},
+            "workflows": {"type": "array", "items": {"type": "string"}},
+            "message": {"type": "string"},
+        }),
+    },
+    {
+        "path": "/suites/{name}",
+        "method": "delete",
+        "tags": ["Suites"],
+        "summary": "Remove a suite from the server",
+        "description": (
+            "Removes suite definition files. By default refuses if test runs exist "
+            "(use ?force=true). Runs are preserved unless ?include_runs=true."
+        ),
+        "parameters": [
+            _SUITE_NAME_PARAM,
+            {"name": "force", "in": "query", "schema": {"type": "boolean", "default": False}, "description": "Force deletion even if test runs exist"},
+            {"name": "include_runs", "in": "query", "schema": {"type": "boolean", "default": False}, "description": "Also delete test run data"},
+        ],
+        "responses": _ok_response("Suite removed", {
+            "name": {"type": "string"},
+            "action": {"type": "string"},
+        }),
     },
 ]
 

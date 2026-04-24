@@ -3088,6 +3088,32 @@ def _parse_station_target(spec: str) -> dict:
         return {"kind": "local", "url": url}
 
 
+def _push_suite_to_server(runner, suite_name: str, suite_path: str) -> dict:
+    """Upload a local suite to the central server.
+
+    Reads suite.json, config.json, and workflows/*.json from the local
+    suite directory and POSTs them to /suites/{name}.
+    """
+    import json as _json
+    sp = Path(suite_path)
+
+    suite_meta = _json.loads((sp / "suite.json").read_text(encoding="utf-8"))
+
+    config = {}
+    config_path = sp / "config.json"
+    if config_path.is_file():
+        config = _json.loads(config_path.read_text(encoding="utf-8"))
+
+    workflows = {}
+    wf_dir = sp / "workflows"
+    if wf_dir.is_dir():
+        for wf in sorted(wf_dir.glob("*.json")):
+            workflows[wf.name] = _json.loads(wf.read_text(encoding="utf-8"))
+
+    body = {"suite": suite_meta, "config": config, "workflows": workflows}
+    return runner._request("POST", f"/suites/{suite_name}", json=body)
+
+
 # ---------------------------------------------------------------------------
 # Station commands
 # ---------------------------------------------------------------------------
@@ -3105,6 +3131,8 @@ def cmd_station(args: argparse.Namespace) -> None:
         _station_jobs(args)
     elif action == "info":
         _station_info(args)
+    elif action == "suites":
+        _station_suites(args)
     else:
         args._parser_station.print_help()
 
@@ -3315,12 +3343,15 @@ def _station_tests(args: argparse.Namespace) -> None:
         try:
             runner = RemoteRunner(_station_server(args))
             suite_path = _resolve_suite_path(args.suite)
+            if not args.json:
+                console.print(f"Pushing suite [cyan]{args.suite}[/cyan] to server...")
+            _push_suite_to_server(runner, args.suite, suite_path)
 
             # Parse target spec
             spec = args.target
             target = _parse_station_target(spec)
 
-            body = {"suite": suite_path, "target": target}
+            body = {"suite": args.suite, "target": target}
             if getattr(args, "timeout", None):
                 body["timeout"] = args.timeout
 
@@ -3351,10 +3382,13 @@ def _station_tests(args: argparse.Namespace) -> None:
         try:
             runner = RemoteRunner(_station_server(args))
             suite_path = _resolve_suite_path(args.suite)
+            if not args.json:
+                console.print(f"Pushing suite [cyan]{args.suite}[/cyan] to server...")
+            _push_suite_to_server(runner, args.suite, suite_path)
 
             targets = [_parse_station_target(spec) for spec in args.target]
 
-            body = {"suite": suite_path, "targets": targets}
+            body = {"suite": args.suite, "targets": targets}
             if getattr(args, "timeout", None):
                 body["timeout"] = args.timeout
             if getattr(args, "max_workers", None):
@@ -3509,6 +3543,114 @@ def _station_info(args: argparse.Namespace) -> None:
             sys.exit(1)
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
+
+
+def _station_suites(args: argparse.Namespace) -> None:
+    """Handle station suites subcommands."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    suite_action = getattr(args, "station_suite_action", None)
+
+    if suite_action is None or suite_action == "list":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("GET", "/suites")
+            suites = data.get("suites", [])
+            if args.json:
+                print(json.dumps({"ok": True, "suites": suites}, indent=2))
+                return
+            if not suites:
+                console.print("[dim]No suites on server.[/dim]")
+                return
+            table = Table(title="Test Suites")
+            table.add_column("Name", style="cyan")
+            table.add_column("Title")
+            table.add_column("Workflows")
+            table.add_column("Runs")
+            table.add_column("Description", style="dim")
+            for s in suites:
+                table.add_row(
+                    s["name"], s.get("title", ""), str(s.get("workflow_count", 0)),
+                    str(s.get("run_count", 0)), s.get("description", "")
+                )
+            console.print(table)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif suite_action == "push":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            if getattr(args, "all_suites", False):
+                # Push all local suites
+                config = _find_station_config()
+                # Find station.json dir
+                p = Path.cwd()
+                while True:
+                    if (p / "station.json").is_file():
+                        break
+                    parent = p.parent
+                    if parent == p:
+                        raise RuntimeError("station.json not found")
+                    p = parent
+                suites_dir = p / "test-suites"
+                if not suites_dir.is_dir():
+                    raise RuntimeError("No test-suites/ directory found")
+                pushed = []
+                for d in sorted(suites_dir.iterdir()):
+                    if d.is_dir() and (d / "suite.json").is_file():
+                        result = _push_suite_to_server(runner, d.name, str(d))
+                        pushed.append(d.name)
+                        if not args.json:
+                            console.print(f"  ✓ {d.name}")
+                if args.json:
+                    print(json.dumps({"ok": True, "pushed": pushed}, indent=2))
+                else:
+                    console.print(f"\n[green]Pushed {len(pushed)} suite(s)[/green]")
+            else:
+                suite_name = args.suite_name
+                suite_path = _resolve_suite_path(suite_name)
+                result = _push_suite_to_server(runner, suite_name, suite_path)
+                if args.json:
+                    print(json.dumps({"ok": True, **result}, indent=2))
+                else:
+                    console.print(f"✓ Suite [cyan]{suite_name}[/cyan] pushed to server")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif suite_action == "rm":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            params = {}
+            if getattr(args, "force", False):
+                params["force"] = "true"
+            if getattr(args, "include_runs", False):
+                params["include_runs"] = "true"
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            path = f"/suites/{args.suite_name}"
+            if query:
+                path += f"?{query}"
+            runner._request("DELETE", path)
+            if args.json:
+                print(json.dumps({"ok": True}))
+            else:
+                console.print(f"✓ Suite [cyan]{args.suite_name}[/cyan] removed from server")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    else:
+        args._parser_station_suites.print_help()
 
 
 # ---------------------------------------------------------------------------
@@ -4066,6 +4208,23 @@ def main(argv: list[str] | None = None) -> None:
     p_st_test_report.add_argument("test_id", help="Test run ID")
 
     p_st_tests.set_defaults(_parser_station_tests=p_st_tests)
+
+    # station suites
+    p_st_suites = station_sub.add_parser("suites", help="Manage test suites on the central server")
+    st_suites_sub = p_st_suites.add_subparsers(dest="station_suite_action")
+
+    st_suites_sub.add_parser("list", help="List suites on the server")
+
+    p_st_suite_push = st_suites_sub.add_parser("push", help="Upload a suite to the server")
+    p_st_suite_push.add_argument("suite_name", nargs="?", help="Suite name (from test-suites/)")
+    p_st_suite_push.add_argument("--all", dest="all_suites", action="store_true", help="Push all local suites")
+
+    p_st_suite_rm = st_suites_sub.add_parser("rm", help="Remove a suite from the server")
+    p_st_suite_rm.add_argument("suite_name", help="Suite name")
+    p_st_suite_rm.add_argument("--force", action="store_true", help="Force removal even if runs exist")
+    p_st_suite_rm.add_argument("--include-runs", action="store_true", help="Also delete test run data")
+
+    p_st_suites.set_defaults(_parser_station_suites=p_st_suites)
 
     # Global --server override for station commands
     p_station.add_argument("--server", help="Override central server URL (default: from station.json)")

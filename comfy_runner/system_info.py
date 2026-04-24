@@ -402,6 +402,15 @@ def _get_disk_info(path: str | Path | None = None) -> dict[str, float]:
         return {"free_gb": 0.0, "total_gb": 0.0}
 
 
+def _get_git_commit() -> str | None:
+    """Return the short git commit hash of the comfy-runner repo, or None."""
+    repo_dir = Path(__file__).resolve().parent.parent
+    result = _run_silent(["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"])
+    if result and result.returncode == 0:
+        return result.stdout.decode("utf-8", errors="replace").strip() or None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -448,7 +457,10 @@ def get_system_info() -> SystemInfo:
             "release_tag": rec.get("release_tag", ""),
         })
 
+    commit = _get_git_commit()
+
     return {
+        "comfy_runner_commit": commit,
         "gpu_vendor": gpu_vendor,
         "gpu_label": gpu_label,
         "gpus": gpus,
