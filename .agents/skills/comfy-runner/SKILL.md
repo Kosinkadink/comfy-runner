@@ -37,6 +37,8 @@ A Python toolkit for managing ComfyUI instances — installation, snapshot, proc
 | `snapshot restore <id> [name]` | Restore snapshot |
 | `nodes list/add/rm/enable/disable` | Manage custom nodes |
 | `server --tailscale --tunnels` | Start HTTP API server |
+| `set <name> autostart true` | Auto-start instance on server boot |
+| `service install/uninstall/status` | Manage systemd service |
 
 ## HTTP API
 

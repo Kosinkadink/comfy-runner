@@ -781,16 +781,27 @@ def create_app() -> Any:
             return _err(err, 404)
 
         body = request.get_json(silent=True) or {}
-        allowed_keys = {"launch_args", "env"}
+        allowed_keys = {"launch_args", "autostart", "tunnel_provider", "tunnel_domain", "env"}
         updated = {}
         for key in allowed_keys:
             if key in body:
-                if key == "env":
+                if key == "autostart":
+                    record[key] = bool(body[key])
+                    updated[key] = record[key]
+                elif key == "tunnel_provider":
+                    if body[key] not in ("ngrok", "tailscale", ""):
+                        return _err(f"Invalid tunnel_provider: '{body[key]}'. Use ngrok, tailscale, or empty string.")
+                    record[key] = body[key]
+                    updated[key] = body[key]
+                elif key == "env":
                     env_err = _validate_env_dict(body[key])
                     if env_err:
                         return _err(env_err)
-                record[key] = body[key]
-                updated[key] = body[key]
+                    record[key] = body[key]
+                    updated[key] = body[key]
+                else:
+                    record[key] = str(body[key]) if body[key] is not None else ""
+                    updated[key] = record[key]
 
         if not updated:
             return _err(f"No valid keys. Allowed: {', '.join(sorted(allowed_keys))}")

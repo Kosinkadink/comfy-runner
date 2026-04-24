@@ -315,6 +315,19 @@ _ROUTES: list[dict[str, Any]] = [
                                 "type": "string",
                                 "description": "CLI arguments passed to ComfyUI on start",
                             },
+                            "autostart": {
+                                "type": "boolean",
+                                "description": "Auto-start this instance when server boots",
+                            },
+                            "tunnel_provider": {
+                                "type": "string",
+                                "enum": ["ngrok", "tailscale", ""],
+                                "description": "Persistent tunnel provider",
+                            },
+                            "tunnel_domain": {
+                                "type": "string",
+                                "description": "Persistent tunnel domain (ngrok only)",
+                            },
                         },
                     }
                 }

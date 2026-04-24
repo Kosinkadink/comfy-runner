@@ -854,6 +854,54 @@ def cmd_server(args: argparse.Namespace) -> None:
             except Exception:
                 pass
 
+    # Auto-start instances with autostart=True and restore persistent tunnels
+    from comfy_runner.installations import show_list
+    from comfy_runner.process import get_status, start_installation
+    autostart_instances = [
+        inst for inst in show_list()
+        if inst.get("autostart")
+    ]
+    if autostart_instances:
+        console.print(f"\n[bold]Auto-starting {len(autostart_instances)} instance(s)...[/bold]")
+        for inst in autostart_instances:
+            name = inst["name"]
+            try:
+                status = get_status(name)
+                if status.get("running"):
+                    port = status.get("port")
+                    console.print(f"  [dim]{name}: already running on port {port}[/dim]")
+                else:
+                    console.print(f"  Starting [cyan]{name}[/cyan]...")
+                    result = start_installation(name, send_output=_output)
+                    port = result.get("port")
+                    console.print(f"  ✓ [cyan]{name}[/cyan] started on port {port}")
+                # Register tailscale serve if in tailscale mode
+                if tailscale_active and port:
+                    try:
+                        from comfy_runner.tunnel import start_tailscale_serve_port
+                        start_tailscale_serve_port(port, send_output=_output)
+                    except Exception as e:
+                        console.print(f"  [dim]⚠ Tailscale serve for {name}: {e}[/dim]")
+                # Restore persistent tunnel if configured (skip if already active)
+                tunnel_provider = inst.get("tunnel_provider")
+                if tunnel_provider:
+                    from comfy_runner.tunnel import get_tunnel_url
+                    if not get_tunnel_url(name):
+                        try:
+                            from comfy_runner.tunnel import start_tunnel
+                            tunnel_domain = inst.get("tunnel_domain", "")
+                            tunnel_result = start_tunnel(
+                                name=name,
+                                provider=tunnel_provider,
+                                send_output=_output,
+                                domain=tunnel_domain,
+                            )
+                            console.print(f"  ✓ Tunnel: {tunnel_result.get('url')}")
+                        except Exception as e:
+                            console.print(f"  [dim]⚠ Tunnel restore for {name}: {e}[/dim]")
+            except Exception as e:
+                console.print(f"  [red]✗ {name}: {e}[/red]")
+
     def _shutdown() -> None:
         if tailscale_active:
             if not args.keep_instances:
@@ -1462,7 +1510,7 @@ def cmd_set(args: argparse.Namespace) -> None:
     key = args.key
     value = args.value
 
-    allowed_keys = {"launch_args"}
+    allowed_keys = {"launch_args", "autostart", "tunnel_provider", "tunnel_domain"}
     if key not in allowed_keys:
         err = f"Unknown key '{key}'. Allowed: {', '.join(sorted(allowed_keys))}"
         if args.json:
@@ -1471,13 +1519,113 @@ def cmd_set(args: argparse.Namespace) -> None:
         console.print(f"[red]{err}[/red]")
         sys.exit(1)
 
+    # Type coercion / validation per key
+    if key == "autostart":
+        if value.lower() in ("true", "1", "yes"):
+            value = True
+        elif value.lower() in ("false", "0", "no"):
+            value = False
+        else:
+            err = f"Invalid value for autostart: '{value}'. Use true/false/1/0/yes/no."
+            if args.json:
+                print(json.dumps({"ok": False, "error": err}))
+                sys.exit(1)
+            console.print(f"[red]{err}[/red]")
+            sys.exit(1)
+    elif key == "tunnel_provider":
+        if value not in ("ngrok", "tailscale", ""):
+            err = f"Invalid tunnel_provider: '{value}'. Use ngrok, tailscale, or empty string."
+            if args.json:
+                print(json.dumps({"ok": False, "error": err}))
+                sys.exit(1)
+            console.print(f"[red]{err}[/red]")
+            sys.exit(1)
+
     record[key] = value
     set_installation(args.name, record)
 
     if args.json:
         print(json.dumps({"ok": True, "key": key, "value": value}))
     else:
-        console.print(f"✓ [cyan]{args.name}[/cyan] {key} = [bold]{value or '(empty)'}[/bold]")
+        console.print(f"✓ [cyan]{args.name}[/cyan] {key} = [bold]{value if value != '' else '(empty)'}[/bold]")
+
+
+def cmd_service(args: argparse.Namespace) -> None:
+    """Manage the systemd service for comfy-runner."""
+    action = getattr(args, "service_action", None)
+
+    if action == "install":
+        from comfy_runner.service import install_service
+        try:
+            result = install_service(
+                tailscale=not args.no_tailscale,
+                tunnels=not args.no_tunnels,
+                keep_instances=args.keep_instances,
+                port=args.port,
+                send_output=None if args.json else _output,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, **result}, indent=2))
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif action == "uninstall":
+        from comfy_runner.service import uninstall_service
+        try:
+            result = uninstall_service(
+                send_output=None if args.json else _output,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, **result}, indent=2))
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif action == "status":
+        from comfy_runner.service import get_service_status
+        try:
+            result = get_service_status()
+            if args.json:
+                print(json.dumps({"ok": True, **result}, indent=2))
+            else:
+                if not result.get("installed"):
+                    console.print("[dim]Service not installed.[/dim]")
+                    reason = result.get("reason")
+                    if reason:
+                        console.print(f"[dim]  ({reason})[/dim]")
+                else:
+                    console.print(f"Service: [bold]{result.get('active', '?')}[/bold]")
+                    console.print(f"Enabled: {result.get('enabled', '?')}")
+                    console.print(f"Path: {result.get('service_path', '?')}")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif action == "unit":
+        from comfy_runner.service import generate_unit
+        unit = generate_unit(
+            tailscale=not args.no_tailscale,
+            tunnels=not args.no_tunnels,
+            keep_instances=args.keep_instances,
+            port=args.port,
+        )
+        if args.json:
+            print(json.dumps({"ok": True, "unit": unit}))
+        else:
+            console.print(unit)
+
+    else:
+        args._parser_service.print_help()
 
 
 def cmd_download_model(args: argparse.Namespace) -> None:
@@ -2558,7 +2706,7 @@ def main(argv: list[str] | None = None) -> None:
     p_sysinfo.set_defaults(func=cmd_sysinfo)
 
     # set
-    p_set = sub.add_parser("set", help="Set a config value on an installation (e.g. launch_args)")
+    p_set = sub.add_parser("set", help="Set a config value on an installation (launch_args, autostart, tunnel_provider, tunnel_domain)")
     p_set.add_argument("name", help="Installation name")
     p_set.add_argument("key", help="Config key (e.g. launch_args)")
     p_set.add_argument("value", help="Value to set")
@@ -2707,6 +2855,27 @@ def main(argv: list[str] | None = None) -> None:
     p_server.add_argument("--keep-instances", action="store_true",
                           help="Don't stop ComfyUI instances when server shuts down")
     p_server.set_defaults(func=cmd_server)
+
+    # service
+    p_service = sub.add_parser("service", help="Manage systemd service for comfy-runner")
+    service_sub = p_service.add_subparsers(dest="service_action")
+
+    p_svc_install = service_sub.add_parser("install", help="Install and enable systemd service")
+    p_svc_install.add_argument("--no-tailscale", action="store_true", help="Don't include --tailscale flag")
+    p_svc_install.add_argument("--no-tunnels", action="store_true", help="Don't include --tunnels flag")
+    p_svc_install.add_argument("--keep-instances", action="store_true", help="Include --keep-instances flag")
+    p_svc_install.add_argument("--port", "-p", type=int, default=9189, help="Server port (default: 9189)")
+
+    service_sub.add_parser("uninstall", help="Remove systemd service")
+    service_sub.add_parser("status", help="Show service status")
+
+    p_svc_unit = service_sub.add_parser("unit", help="Print the generated systemd unit file")
+    p_svc_unit.add_argument("--no-tailscale", action="store_true", help="Don't include --tailscale flag")
+    p_svc_unit.add_argument("--no-tunnels", action="store_true", help="Don't include --tunnels flag")
+    p_svc_unit.add_argument("--keep-instances", action="store_true", help="Include --keep-instances flag")
+    p_svc_unit.add_argument("--port", "-p", type=int, default=9189, help="Server port (default: 9189)")
+
+    p_service.set_defaults(func=cmd_service, _parser_service=p_service)
 
     # tailscale-serve
     p_ts = sub.add_parser("tailscale-serve", help="Manage tailscale serve for the runner server")

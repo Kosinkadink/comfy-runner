@@ -60,6 +60,9 @@ comfy_runner.py rm <name> --keep-files    # remove record but keep files on disk
 # Set a config value on an installation
 comfy_runner.py set <name> <key> <value>
 comfy_runner.py set main launch_args "--cpu"
+comfy_runner.py set main autostart true       # auto-start on server boot
+comfy_runner.py set main tunnel_provider ngrok  # persistent tunnel
+comfy_runner.py set main tunnel_domain myapp.ngrok-free.app
 
 # View or set global configuration
 comfy_runner.py config show
@@ -309,6 +312,53 @@ comfy_runner.py tailscale-serve stop
 comfy_runner.py tailscale-serve status
 ```
 
+### Service Management (systemd)
+
+Install comfy-runner as a systemd service for automatic startup on boot.
+
+```bash
+# Install and enable the systemd service
+comfy_runner.py service install
+
+# Install with custom options
+comfy_runner.py service install --no-tailscale --port 9000
+
+# Show service status
+comfy_runner.py service status
+
+# Print the generated unit file (dry run)
+comfy_runner.py service unit
+
+# Remove the service
+comfy_runner.py service uninstall
+```
+
+The installed service starts `comfy_runner.py server --tailscale --tunnels` by default, auto-restarts on crash, and starts on boot. Instances with `autostart=true` are automatically started when the server boots, and persistent tunnel assignments are restored.
+
+### Auto-start and Persistent Tunnels
+
+Configure instances to start automatically when the server boots:
+
+```bash
+# Mark an instance for auto-start
+comfy_runner.py set main autostart true
+
+# Assign a persistent tunnel (restored on every boot)
+comfy_runner.py set main tunnel_provider ngrok
+comfy_runner.py set main tunnel_domain myapp.ngrok-free.app
+
+# Or via the HTTP API
+curl -X PUT https://mybox.ts.net:9189/main/config \
+  -H "Content-Type: application/json" \
+  -d '{"autostart": true, "tunnel_provider": "ngrok", "tunnel_domain": "myapp.ngrok-free.app"}'
+```
+
+On server startup, the boot sequence:
+1. Cleans up stale tailscale serves and tunnel state
+2. Registers tailscale serve for the runner server (if `--tailscale`)
+3. Starts all instances marked with `autostart=true`
+4. Restores persistent tunnel assignments for each instance
+
 ## HTTP API Server
 
 Start the server:
@@ -404,7 +454,7 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 | `POST` | `/{name}/stop` | Stop a running installation |
 | `POST` | `/{name}/restart` | Restart an installation |
 | `POST` | `/{name}/deploy` | Deploy a branch, tag, PR, or commit |
-| `PUT` | `/{name}/config` | Update installation config (launch_args) |
+| `PUT` | `/{name}/config` | Update installation config (launch_args, autostart, tunnel_provider, tunnel_domain) |
 | `GET` | `/{name}/logs` | Read logs (with `?lines=N` or `?after=offset`) |
 | `GET` | `/{name}/logs/sessions` | List log sessions |
 | `GET` | `/{name}/nodes` | List custom nodes |
