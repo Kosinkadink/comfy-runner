@@ -56,7 +56,8 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
             mkdir -p "${TAILSCALE_STATE}"
         fi
         mkdir -p /var/run/tailscale
-        tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock &
+        # Use userspace networking — RunPod containers lack /dev/net/tun
+        tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock --tun=userspace-networking &
         # Wait for tailscaled socket to become available (up to 10s)
         for i in $(seq 1 20); do
             [ -S /var/run/tailscale/tailscaled.sock ] && break
