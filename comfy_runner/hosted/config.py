@@ -10,17 +10,6 @@ from typing import Any
 
 from comfy_runner.config import load_config, save_config
 
-DEFAULT_RUNPOD_CONFIG: dict[str, Any] = {
-    "api_key": "",
-    "s3_access_key": "",
-    "s3_secret_key": "",
-    "default_gpu": "NVIDIA L40S",
-    "default_datacenter": "US-KS-2",
-    "default_cloud_type": "SECURE",
-    "cache_releases": 3,
-    "volumes": {},
-}
-
 
 def get_hosted_config() -> dict[str, Any]:
     """Return the full hosted config dict, defaulting to ``{}``."""

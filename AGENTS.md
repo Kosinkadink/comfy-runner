@@ -22,3 +22,29 @@ This applies to: filenames from HTTP responses, user CLI arguments used as direc
 ## When adding or changing server endpoints
 
 Always update `comfy_runner_server/openapi.py` — add a new entry to the `_ROUTES` list for any new endpoint, or update the existing entry if changing an endpoint's schema. The spec is auto-served at `GET /openapi.json` from this file.
+
+## Station subcommand
+
+The `station` subcommand lets users interact with a central comfy-runner fleet server. It reads `station.json` (walks up from cwd) for the server URL and uses `RemoteRunner` for HTTP calls. Key commands:
+
+- `station info` — show config + verify connectivity
+- `station pods [list|create|deploy|start|stop|terminate]` — pod lifecycle via `/pods/*` endpoints
+- `station tests [list|run|fleet|status|report]` — test orchestration via `/tests/*` endpoints
+- `station dashboard` — open fleet dashboard
+- `station jobs` — list active jobs
+
+The station commands talk to the central server's orchestration API (`/pods/*`, `/tests/*`). Direct pod interaction (deploy, status, logs) uses existing `hosted` commands via Tailscale.
+
+## Testing subsystem
+
+The `test` CLI subcommand runs regression tests against ComfyUI instances:
+
+- `test run <suite> --target <spec>` — single target test
+- `test fleet <suite> --target <spec> [--target ...]` — parallel fleet test
+- `test list` — discover test suites
+- `test baseline` — approve outputs as baselines
+- `test report` — regenerate reports
+
+Target specs: `local:<url>`, `remote:<server_url>`, `runpod:<gpu_type>`.
+
+Key modules: `comfy_runner/testing/` (client, runner, suite, fleet, runpod, report, compare/).

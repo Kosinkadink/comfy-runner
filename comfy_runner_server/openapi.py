@@ -43,6 +43,22 @@ _OTHER_ID_PARAM: dict[str, Any] = {
     "description": "Second snapshot identifier for comparison",
 }
 
+_POD_NAME_PARAM: dict[str, Any] = {
+    "name": "name",
+    "in": "path",
+    "required": True,
+    "schema": {"type": "string"},
+    "description": "Pod name (e.g. 'test-l40s')",
+}
+
+_TEST_ID_PARAM: dict[str, Any] = {
+    "name": "test_id",
+    "in": "path",
+    "required": True,
+    "schema": {"type": "string"},
+    "description": "Test run ID (same as the job_id returned by POST /tests/run or /tests/fleet)",
+}
+
 
 def _ok_response(desc: str, extra_props: dict[str, Any] | None = None) -> dict:
     props: dict[str, Any] = {"ok": {"type": "boolean", "example": True}}
@@ -1187,6 +1203,331 @@ _ROUTES: list[dict[str, Any]] = [
                 },
             },
         }),
+    },
+
+    # ── Pods (Central Orchestration) ─────────────────────────────────
+    {
+        "path": "/pods",
+        "method": "get",
+        "tags": ["Pods"],
+        "summary": "List all pods",
+        "description": (
+            "Returns all RunPod pods from config, merged with live status from the RunPod API. "
+            "Includes Tailscale server URLs for pods on the tailnet."
+        ),
+        "responses": _ok_response("Pod list", {
+            "pods": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "id": {"type": "string"},
+                        "status": {"type": "string", "enum": ["RUNNING", "EXITED", "TERMINATED", "UNKNOWN"]},
+                        "gpu_type": {"type": "string"},
+                        "datacenter": {"type": "string"},
+                        "image": {"type": "string"},
+                        "cost_per_hr": {"type": "number"},
+                        "server_url": {"type": "string"},
+                        "comfy_url": {"type": "string"},
+                    },
+                },
+            },
+        }),
+    },
+    {
+        "path": "/pods/create",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Create a RunPod pod (async)",
+        "description": (
+            "Provision a new RunPod GPU pod or reuse an existing one. "
+            "The pod automatically joins the Tailscale tailnet. "
+            "Returns a job_id — poll GET /job/{job_id} to track progress."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string", "description": "Pod name (used as Tailscale hostname: comfy-{name})"},
+                            "gpu_type": {"type": "string", "description": "GPU type (e.g. 'NVIDIA L40S'). Default from config."},
+                            "image": {"type": "string", "description": "Docker image. Default from config."},
+                            "volume_id": {"type": "string", "description": "Attach an existing network volume by ID"},
+                            "volume_size_gb": {"type": "integer", "description": "Create a pod-local volume of this size (GB)"},
+                            "datacenter": {"type": "string", "description": "Datacenter ID (e.g. 'US-KS-2')"},
+                            "cloud_type": {"type": "string", "enum": ["SECURE", "COMMUNITY", "ALL"]},
+                            "gpu_count": {"type": "integer", "default": 1},
+                            "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables"},
+                            "wait_ready": {"type": "boolean", "default": True, "description": "Wait for the pod's comfy-runner server to be reachable"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Pod creation started"),
+    },
+    {
+        "path": "/pods/{name}/deploy",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Deploy to a pod (async)",
+        "description": (
+            "Deploy a PR, branch, tag, or commit to a named RunPod pod. "
+            "The central server connects to the pod's comfy-runner server via Tailscale "
+            "and proxies the deploy operation. Returns a job_id."
+        ),
+        "parameters": [_POD_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "pr": {"type": "integer", "description": "PR number to deploy"},
+                            "branch": {"type": "string", "description": "Branch name to checkout"},
+                            "tag": {"type": "string", "description": "Tag to checkout"},
+                            "commit": {"type": "string", "description": "Commit SHA to checkout"},
+                            "reset": {"type": "boolean", "description": "Reset to original release ref"},
+                            "latest": {"type": "boolean", "description": "Update to latest release"},
+                            "pull": {"type": "boolean", "description": "Re-fetch current PR/branch"},
+                            "install": {"type": "string", "default": "main", "description": "Installation name on pod"},
+                            "start": {"type": "boolean", "default": True, "description": "Start ComfyUI after deploy"},
+                            "repo": {"type": "string", "description": "GitHub repo URL for PR deploy"},
+                            "title": {"type": "string", "description": "PR title for display"},
+                            "launch_args": {"type": "string", "description": "ComfyUI launch arguments"},
+                            "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility"},
+                            "build": {"type": "boolean", "description": "Build standalone env instead of downloading"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Deploy started"),
+    },
+    {
+        "path": "/pods/{name}/stop",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Stop a pod",
+        "description": "Stop a running pod (preserves data, can be restarted later).",
+        "parameters": [_POD_NAME_PARAM],
+        "responses": _ok_response("Pod stopped", {
+            "name": {"type": "string"},
+            "action": {"type": "string", "enum": ["stopped"]},
+        }),
+    },
+    {
+        "path": "/pods/{name}/start",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Start a stopped pod (async)",
+        "description": (
+            "Start a previously stopped pod and optionally wait for the comfy-runner server to be ready. "
+            "Returns a job_id."
+        ),
+        "parameters": [_POD_NAME_PARAM],
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "wait_ready": {"type": "boolean", "default": True, "description": "Wait for server readiness"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Pod start initiated"),
+    },
+    {
+        "path": "/pods/{name}",
+        "method": "delete",
+        "tags": ["Pods"],
+        "summary": "Terminate a pod",
+        "description": "Permanently terminate a pod and remove it from config.",
+        "parameters": [_POD_NAME_PARAM],
+        "responses": _ok_response("Pod terminated", {
+            "name": {"type": "string"},
+            "action": {"type": "string", "enum": ["terminated"]},
+        }),
+    },
+
+    # ── Tests (Central Orchestration) ────────────────────────────────
+    {
+        "path": "/tests/run",
+        "method": "post",
+        "tags": ["Tests"],
+        "summary": "Run a test suite against a target (async)",
+        "description": (
+            "Run a test suite against a single target (local ComfyUI URL, remote pod, or ephemeral RunPod). "
+            "Returns a job_id — poll GET /tests/{test_id} to track progress."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["suite", "target"],
+                        "properties": {
+                            "suite": {"type": "string", "description": "Path to test suite directory"},
+                            "target": {
+                                "type": "object",
+                                "description": "Target to test against",
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["local", "remote", "runpod"]},
+                                    "url": {"type": "string", "description": "ComfyUI URL (local target)"},
+                                    "pod_name": {"type": "string", "description": "Pod name (remote target)"},
+                                    "server_url": {"type": "string", "description": "Explicit server URL (remote target)"},
+                                    "gpu_type": {"type": "string", "description": "GPU type (runpod target)"},
+                                    "install": {"type": "string", "default": "main"},
+                                    "label": {"type": "string", "description": "Human-readable label"},
+                                },
+                            },
+                            "timeout": {"type": "integer", "default": 600, "description": "Per-workflow timeout (seconds)"},
+                            "formats": {"type": "string", "default": "json,html,markdown"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Test run started"),
+    },
+    {
+        "path": "/tests/fleet",
+        "method": "post",
+        "tags": ["Tests"],
+        "summary": "Run a test suite across multiple targets (async)",
+        "description": (
+            "Execute a test suite in parallel across a fleet of targets. "
+            "Each target gets its own subdirectory and report. "
+            "Returns a job_id."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["suite", "targets"],
+                        "properties": {
+                            "suite": {"type": "string", "description": "Path to test suite directory"},
+                            "targets": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {"type": "string", "enum": ["local", "remote", "runpod"]},
+                                        "url": {"type": "string"},
+                                        "pod_name": {"type": "string"},
+                                        "server_url": {"type": "string"},
+                                        "gpu_type": {"type": "string"},
+                                        "install": {"type": "string", "default": "main"},
+                                        "label": {"type": "string"},
+                                    },
+                                },
+                                "description": "List of targets to test against in parallel",
+                            },
+                            "timeout": {"type": "integer", "default": 600},
+                            "max_workers": {"type": "integer", "description": "Max parallel workers (default: min(targets, 4))"},
+                            "formats": {"type": "string", "default": "json,html,markdown"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Fleet test started"),
+    },
+    {
+        "path": "/tests",
+        "method": "get",
+        "tags": ["Tests"],
+        "summary": "List recent test runs",
+        "description": "Returns recent test runs (newest first) with current status from the job tracker.",
+        "parameters": [
+            {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}, "description": "Max runs to return"},
+        ],
+        "responses": _ok_response("Test run list", {
+            "runs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "kind": {"type": "string", "enum": ["single", "fleet"]},
+                        "suite": {"type": "string"},
+                        "status": {"type": "string"},
+                        "targets": {"type": "array", "items": {"type": "object"}},
+                        "created_at": {"type": "number"},
+                        "finished_at": {"type": "number", "nullable": True},
+                        "summary": {"type": "object", "nullable": True},
+                    },
+                },
+            },
+        }),
+    },
+    {
+        "path": "/tests/{test_id}",
+        "method": "get",
+        "tags": ["Tests"],
+        "summary": "Get test run status",
+        "description": (
+            "Returns detailed status for a test run including job output lines, "
+            "test metadata, and results when complete."
+        ),
+        "parameters": [_TEST_ID_PARAM],
+        "responses": _ok_response("Test run details", {
+            "id": {"type": "string"},
+            "kind": {"type": "string"},
+            "suite": {"type": "string"},
+            "status": {"type": "string"},
+            "targets": {"type": "array", "items": {"type": "object"}},
+            "output": {"type": "array", "items": {"type": "string"}},
+            "result": {"type": "object", "nullable": True},
+            "summary": {"type": "object", "nullable": True},
+        }),
+    },
+    {
+        "path": "/tests/{test_id}/report",
+        "method": "get",
+        "tags": ["Tests"],
+        "summary": "Get test report",
+        "description": (
+            "Retrieve the test report in JSON, HTML, or Markdown format. "
+            "For fleet runs, returns the fleet summary report."
+        ),
+        "parameters": [
+            _TEST_ID_PARAM,
+            {"name": "format", "in": "query", "schema": {"type": "string", "default": "json", "enum": ["json", "html", "markdown"]}, "description": "Report format"},
+        ],
+        "responses": _ok_response("Test report", {
+            "test_id": {"type": "string"},
+            "report": {"type": "object", "description": "Report data (JSON format only)"},
+        }),
+    },
+
+    # ── Dashboard ─────────────────────────────────────────────────────
+    {
+        "path": "/dashboard",
+        "method": "get",
+        "tags": ["Dashboard"],
+        "summary": "HTML status dashboard",
+        "description": (
+            "Server-rendered HTML page showing active pods, running tests, and recent results. "
+            "Auto-refreshes every 15 seconds."
+        ),
+        "responses": {
+            "200": {
+                "description": "HTML dashboard page",
+                "content": {"text/html": {"schema": {"type": "string"}}},
+            },
+        },
     },
 ]
 

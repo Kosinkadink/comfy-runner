@@ -13,7 +13,7 @@ from .runpod_api import RunPodAPI
 
 DEFAULT_IMAGE = "ghcr.io/kosinkadink/comfy-runner:latest"
 DEFAULT_PORTS = ["8188/http", "9189/http", "22/tcp"]
-DEFAULT_CUDA_VERSIONS = ["12.4", "12.6", "12.8", "13.0"]
+DEFAULT_CUDA_VERSIONS = ["13.0"]
 
 
 def _pod_info(data: dict[str, Any]) -> PodInfo:
@@ -54,8 +54,8 @@ class RunPodProvider:
             )
         self.api = RunPodAPI(api_key)
         cfg = get_provider_config("runpod")
-        self.default_gpu: str = cfg.get("default_gpu", "NVIDIA L40S")
-        self.default_datacenter: str = cfg.get("default_datacenter", "US-KS-2")
+        self.default_gpu: str = cfg.get("default_gpu", "NVIDIA GeForce RTX 5090")
+        self.default_datacenter: str = cfg.get("default_datacenter", "")
         self.default_cloud_type: str = cfg.get("default_cloud_type", "SECURE")
         self.default_image: str = cfg.get("default_image", DEFAULT_IMAGE)
 

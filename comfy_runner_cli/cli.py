@@ -3003,6 +3003,512 @@ def _hosted_logs(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Station helpers
+# ---------------------------------------------------------------------------
+
+def _find_station_config() -> dict:
+    """Find and load station.json by walking up from cwd.
+
+    Raises RuntimeError if not found.
+    """
+    p = Path.cwd()
+    while True:
+        candidate = p / "station.json"
+        if candidate.is_file():
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    raise RuntimeError(
+        "station.json not found. Run this from a comfy-runner-station directory."
+    )
+
+
+def _station_server(args: argparse.Namespace) -> str:
+    """Return the central server URL from station.json or --server flag."""
+    server = getattr(args, "server", None)
+    if server:
+        return server
+    config = _find_station_config()
+    return config["central_server"]
+
+
+def _station_config(args: argparse.Namespace) -> dict:
+    """Return the full station config."""
+    return _find_station_config()
+
+
+def _resolve_suite_path(suite_name: str) -> str:
+    """Resolve a suite name to a full path.
+
+    Checks: ./test-suites/{name}, then treats as literal path.
+    """
+    # Check test-suites/ relative to station.json location
+    p = Path.cwd()
+    while True:
+        if (p / "station.json").is_file():
+            candidate = p / "test-suites" / suite_name
+            if (candidate / "suite.json").is_file():
+                return str(candidate.resolve())
+            break
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    # Literal path
+    literal = Path(suite_name)
+    if (literal / "suite.json").is_file():
+        return str(literal.resolve())
+    raise RuntimeError(f"Suite not found: {suite_name}")
+
+
+def _parse_station_target(spec: str) -> dict:
+    """Parse a target spec string into a target dict for the API.
+
+    Formats: local:<url>, remote:<pod_name>, runpod:<gpu_type>
+    """
+    if spec.startswith("local:"):
+        url = spec[6:]
+        if "://" not in url:
+            url = f"http://{url}"
+        return {"kind": "local", "url": url}
+    elif spec.startswith("remote:"):
+        return {"kind": "remote", "pod_name": spec[7:]}
+    elif spec.startswith("runpod:"):
+        return {"kind": "runpod", "gpu_type": spec[7:]}
+    else:
+        # Default: treat as local URL
+        url = spec
+        if "://" not in url:
+            url = f"http://{url}"
+        return {"kind": "local", "url": url}
+
+
+# ---------------------------------------------------------------------------
+# Station commands
+# ---------------------------------------------------------------------------
+
+def cmd_station(args: argparse.Namespace) -> None:
+    """Dispatch station subcommands."""
+    action = getattr(args, "station_action", None)
+    if action == "pods":
+        _station_pods(args)
+    elif action == "tests":
+        _station_tests(args)
+    elif action == "dashboard":
+        _station_dashboard(args)
+    elif action == "jobs":
+        _station_jobs(args)
+    elif action == "info":
+        _station_info(args)
+    else:
+        args._parser_station.print_help()
+
+
+def _station_pods(args: argparse.Namespace) -> None:
+    """Handle station pods subcommands."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    pod_action = getattr(args, "station_pod_action", None)
+
+    if pod_action is None or pod_action == "list":
+        # GET /pods
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("GET", "/pods")
+            pods = data.get("pods", [])
+            if args.json:
+                print(json.dumps({"ok": True, "pods": pods}, indent=2))
+                return
+            if not pods:
+                console.print("[dim]No pods configured.[/dim]")
+                return
+            table = Table(title="Pods")
+            table.add_column("Name", style="cyan")
+            table.add_column("Status", style="bold")
+            table.add_column("GPU")
+            table.add_column("$/hr")
+            table.add_column("Server URL", style="dim")
+            for p in pods:
+                status = p.get("status", "?")
+                status_style = {"RUNNING": "green", "EXITED": "yellow", "TERMINATED": "red"}.get(status, "dim")
+                cost = f"${p.get('cost_per_hr', 0):.2f}" if p.get("cost_per_hr") else "-"
+                url = p.get("server_url", "") or "-"
+                table.add_row(p["name"], f"[{status_style}]{status}[/{status_style}]", p.get("gpu_type", ""), cost, url)
+            console.print(table)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "create":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            config = _station_config(args)
+            defaults = config.get("defaults", {})
+            body = {"name": args.pod_name}
+            if getattr(args, "gpu", None):
+                body["gpu_type"] = args.gpu
+            elif defaults.get("gpu_type"):
+                body["gpu_type"] = defaults["gpu_type"]
+            if getattr(args, "image", None):
+                body["image"] = args.image
+            if getattr(args, "datacenter", None):
+                body["datacenter"] = args.datacenter
+            elif defaults.get("datacenter"):
+                body["datacenter"] = defaults["datacenter"]
+            if getattr(args, "no_wait", False):
+                body["wait_ready"] = False
+
+            data = runner._request("POST", "/pods/create", json=body)
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(f"Creating pod [cyan]{args.pod_name}[/cyan] (job: {job_id})...")
+            result = runner.poll_job(job_id, timeout=600, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ Pod [cyan]{args.pod_name}[/cyan] ready.")
+                if result.get("server_url"):
+                    console.print(f"  Server: {result['server_url']}")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "deploy":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            body = {}
+            if getattr(args, "pr", None) is not None:
+                body["pr"] = args.pr
+            if getattr(args, "branch", None):
+                body["branch"] = args.branch
+            if getattr(args, "tag", None):
+                body["tag"] = args.tag
+            if getattr(args, "commit", None):
+                body["commit"] = args.commit
+            if getattr(args, "reset", False):
+                body["reset"] = True
+            if getattr(args, "latest", False):
+                body["latest"] = True
+            if getattr(args, "pull_deploy", False):
+                body["pull"] = True
+
+            data = runner._request("POST", f"/pods/{args.pod_name}/deploy", json=body)
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(f"Deploying to [cyan]{args.pod_name}[/cyan] (job: {job_id})...")
+            result = runner.poll_job(job_id, timeout=600, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ Deploy to [cyan]{args.pod_name}[/cyan] complete.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "stop":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            runner._request("POST", f"/pods/{args.pod_name}/stop")
+            if args.json:
+                print(json.dumps({"ok": True}))
+            else:
+                console.print(f"✓ Pod [cyan]{args.pod_name}[/cyan] stopped.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "start":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("POST", f"/pods/{args.pod_name}/start")
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(f"Starting pod [cyan]{args.pod_name}[/cyan] (job: {job_id})...")
+            result = runner.poll_job(job_id, timeout=600, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ Pod [cyan]{args.pod_name}[/cyan] started.")
+                if result.get("server_url"):
+                    console.print(f"  Server: {result['server_url']}")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "terminate":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            runner._request("DELETE", f"/pods/{args.pod_name}")
+            if args.json:
+                print(json.dumps({"ok": True}))
+            else:
+                console.print(f"✓ Pod [cyan]{args.pod_name}[/cyan] terminated.")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    else:
+        args._parser_station_pods.print_help()
+
+
+def _station_tests(args: argparse.Namespace) -> None:
+    """Handle station tests subcommands."""
+    from comfy_runner.hosted.remote import RemoteRunner
+
+    test_action = getattr(args, "station_test_action", None)
+
+    if test_action is None or test_action == "list":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("GET", "/tests")
+            runs = data.get("runs", [])
+            if args.json:
+                print(json.dumps({"ok": True, "runs": runs}, indent=2))
+                return
+            if not runs:
+                console.print("[dim]No test runs.[/dim]")
+                return
+            table = Table(title="Test Runs")
+            table.add_column("ID", style="cyan")
+            table.add_column("Kind")
+            table.add_column("Status", style="bold")
+            table.add_column("Suite")
+            table.add_column("Targets")
+            for r in runs:
+                status = r.get("status", "?")
+                status_style = {"running": "yellow", "done": "green", "error": "red"}.get(status, "dim")
+                suite_name = Path(r.get("suite", "")).name if r.get("suite") else "-"
+                targets = str(len(r.get("targets", [])))
+                table.add_row(r["id"], r.get("kind", "?"), f"[{status_style}]{status}[/{status_style}]", suite_name, targets)
+            console.print(table)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif test_action == "run":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            suite_path = _resolve_suite_path(args.suite)
+
+            # Parse target spec
+            spec = args.target
+            target = _parse_station_target(spec)
+
+            body = {"suite": suite_path, "target": target}
+            if getattr(args, "timeout", None):
+                body["timeout"] = args.timeout
+
+            data = runner._request("POST", "/tests/run", json=body)
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(f"Test started (job: {job_id})...")
+            result = runner.poll_job(job_id, timeout=3600, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                passed = result.get("passed", 0)
+                total = result.get("total", 0) if result.get("total") else (passed + result.get("failed", 0))
+                failed = result.get("failed", 0)
+                duration = result.get("duration", 0)
+                if failed == 0:
+                    console.print(f"\n[green]✓ All {total} tests passed[/green] ({duration:.1f}s)")
+                else:
+                    console.print(f"\n[red]✗ {failed}/{total} tests failed[/red] ({duration:.1f}s)")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif test_action == "fleet":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            suite_path = _resolve_suite_path(args.suite)
+
+            targets = [_parse_station_target(spec) for spec in args.target]
+
+            body = {"suite": suite_path, "targets": targets}
+            if getattr(args, "timeout", None):
+                body["timeout"] = args.timeout
+            if getattr(args, "max_workers", None):
+                body["max_workers"] = args.max_workers
+
+            data = runner._request("POST", "/tests/fleet", json=body)
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(f"Fleet test started ({len(targets)} targets, job: {job_id})...")
+            result = runner.poll_job(job_id, timeout=3600, on_output=None if args.json else _output)
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                passed = result.get("targets_passed", 0)
+                total = result.get("total_targets", 0)
+                failed = result.get("targets_failed", 0)
+                duration = result.get("total_duration", 0)
+                if failed == 0:
+                    console.print(f"\n[green]✓ All {total} targets passed[/green] ({duration:.1f}s)")
+                else:
+                    console.print(f"\n[red]✗ {failed}/{total} targets failed[/red] ({duration:.1f}s)")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif test_action == "status":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("GET", f"/tests/{args.test_id}")
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print_json(json.dumps(data, indent=2))
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif test_action == "report":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("GET", f"/tests/{args.test_id}/report")
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print_json(json.dumps(data, indent=2))
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    else:
+        args._parser_station_tests.print_help()
+
+
+def _station_dashboard(args: argparse.Namespace) -> None:
+    """Open the station dashboard."""
+    try:
+        config = _station_config(args)
+        url = config.get("dashboard_url", config["central_server"] + "/dashboard")
+        if args.json:
+            print(json.dumps({"ok": True, "url": url}))
+        else:
+            console.print(f"Dashboard: {url}")
+            import webbrowser
+            webbrowser.open(url)
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _station_jobs(args: argparse.Namespace) -> None:
+    """List active jobs on the central server."""
+    from comfy_runner.hosted.remote import RemoteRunner
+    try:
+        runner = RemoteRunner(_station_server(args))
+        data = runner._request("GET", "/jobs")
+        jobs = data.get("jobs", [])
+        if args.json:
+            print(json.dumps({"ok": True, "jobs": jobs}, indent=2))
+            return
+        if not jobs:
+            console.print("[dim]No active jobs.[/dim]")
+            return
+        table = Table(title="Active Jobs")
+        table.add_column("ID", style="cyan")
+        table.add_column("Status", style="bold")
+        table.add_column("Label")
+        for j in jobs:
+            status = j.get("status", "?")
+            status_style = {"running": "yellow", "done": "green", "error": "red"}.get(status, "dim")
+            table.add_row(j["id"], f"[{status_style}]{status}[/{status_style}]", j.get("label", ""))
+        console.print(table)
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+def _station_info(args: argparse.Namespace) -> None:
+    """Show station config and server status."""
+    from comfy_runner.hosted.remote import RemoteRunner
+    try:
+        config = _station_config(args)
+        server = config["central_server"]
+        if args.json:
+            result = {"ok": True, "station": config}
+            try:
+                runner = RemoteRunner(server)
+                sys_info = runner.get_system_info()
+                result["server_info"] = sys_info
+                result["connected"] = True
+            except Exception:
+                result["connected"] = False
+            print(json.dumps(result, indent=2))
+        else:
+            console.print(f"[bold]Central server:[/bold]  {server}")
+            console.print(f"[bold]Tailnet domain:[/bold]  {config.get('tailnet_domain', '?')}")
+            console.print(f"[bold]Dashboard:[/bold]       {config.get('dashboard_url', '?')}")
+            defaults = config.get("defaults", {})
+            if defaults:
+                console.print(f"[bold]Default GPU:[/bold]     {defaults.get('gpu_type', '?')}")
+                console.print(f"[bold]Default DC:[/bold]      {defaults.get('datacenter', '?')}")
+            console.print()
+            try:
+                runner = RemoteRunner(server)
+                info = runner.get_system_info()
+                console.print(f"[green]✓ Connected[/green]")
+                console.print(f"  OS:     {info.get('os_distro', '?')}")
+                console.print(f"  CPU:    {info.get('cpu_model', '?')}")
+                for gpu in info.get("gpus", []):
+                    vram = gpu.get("vram_mb", 0)
+                    vram_str = f"{vram / 1024:.0f} GB" if vram else "?"
+                    console.print(f"  GPU:    {gpu.get('model', '?')} ({vram_str})")
+            except Exception as e:
+                console.print(f"[yellow]✗ Not connected[/yellow]: {e}")
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -3482,6 +3988,86 @@ def main(argv: list[str] | None = None) -> None:
     p_tunnel_config.add_argument("--rm-domain", help="Remove a domain from the ngrok domain pool")
 
     p_tunnel.set_defaults(func=cmd_tunnel, _parser_tunnel=p_tunnel)
+
+    # station
+    p_station = sub.add_parser("station", help="Interact with a central comfy-runner fleet server")
+    station_sub = p_station.add_subparsers(dest="station_action")
+
+    # station info
+    station_sub.add_parser("info", help="Show station config and server connectivity")
+
+    # station dashboard
+    station_sub.add_parser("dashboard", help="Open the fleet dashboard in browser")
+
+    # station jobs
+    station_sub.add_parser("jobs", help="List active jobs on the central server")
+
+    # station pods
+    p_st_pods = station_sub.add_parser("pods", help="Manage fleet pods")
+    st_pods_sub = p_st_pods.add_subparsers(dest="station_pod_action")
+
+    st_pods_sub.add_parser("list", help="List all pods")
+
+    p_st_pod_create = st_pods_sub.add_parser("create", help="Create a new pod")
+    p_st_pod_create.add_argument("pod_name", help="Pod name")
+    p_st_pod_create.add_argument("--gpu", "-g", help="GPU type (default: from station config)")
+    p_st_pod_create.add_argument("--image", "-i", help="Docker image")
+    p_st_pod_create.add_argument("--datacenter", help="Datacenter ID")
+    p_st_pod_create.add_argument("--no-wait", action="store_true", help="Don't wait for server readiness")
+
+    p_st_pod_deploy = st_pods_sub.add_parser("deploy", help="Deploy a PR/branch/commit to a pod")
+    p_st_pod_deploy.add_argument("pod_name", help="Pod name")
+    deploy_group = p_st_pod_deploy.add_mutually_exclusive_group(required=True)
+    deploy_group.add_argument("--pr", type=int, help="PR number")
+    deploy_group.add_argument("--branch", help="Branch name")
+    deploy_group.add_argument("--tag", help="Tag")
+    deploy_group.add_argument("--commit", help="Commit SHA")
+    deploy_group.add_argument("--reset", action="store_true", help="Reset to original release")
+    deploy_group.add_argument("--latest", action="store_true", help="Update to latest release")
+    deploy_group.add_argument("--pull", dest="pull_deploy", action="store_true", help="Re-fetch current PR/branch")
+
+    p_st_pod_stop = st_pods_sub.add_parser("stop", help="Stop a pod")
+    p_st_pod_stop.add_argument("pod_name", help="Pod name")
+
+    p_st_pod_start = st_pods_sub.add_parser("start", help="Start a stopped pod")
+    p_st_pod_start.add_argument("pod_name", help="Pod name")
+
+    p_st_pod_terminate = st_pods_sub.add_parser("terminate", help="Terminate a pod permanently")
+    p_st_pod_terminate.add_argument("pod_name", help="Pod name")
+
+    p_st_pods.set_defaults(_parser_station_pods=p_st_pods)
+
+    # station tests
+    p_st_tests = station_sub.add_parser("tests", help="Run and manage fleet tests")
+    st_tests_sub = p_st_tests.add_subparsers(dest="station_test_action")
+
+    st_tests_sub.add_parser("list", help="List recent test runs")
+
+    p_st_test_run = st_tests_sub.add_parser("run", help="Run a test suite against a target")
+    p_st_test_run.add_argument("suite", help="Suite name (from test-suites/) or path")
+    p_st_test_run.add_argument("--target", "-t", required=True,
+                               help="Target: local:<url>, remote:<pod_name>, runpod:<gpu_type>")
+    p_st_test_run.add_argument("--timeout", type=int, help="Per-workflow timeout (seconds)")
+
+    p_st_test_fleet = st_tests_sub.add_parser("fleet", help="Run a test suite across multiple targets")
+    p_st_test_fleet.add_argument("suite", help="Suite name or path")
+    p_st_test_fleet.add_argument("--target", "-t", action="append", required=True,
+                                 help="Target spec (repeatable)")
+    p_st_test_fleet.add_argument("--timeout", type=int, help="Per-workflow timeout (seconds)")
+    p_st_test_fleet.add_argument("--max-workers", type=int, help="Max parallel workers")
+
+    p_st_test_status = st_tests_sub.add_parser("status", help="Check test run status")
+    p_st_test_status.add_argument("test_id", help="Test run ID")
+
+    p_st_test_report = st_tests_sub.add_parser("report", help="Get test report")
+    p_st_test_report.add_argument("test_id", help="Test run ID")
+
+    p_st_tests.set_defaults(_parser_station_tests=p_st_tests)
+
+    # Global --server override for station commands
+    p_station.add_argument("--server", help="Override central server URL (default: from station.json)")
+
+    p_station.set_defaults(func=cmd_station, _parser_station=p_station)
 
     effective_argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(effective_argv)
