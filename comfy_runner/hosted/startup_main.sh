@@ -68,7 +68,7 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
 
         TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
         TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
-        if timeout 30 tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}" 2>&1; then
+        if timeout 30 tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}" --force-reauth 2>&1; then
             log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
             # Don't pass --tailscale to the server — pods serve plain HTTP.
             # Tailscale provides the encrypted tunnel; tailscale serve (HTTPS)
