@@ -2097,9 +2097,15 @@ def create_app() -> Any:
 def run_server(
     host: str = "127.0.0.1",
     port: int = 9189,
+    tailscale: bool = False,
+    tunnels: bool = False,
 ) -> None:
     """Start the control server (blocking)."""
+    global _tailscale_mode, _tunnels_enabled
     from waitress import serve
+
+    _tailscale_mode = tailscale
+    _tunnels_enabled = tunnels
 
     # Ensure job lifecycle messages appear on the console
     if not log.handlers:
@@ -2111,5 +2117,7 @@ def run_server(
 
     app = create_app()
     log.info("Starting comfy-runner control server on %s:%d", host, port)
+    if tailscale:
+        log.info("Tailscale integration enabled")
     print(f"comfy-runner server listening on http://{host}:{port}")
     serve(app, host=host, port=port, threads=8)
