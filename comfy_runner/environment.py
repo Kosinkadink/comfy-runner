@@ -659,11 +659,29 @@ def _safe_tar_extractall(
         send_output(f"\r  Extracted {total}/{total} files (100%)\n")
 
 
-def _find_7z() -> str | None:
-    """Locate native 7z executable. Returns path string, or None if not found."""
+def _find_7z(
+    send_output: Callable[[str], None] | None = None,
+) -> str | None:
+    """Locate native 7z executable. Returns path string, or None if not found.
+
+    Search order:
+    1. Bundled binary (~/.comfy-runner/bin/)
+    2. System PATH
+    3. Common Windows install locations
+    4. Auto-download bundled binary
+    """
+    # 1. Check bundled binary first (fastest)
+    from .sevenzip import get_bundled_7z
+    bundled = get_bundled_7z()
+    if bundled:
+        return bundled
+
+    # 2. System PATH
     found = shutil.which("7z")
     if found:
         return found
+
+    # 3. Common Windows install locations
     if sys.platform == "win32":
         for candidate in (
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "7-Zip" / "7z.exe",
@@ -672,7 +690,10 @@ def _find_7z() -> str | None:
         ):
             if candidate.exists():
                 return str(candidate)
-    return None
+
+    # 4. Auto-download
+    from .sevenzip import ensure_7z
+    return ensure_7z(send_output=send_output)
 
 
 def _extract_7z_native(
@@ -864,7 +885,7 @@ def _extract_archive(
         with tarfile.open(archive_path, "r:") as tar:
             _safe_tar_extractall(tar, dest, send_output)
     elif name.endswith(".7z") or name.endswith(".001"):
-        seven_zip = _find_7z()
+        seven_zip = _find_7z(send_output=send_output)
         if seven_zip:
             if send_output:
                 send_output("Using native 7z for extraction (fast path)...\n")

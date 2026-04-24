@@ -75,6 +75,18 @@ def _err(msg: str, status: int = 400) -> tuple[Any, int]:
     return jsonify({"ok": False, "error": msg}), status
 
 
+def _validate_env_dict(env: Any) -> str | None:
+    """Return an error message if *env* is not a valid ``dict[str, str]``, else None."""
+    if env is None:
+        return None
+    if not isinstance(env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in env.items()
+    ):
+        return "'env' must be a dict of string key-value pairs"
+    return None
+
+
 def _get_record(name: str) -> tuple[dict | None, str]:
     """Get an installation record, returning (record, error_msg)."""
     from comfy_runner.config import get_installation
@@ -242,6 +254,15 @@ def _get_install_lock(name: str) -> threading.Lock:
         if name not in _install_locks:
             _install_locks[name] = threading.Lock()
         return _install_locks[name]
+
+
+def _force_release_lock(name: str) -> bool:
+    """Replace a stuck lock with a fresh one. Returns True if a lock existed."""
+    with _install_locks_guard:
+        if name in _install_locks:
+            _install_locks[name] = threading.Lock()
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +463,7 @@ def create_app() -> Any:
                 "head_commit": record.get("head_commit"),
                 "python_version": record.get("python_version"),
                 "launch_args": record.get("launch_args"),
+                "env": record.get("env", {}),
                 "created_at": record.get("created_at"),
                 "deployed_pr": record.get("deployed_pr"),
                 "deployed_branch": record.get("deployed_branch"),
@@ -508,6 +530,7 @@ def create_app() -> Any:
                     out(f"Installation '{name}' not found — initializing...\n")
                     try:
                         cuda_compat = body.get("cuda_compat", False)
+                        variant = body.get("variant")
                         from comfy_runner.hosted.config import get_provider_config
                         prov_cfg = get_provider_config("runpod")
                         cache_releases = prov_cfg.get("cache_releases")
@@ -524,6 +547,7 @@ def create_app() -> Any:
                                     build_kw[bk] = body[bk]
                         init_installation(
                             name=name, send_output=out, cuda_compat=cuda_compat,
+                            variant=variant,
                             **cache_kw, **build_kw,
                         )
                     except Exception as e:
@@ -636,6 +660,10 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
+        env_overrides = body.get("env")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"restart {name}")
 
@@ -660,7 +688,7 @@ def create_app() -> Any:
                 except RuntimeError:
                     pass
 
-                result = start_installation(name, port_override=running_port, extra_args=extra_args, send_output=out)
+                result = start_installation(name, port_override=running_port, extra_args=extra_args, env_overrides=env_overrides, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
@@ -708,6 +736,14 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # POST /<name>/unlock — force-release a stuck installation lock
+    # ------------------------------------------------------------------
+    @app.route("/<name>/unlock", methods=["POST"])
+    def route_unlock(name: str) -> Any:
+        had_lock = _force_release_lock(name)
+        return jsonify({"ok": True, "lock_reset": had_lock})
+
+    # ------------------------------------------------------------------
     # DELETE /<name>
     # ------------------------------------------------------------------
     @app.route("/<name>", methods=["DELETE"])
@@ -753,10 +789,14 @@ def create_app() -> Any:
             return _err(err, 404)
 
         body = request.get_json(silent=True) or {}
-        allowed_keys = {"launch_args"}
+        allowed_keys = {"launch_args", "env"}
         updated = {}
         for key in allowed_keys:
             if key in body:
+                if key == "env":
+                    env_err = _validate_env_dict(body[key])
+                    if env_err:
+                        return _err(env_err)
                 record[key] = body[key]
                 updated[key] = body[key]
 
@@ -1433,6 +1473,64 @@ def create_app() -> Any:
         return jsonify({"ok": True, "removed": removed})
 
     # ------------------------------------------------------------------
+    # POST /<name>/move-model
+    # ------------------------------------------------------------------
+    @app.route("/<name>/move-model", methods=["POST"])
+    def route_move_model(name: str) -> Any:
+        from comfy_runner.workflow_models import resolve_models_dir, _validate_model_path
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        from_directory = body.get("from_directory", "")
+        to_directory = body.get("to_directory", "")
+        filename = body.get("name", "")
+        copy = body.get("copy", False)
+
+        if not from_directory:
+            return _err("Missing 'from_directory' field")
+        if not to_directory:
+            return _err("Missing 'to_directory' field")
+        if not filename:
+            return _err("Missing 'name' field")
+
+        try:
+            models_dir = resolve_models_dir(record["path"])
+
+            src = _validate_model_path(models_dir, from_directory, filename)
+            dst = _validate_model_path(models_dir, to_directory, filename)
+
+            if not src.is_file():
+                return _err(f"Source not found: {from_directory}/{filename}", 404)
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if dst.exists():
+                return _err(f"Destination already exists: {to_directory}/{filename}")
+
+            import shutil
+            if copy:
+                shutil.copy2(str(src), str(dst))
+            else:
+                shutil.move(str(src), str(dst))
+
+            action = "copied" if copy else "moved"
+            return jsonify({
+                "ok": True,
+                "action": action,
+                "name": filename,
+                "from_directory": from_directory,
+                "to_directory": to_directory,
+            })
+        except ValueError as e:
+            return _err(str(e))
+        except Exception as e:
+            log.error("Move/copy failed for '%s': %s", name, e)
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # POST /<name>/workflow-models  (async — returns job_id)
     # ------------------------------------------------------------------
     @app.route("/<name>/workflow-models", methods=["POST"])
@@ -1509,6 +1607,10 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
+        env_overrides = body.get("env")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"start {name}")
 
@@ -1530,7 +1632,7 @@ def create_app() -> Any:
                 rec = get_installation(name)
                 install_path = rec["path"] if rec else ""
 
-                result = start_installation(name, extra_args=extra_args, send_output=out)
+                result = start_installation(name, extra_args=extra_args, env_overrides=env_overrides, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
@@ -1753,14 +1855,29 @@ def create_app() -> Any:
         import sys
 
         repo_dir = Path(__file__).resolve().parent.parent
+        body = request.get_json(silent=True) or {}
+        force = body.get("force", False)
 
-        # git pull
+        # git pull (or force-reset)
         try:
-            result = subprocess.run(
-                ["git", "pull", "--ff-only"],
+            # Always fetch first
+            subprocess.run(
+                ["git", "fetch", "--all"],
                 cwd=str(repo_dir),
                 capture_output=True, text=True, timeout=30,
             )
+            if force:
+                result = subprocess.run(
+                    ["git", "reset", "--hard", "origin/main"],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=30,
+                )
+            else:
+                result = subprocess.run(
+                    ["git", "pull", "--ff-only"],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=30,
+                )
             pull_output = result.stdout.strip()
             if result.returncode != 0:
                 return _err(f"git pull failed: {result.stderr.strip()}")
@@ -1771,6 +1888,22 @@ def create_app() -> Any:
 
         if already_up_to_date:
             return jsonify({"ok": True, "updated": False, "message": pull_output})
+
+        # Install any new/changed dependencies before restarting
+        req_file = repo_dir / "requirements.txt"
+        deps_output = ""
+        if req_file.exists():
+            try:
+                pip_result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=120,
+                )
+                deps_output = pip_result.stdout.strip()
+                if pip_result.returncode != 0:
+                    log.warning("pip install failed during self-update: %s", pip_result.stderr.strip())
+            except Exception as e:
+                log.warning("pip install failed during self-update: %s", e)
 
         # Schedule restart after response is sent
         def _restart() -> None:

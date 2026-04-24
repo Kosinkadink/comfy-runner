@@ -175,15 +175,21 @@ def deploy_ref(
             if rc != 0 and send_output:
                 send_output("Warning: fetch failed, trying checkout anyway\n")
 
-    # For branches, try remote/<ref> first (detached HEAD avoids local branch issues)
-    target = ref
-    if git_rev_parse(repo, f"{remote}/{ref}") is not None:
-        target = f"{remote}/{ref}"
+    # For branches, create/update a local branch tracking the remote ref.
+    # This avoids detached HEAD which breaks tools like ComfyUI-Manager
+    # that expect a local branch (e.g. `repo.heads.master`).
+    remote_ref = f"{remote}/{ref}"
+    is_branch = git_rev_parse(repo, remote_ref) is not None
 
     if send_output:
         send_output(f"Checking out {ref}...\n")
 
-    rc = git_checkout(repo, target, send_output)
+    if is_branch:
+        # -B creates or resets the local branch to match the remote
+        rc = git_checkout(repo, ["-B", ref, remote_ref], send_output)
+    else:
+        # Tags, commits, etc. — detached HEAD is expected
+        rc = git_checkout(repo, ref, send_output)
     if rc != 0:
         raise RuntimeError(f"Failed to checkout {ref} (exit code {rc})")
 

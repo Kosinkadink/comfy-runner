@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import subprocess
@@ -12,10 +13,11 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDO
 
 
 def _git_env() -> dict[str, str]:
-    """Build environment for git commands with optional GitHub token auth.
+    """Build environment for git commands.
 
-    Injects GITHUB_TOKEN as HTTPS credentials via git config env vars,
-    enabling clone/fetch from private repos without a credential helper.
+    Disables interactive prompts so git never blocks on auth dialogs.
+    When a GitHub token is available, injects it via an HTTP Authorization
+    header (not URL rewriting) to avoid polluting Windows Credential Manager.
     """
     from .config import get_github_token
 
@@ -23,12 +25,11 @@ def _git_env() -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     token = get_github_token()
     if token:
-        env["GIT_ASKPASS"] = "echo"
+        # Encode as Basic auth with x-access-token as username
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         env["GIT_CONFIG_COUNT"] = "1"
-        env["GIT_CONFIG_KEY_0"] = (
-            f"url.https://x-access-token:{token}@github.com/.insteadOf"
-        )
-        env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+        env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {basic}"
     return env
 
 

@@ -22,6 +22,23 @@ from comfy_runner.lifecycle import maybe_tailscale_serve, maybe_tailscale_unserv
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_env_args(env_list: list[str] | None) -> dict[str, str] | None:
+    """Parse ['KEY=VALUE', ...] into a dict. Returns None if empty."""
+    if not env_list:
+        return None
+    result = {}
+    for item in env_list:
+        if "=" not in item:
+            raise ValueError(f"Invalid env format '{item}' — expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        result[key] = value
+    return result or None
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -284,6 +301,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     out = None if args.json else _output
     try:
+        env_overrides = _parse_env_args(args.env)
         if args.background:
             result = start_installation(
                 name=name,
@@ -291,6 +309,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 port_conflict=pc,
                 extra_args=extra,
                 send_output=out,
+                env_overrides=env_overrides,
             )
             if result.get("port"):
                 maybe_tailscale_serve(result["port"], send_output=out)
@@ -305,6 +324,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                     port_conflict=pc,
                     extra_args=extra,
                     send_output=None,
+                    env_overrides=env_overrides,
                 )
                 if result.get("port"):
                     maybe_tailscale_serve(result["port"])
@@ -316,6 +336,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                     port_conflict=pc,
                     extra_args=extra,
                     send_output=_output,
+                    env_overrides=env_overrides,
                 )
     except Exception as e:
         if args.json:
@@ -355,6 +376,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
     name = args.name
     out = None if args.json else _output
     try:
+        env_overrides = _parse_env_args(args.env)
         # Unserve old port before stopping
         status = get_status(name)
         if status.get("port"):
@@ -371,6 +393,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
             name=name,
             port_override=args.port,
             send_output=out,
+            env_overrides=env_overrides,
         )
         if result.get("port"):
             maybe_tailscale_serve(result["port"], send_output=out)
@@ -729,6 +752,60 @@ def cmd_config(args: argparse.Namespace) -> None:
                     console.print(f"  tunnel.{provider}:  {json.dumps(pcfg)}")
     else:
         console.print("[dim]Usage: comfy-runner config {show,set}[/dim]")
+
+
+def cmd_config_env(args: argparse.Namespace) -> None:
+    """Manage persistent environment variables for an installation."""
+    from comfy_runner.config import get_installation, set_installation
+
+    name = args.name
+    action = args.env_action
+
+    record = get_installation(name)
+    if not record:
+        if args.json:
+            print(json.dumps({"ok": False, "error": f"Installation '{name}' not found."}))
+            sys.exit(1)
+        console.print(f"[red]Installation '{name}' not found.[/red]")
+        sys.exit(1)
+
+    env = dict(record.get("env", {}) or {})
+
+    if action == "list":
+        if args.json:
+            print(json.dumps({"ok": True, "env": env}, indent=2))
+        elif not env:
+            console.print("[dim]No environment variables set.[/dim]")
+        else:
+            table = Table(title=f"Environment Variables: {name}")
+            table.add_column("Key", style="cyan")
+            table.add_column("Value", style="green")
+            for k, v in sorted(env.items()):
+                table.add_row(k, v)
+            console.print(table)
+
+    elif action == "set":
+        key, value = args.key, args.value
+        env[key] = value
+        record["env"] = env
+        set_installation(name, record)
+        if args.json:
+            print(json.dumps({"ok": True, "key": key, "value": value}))
+        else:
+            console.print(f"[green]Set {key}={value}[/green]")
+
+    elif action == "unset":
+        key = args.key
+        removed = env.pop(key, None)
+        record["env"] = env
+        set_installation(name, record)
+        if args.json:
+            print(json.dumps({"ok": True, "key": key, "removed": removed is not None}))
+        else:
+            if removed is not None:
+                console.print(f"[yellow]Removed {key}[/yellow]")
+            else:
+                console.print(f"[dim]{key} was not set[/dim]")
 
 
 def cmd_server(args: argparse.Namespace) -> None:
@@ -2525,6 +2602,24 @@ def main(argv: list[str] | None = None) -> None:
 
     p_config.set_defaults(func=cmd_config)
 
+    # config env
+    p_config_env = config_sub.add_parser("env", help="Manage persistent environment variables")
+    config_env_sub = p_config_env.add_subparsers(dest="env_action")
+
+    p_env_list = config_env_sub.add_parser("list", help="List environment variables")
+    p_env_list.add_argument("name", nargs="?", default="main")
+
+    p_env_set = config_env_sub.add_parser("set", help="Set an environment variable")
+    p_env_set.add_argument("name", nargs="?", default="main")
+    p_env_set.add_argument("key", help="Variable name")
+    p_env_set.add_argument("value", help="Variable value")
+
+    p_env_unset = config_env_sub.add_parser("unset", help="Remove an environment variable")
+    p_env_unset.add_argument("name", nargs="?", default="main")
+    p_env_unset.add_argument("key", help="Variable name to remove")
+
+    p_config_env.set_defaults(func=cmd_config_env)
+
     # start
     p_start = sub.add_parser("start", help="Start a ComfyUI installation")
     p_start.add_argument("name", nargs="?", default="main", help="Installation name (default: main)")
@@ -2533,6 +2628,8 @@ def main(argv: list[str] | None = None) -> None:
                          help="Port conflict mode: auto=find next free port, fail=error (default: auto)")
     p_start.add_argument("--background", "-b", action="store_true", help="Run in background (detached)")
     p_start.add_argument("--extra-args", "-e", default="", help="Extra args to pass to ComfyUI")
+    p_start.add_argument("--env", action="append", metavar="KEY=VALUE",
+                         help="Set environment variable for this run (repeatable)")
     p_start.set_defaults(func=cmd_start)
 
     # stop
@@ -2544,6 +2641,8 @@ def main(argv: list[str] | None = None) -> None:
     p_restart = sub.add_parser("restart", help="Restart a ComfyUI installation")
     p_restart.add_argument("name", nargs="?", default="main", help="Installation name (default: main)")
     p_restart.add_argument("--port", "-p", type=int, help="Override port (default: 8188)")
+    p_restart.add_argument("--env", action="append", metavar="KEY=VALUE",
+                           help="Set environment variable for this run (repeatable)")
     p_restart.set_defaults(func=cmd_restart)
 
     # status

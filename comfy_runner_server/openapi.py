@@ -269,6 +269,20 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
     {
+        "path": "/{name}/unlock",
+        "method": "post",
+        "tags": ["Process"],
+        "summary": "Force-release installation lock",
+        "description": (
+            "Replaces the in-memory lock for this installation with a fresh one. "
+            "Use when an installation is stuck in 'busy' state due to a hung job."
+        ),
+        "parameters": [_NAME_PARAM],
+        "responses": _ok_response("Lock reset", {
+            "lock_reset": {"type": "boolean", "description": "True if a lock existed and was replaced"},
+        }),
+    },
+    {
         "path": "/{name}",
         "method": "delete",
         "tags": ["Installations"],
@@ -391,6 +405,13 @@ _ROUTES: list[dict[str, Any]] = [
                                 "description": (
                                     "Auto-detect host NVIDIA driver and swap torch CUDA build if needed during auto-init. "
                                     "Only applies when the installation doesn't exist yet and is created automatically."
+                                ),
+                            },
+                            "variant": {
+                                "type": "string",
+                                "description": (
+                                    "Force a specific variant for auto-init (e.g. 'linux-nvidia', 'win-nvidia'). "
+                                    "Only applies when the installation doesn't exist yet."
                                 ),
                             },
                         },
@@ -817,6 +838,40 @@ _ROUTES: list[dict[str, Any]] = [
         },
         "responses": _ok_response("Staging deleted", {
             "removed": {"type": "boolean"},
+        }),
+    },
+    {
+        "path": "/{name}/move-model",
+        "method": "post",
+        "tags": ["Models"],
+        "summary": "Move or copy a model",
+        "description": (
+            "Moves or copies a model file between subdirectories under models/. "
+            "Set copy=true to copy instead of move. Fails if the destination already exists."
+        ),
+        "parameters": [_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["from_directory", "to_directory", "name"],
+                        "properties": {
+                            "from_directory": {"type": "string", "description": "Source subdirectory under models/ (e.g. 'diffusion_models')"},
+                            "to_directory": {"type": "string", "description": "Destination subdirectory under models/ (e.g. 'checkpoints')"},
+                            "name": {"type": "string", "description": "Filename to move or copy"},
+                            "copy": {"type": "boolean", "description": "If true, copy instead of move (default: false)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Model moved/copied", {
+            "action": {"type": "string", "enum": ["moved", "copied"]},
+            "name": {"type": "string"},
+            "from_directory": {"type": "string"},
+            "to_directory": {"type": "string"},
         }),
     },
     {

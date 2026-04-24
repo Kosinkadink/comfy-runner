@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from comfy_runner.config import get_github_token
 from .config import get_provider_config, get_runpod_api_key
 
 import os
@@ -58,12 +59,6 @@ class RunPodProvider:
         self.default_cloud_type: str = cfg.get("default_cloud_type", "SECURE")
         self.default_image: str = cfg.get("default_image", DEFAULT_IMAGE)
 
-    @staticmethod
-    def _get_github_token() -> str:
-        """Get GitHub token for private repo cloning on pods."""
-        from comfy_runner.config import get_github_token
-        return get_github_token()
-
     # ------------------------------------------------------------------
     # Pod methods
     # ------------------------------------------------------------------
@@ -102,9 +97,9 @@ class RunPodProvider:
             params["networkVolumeId"] = volume_id
         elif volume_size_gb is not None:
             params["volumeInGb"] = volume_size_gb
-        # Build env vars — inject GITHUB_TOKEN for private repo cloning
+        # Build env vars — pass GITHUB_TOKEN for API rate limits
         pod_env: dict[str, str] = {}
-        github_token = self._get_github_token()
+        github_token = get_github_token()
         if github_token:
             pod_env["GITHUB_TOKEN"] = github_token
         if env is not None:

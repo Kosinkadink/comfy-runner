@@ -10,15 +10,8 @@
 
 set -euo pipefail
 
-REPO_BASE="${COMFY_RUNNER_REPO:-https://github.com/Kosinkadink/comfy-runner.git}"
+REPO_URL="${COMFY_RUNNER_REPO:-https://github.com/Kosinkadink/comfy-runner.git}"
 REPO_BRANCH="${COMFY_RUNNER_BRANCH:-main}"
-
-# If GITHUB_TOKEN is set, inject it into the clone URL for private repos
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    REPO_URL=$(echo "${REPO_BASE}" | sed "s|https://|https://${GITHUB_TOKEN}@|")
-else
-    REPO_URL="${REPO_BASE}"
-fi
 INSTALL_DIR="/opt/comfy-runner"
 
 log() { echo "[comfy-runner] $(date '+%H:%M:%S') $*"; }
