@@ -151,7 +151,10 @@ class RunPodProvider:
         ts_domain = get_provider_config("runpod").get("tailscale_domain", "")
         if not ts_domain:
             return None
-        return f"https://comfy-{pod_name}.{ts_domain}:{port}"
+        # Use HTTP — Tailscale in userspace-networking mode (required on RunPod)
+        # doesn't support tailscale serve (HTTPS proxy), but the Tailscale
+        # tunnel itself provides encryption.
+        return f"http://comfy-{pod_name}.{ts_domain}:{port}"
 
     # ------------------------------------------------------------------
     # Volume methods
