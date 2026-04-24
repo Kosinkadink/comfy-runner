@@ -47,13 +47,27 @@ def cmd_init(args: argparse.Namespace) -> None:
     from comfy_runner.installations import init_installation
 
     try:
+        # Parse --torch-spec into a list if provided
+        torch_spec = None
+        if getattr(args, "torch_spec", None):
+            torch_spec = args.torch_spec
+
         record = init_installation(
             name=args.name,
-            variant=args.variant,
-            release_tag=args.release,
-            install_dir=args.dir,
+            variant=getattr(args, "variant", None),
+            release_tag=getattr(args, "release", None),
+            install_dir=getattr(args, "dir", None),
             send_output=None if args.json else _output,
             cuda_compat=getattr(args, "cuda_compat", False),
+            build=getattr(args, "build", False),
+            python_version=getattr(args, "python_version", None),
+            pbs_release=getattr(args, "pbs_release", None),
+            gpu=getattr(args, "gpu", None),
+            cuda_tag=getattr(args, "cuda_tag", None),
+            torch_version=getattr(args, "torch_version", None),
+            torch_spec=torch_spec,
+            torch_index_url=getattr(args, "torch_index_url", None),
+            comfyui_ref=getattr(args, "comfyui_ref", None),
         )
         if args.json:
             print(json.dumps({"ok": True, "installation": record}, indent=2))
@@ -2529,7 +2543,19 @@ def main(argv: list[str] | None = None) -> None:
     p_init.add_argument("--release", "-r", help="Specific release tag (e.g. v0.2.1)")
     p_init.add_argument("--dir", "-d", help="Custom installation directory")
     p_init.add_argument("--cuda-compat", action="store_true", default=False,
-                        help="Auto-detect host NVIDIA driver and swap torch CUDA build if needed")
+                         help="Auto-detect host NVIDIA driver and swap torch CUDA build if needed")
+    p_init.add_argument("--comfyui-ref", help="ComfyUI branch/tag/commit to checkout")
+    # Ad-hoc build options
+    p_init.add_argument("--build", action="store_true", default=False,
+                         help="Build standalone env locally instead of downloading a pre-built release")
+    p_init.add_argument("--python-version", help="Python version for ad-hoc build (e.g. 3.12, 3.13.12)")
+    p_init.add_argument("--pbs-release", help="python-build-standalone release tag (e.g. 20260211)")
+    p_init.add_argument("--gpu", help="GPU type override (nvidia/amd/intel/mps/cpu)")
+    p_init.add_argument("--cuda-tag", help="CUDA/ROCm/XPU tag (e.g. cu128, cu130, rocm7.1, xpu)")
+    p_init.add_argument("--torch-version", help="PyTorch version (e.g. 2.10.0)")
+    p_init.add_argument("--torch-spec", nargs="+",
+                         help="Full custom torch package specs (e.g. torch==2.10.0+cu128 torchvision==0.25.0+cu128)")
+    p_init.add_argument("--torch-index-url", help="Custom PyTorch index URL")
     p_init.set_defaults(func=cmd_init)
 
     # releases

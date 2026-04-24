@@ -537,10 +537,18 @@ def create_app() -> Any:
                         cache_kw: dict = {}
                         if isinstance(cache_releases, int):
                             cache_kw["max_cache_entries"] = cache_releases
+                        build_kw: dict = {}
+                        if body.get("build"):
+                            build_kw["build"] = True
+                            for bk in ("python_version", "pbs_release", "gpu",
+                                       "cuda_tag", "torch_version", "torch_spec",
+                                       "torch_index_url", "comfyui_ref"):
+                                if bk in body:
+                                    build_kw[bk] = body[bk]
                         init_installation(
                             name=name, send_output=out, cuda_compat=cuda_compat,
                             variant=variant,
-                            **cache_kw,
+                            **cache_kw, **build_kw,
                         )
                     except Exception as e:
                         _jobs.fail(job_id, f"Auto-init failed: {e}", lines)

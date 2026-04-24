@@ -902,6 +902,562 @@ def _extract_archive(
 
 
 # ---------------------------------------------------------------------------
+# Ad-hoc build — construct standalone-env locally without pre-built releases
+# ---------------------------------------------------------------------------
+
+_PBS_PLATFORM: dict[str, str] = {
+    "Windows-AMD64": "x86_64-pc-windows-msvc",
+    "Windows-x86_64": "x86_64-pc-windows-msvc",
+    "Linux-x86_64": "x86_64-unknown-linux-gnu",
+    "Linux-aarch64": "aarch64-unknown-linux-gnu",
+    "Darwin-arm64": "aarch64-apple-darwin",
+    "Darwin-x86_64": "x86_64-apple-darwin",
+}
+
+# Default torch version used when no explicit spec is given
+_DEFAULT_TORCH_VERSION = "2.10.0"
+
+# gpu_type → (index_url_or_None, cu_tag_or_None)
+# cu_tag is appended to version like torch==2.10.0+cu130
+_TORCH_PRESETS: dict[str, tuple[str | None, str | None]] = {
+    "nvidia": ("https://download.pytorch.org/whl/cu130", "cu130"),
+    "nvidia-cu128": ("https://download.pytorch.org/whl/cu128", "cu128"),
+    "nvidia-cu126": ("https://download.pytorch.org/whl/cu126", "cu126"),
+    "amd": ("https://download.pytorch.org/whl/rocm7.1", "rocm7.1"),
+    "intel": ("https://download.pytorch.org/whl/xpu", "xpu"),
+    "cpu": ("https://download.pytorch.org/whl/cpu", "cpu"),
+    "mps": (None, None),  # macOS uses default PyPI wheels
+}
+
+
+def _get_pbs_platform() -> str:
+    """Return the python-build-standalone platform suffix for this machine."""
+    key = f"{platform.system()}-{platform.machine()}"
+    result = _PBS_PLATFORM.get(key)
+    if not result:
+        raise RuntimeError(
+            f"No python-build-standalone platform mapping for {key}. "
+            f"Supported: {list(_PBS_PLATFORM.keys())}"
+        )
+    return result
+
+
+def _resolve_pbs_release(
+    python_version: str,
+    pbs_release: str | None = None,
+    send_output: Callable[[str], None] | None = None,
+) -> tuple[str, str, str]:
+    """Resolve a python-build-standalone release for the given Python version.
+
+    Args:
+        python_version: Python version like "3.12" or "3.12.12"
+        pbs_release: Optional PBS release tag (e.g. "20260211"). If None, uses latest.
+
+    Returns:
+        (download_url, resolved_python_version, pbs_release_tag)
+    """
+    pbs_platform = _get_pbs_platform()
+
+    if pbs_release:
+        # Direct lookup — construct URL and verify with HEAD request
+        releases_url = f"https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/{pbs_release}"
+        resp = requests.get(releases_url, headers=_github_headers(), timeout=30)
+        resp.raise_for_status()
+        release = resp.json()
+        releases = [release]
+    else:
+        # Fetch recent releases
+        releases_url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=5"
+        resp = requests.get(releases_url, headers=_github_headers(), timeout=30)
+        resp.raise_for_status()
+        releases = resp.json()
+
+    # Is this a partial version like "3.12" or full like "3.12.12"?
+    version_parts = python_version.split(".")
+    is_partial = len(version_parts) < 3
+
+    for release in releases:
+        tag = release["tag_name"]
+        assets = release.get("assets", [])
+
+        # Find matching assets
+        suffix = f"-{pbs_platform}-install_only.tar.gz"
+        candidates: list[tuple[str, str, str]] = []  # (url, full_version, tag)
+
+        for asset in assets:
+            name = asset["name"]
+            if not name.endswith(suffix):
+                continue
+            if not name.startswith("cpython-"):
+                continue
+            # Extract version: cpython-{version}+{pbs_tag}-{platform}-install_only.tar.gz
+            # Example: cpython-3.12.12+20260211-x86_64-pc-windows-msvc-install_only.tar.gz
+            prefix = name[len("cpython-"):]
+            plus_idx = prefix.find("+")
+            if plus_idx < 0:
+                continue
+            asset_version = prefix[:plus_idx]
+
+            if is_partial:
+                if asset_version.startswith(python_version + "."):
+                    candidates.append((asset["browser_download_url"], asset_version, tag))
+            else:
+                if asset_version == python_version:
+                    candidates.append((asset["browser_download_url"], asset_version, tag))
+
+        if candidates:
+            # Sort by version descending to pick highest patch
+            candidates.sort(key=lambda c: [int(x) for x in c[1].split(".")], reverse=True)
+            url, resolved_ver, resolved_tag = candidates[0]
+            if send_output:
+                send_output(f"Resolved Python {python_version} -> {resolved_ver} (PBS {resolved_tag})\n")
+            return url, resolved_ver, resolved_tag
+
+    raise RuntimeError(
+        f"No python-build-standalone release found for Python {python_version} "
+        f"on {pbs_platform}" + (f" (PBS release {pbs_release})" if pbs_release else "")
+    )
+
+
+def _download_uv(
+    install_path: Path,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Download and install the latest uv binary into standalone-env."""
+    system = platform.system()
+    machine = platform.machine().lower()
+
+    if system == "Windows":
+        archive_name = "uv-x86_64-pc-windows-msvc.zip"
+    elif system == "Darwin":
+        archive_name = "uv-aarch64-apple-darwin.tar.gz" if machine in ("arm64", "aarch64") else "uv-x86_64-apple-darwin.tar.gz"
+    elif system == "Linux":
+        archive_name = "uv-x86_64-unknown-linux-gnu.tar.gz" if machine == "x86_64" else "uv-aarch64-unknown-linux-gnu.tar.gz"
+    else:
+        raise RuntimeError(f"Unsupported platform for uv download: {system}")
+
+    url = f"https://github.com/astral-sh/uv/releases/latest/download/{archive_name}"
+
+    if send_output:
+        send_output(f"Downloading uv ({archive_name})...\n")
+
+    import tempfile, zipfile
+
+    env_dir = install_path / "standalone-env"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        archive_path = tmp_path / archive_name
+
+        # Download
+        resp = requests.get(url, stream=True, timeout=60)
+        resp.raise_for_status()
+        with open(archive_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+
+        # Extract
+        if archive_name.endswith(".zip"):
+            with zipfile.ZipFile(archive_path) as zf:
+                zf.extractall(tmp_path / "uv-extract")
+            # Find uv.exe in extracted contents
+            uv_src = tmp_path / "uv-extract" / "uv.exe"
+            if not uv_src.exists():
+                # May be in a subdirectory
+                for p in (tmp_path / "uv-extract").rglob("uv.exe"):
+                    uv_src = p
+                    break
+            shutil.copy2(uv_src, env_dir / "uv.exe")
+        else:
+            # tar.gz — extract with tarfile
+            import tarfile as _tarfile
+            with _tarfile.open(archive_path, "r:gz") as tar:
+                tar.extractall(tmp_path / "uv-extract", filter="data" if sys.version_info >= (3, 12) else None)
+            # Find uv binary
+            uv_src = None
+            for p in (tmp_path / "uv-extract").rglob("uv"):
+                if p.is_file() and p.name == "uv":
+                    uv_src = p
+                    break
+            if uv_src is None:
+                raise RuntimeError("Could not find uv binary in downloaded archive")
+
+            bin_dir = env_dir / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            dest = bin_dir / "uv"
+            shutil.copy2(uv_src, dest)
+            dest.chmod(0o755)
+
+    if send_output:
+        send_output("uv installed.\n")
+
+
+def _torchvision_ver(torch_ver: str) -> str:
+    """Derive torchvision version from torch version.
+
+    Torch 2.x.y → torchvision 0.(x+15).y for torch >= 2.0
+    This is an approximation; for exact mapping see PyTorch compatibility matrix.
+    Known mappings: torch 2.10.0 → torchvision 0.25.0
+    """
+    parts = torch_ver.split(".")
+    try:
+        major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
+    except (ValueError, IndexError):
+        return "0.25.0"  # fallback
+    if major == 2:
+        return f"0.{minor + 15}.{patch}"
+    return "0.25.0"  # fallback
+
+
+def _resolve_torch_preset(
+    gpu: str | None = None,
+    cuda_tag: str | None = None,
+    torch_version: str | None = None,
+) -> tuple[list[str], str | None]:
+    """Resolve torch packages and index URL from GPU type or CUDA tag.
+
+    Returns:
+        (packages_list, index_url_or_None)
+        e.g. (["torch==2.10.0+cu130", "torchvision==0.25.0+cu130", "torchaudio==2.10.0+cu130"],
+              "https://download.pytorch.org/whl/cu130")
+    """
+    ver = torch_version or _DEFAULT_TORCH_VERSION
+
+    # Determine preset key
+    if cuda_tag:
+        # e.g. "cu128" → look for "nvidia-cu128", fallback to constructing it
+        key = f"nvidia-{cuda_tag}" if not cuda_tag.startswith(("rocm", "xpu", "cpu")) else cuda_tag
+        if key not in _TORCH_PRESETS:
+            # Construct from cuda_tag directly
+            index_url = f"https://download.pytorch.org/whl/{cuda_tag}"
+            suffix = f"+{cuda_tag}"
+            return (
+                [f"torch=={ver}{suffix}", f"torchvision=={_torchvision_ver(ver)}{suffix}", f"torchaudio=={ver}{suffix}"],
+                index_url,
+            )
+    else:
+        detected = gpu or detect_gpu()
+        key = detected
+
+    preset = _TORCH_PRESETS.get(key)
+    if not preset:
+        # Default to nvidia
+        preset = _TORCH_PRESETS["nvidia"]
+
+    index_url, tag = preset
+    if tag:
+        suffix = f"+{tag}"
+    else:
+        suffix = ""
+
+    tv_ver = _torchvision_ver(ver)
+    packages = [f"torch=={ver}{suffix}", f"torchvision=={tv_ver}{suffix}", f"torchaudio=={ver}{suffix}"]
+
+    return packages, index_url
+
+
+def _build_run_cmd(
+    cmd: list[str],
+    send_output: Callable[[str], None] | None = None,
+    label: str = "",
+    check: bool = True,
+) -> int:
+    """Run a subprocess during build, streaming output."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        if send_output:
+            send_output(line)
+    proc.wait()
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"{label or 'Command'} failed with exit code {proc.returncode}")
+    return proc.returncode
+
+
+def _get_installed_version(python_path: Path, package: str) -> str | None:
+    """Get installed package version from a Python interpreter."""
+    result = _run_silent(
+        [str(python_path), "-c", f"import {package}; print({package}.__version__)"],
+        timeout=30,
+    )
+    if result is None or result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="replace").strip() or None
+
+
+def _strip_build(
+    env_dir: Path,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Strip unnecessary files from built environment (mirrors CI strip step)."""
+    sp = find_site_packages(env_dir)
+    if not sp:
+        return
+
+    removals = [
+        sp / "torch" / "lib",       # .lib files (Windows)
+        sp / "torch" / "include",   # C++ headers
+        sp / "torch" / "share",     # cmake files
+        sp / "caffe2",              # unused
+        sp / "torch" / "_inductor" / "autoheuristic" / "datasets",
+        sp / "torch" / "test",      # test files
+    ]
+
+    for path in removals:
+        if not path.exists():
+            continue
+        if path.name == "lib":
+            # Only remove .lib and .a files, not the whole dir
+            for f in path.iterdir():
+                if f.is_file() and f.suffix in (".lib", ".a"):
+                    f.unlink()
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+
+    # Remove .a files everywhere
+    if sys.platform != "win32":
+        for f in sp.rglob("*.a"):
+            f.unlink(missing_ok=True)
+
+    # Remove __pycache__
+    for d in list(env_dir.rglob("__pycache__")):
+        shutil.rmtree(d, ignore_errors=True)
+
+    # Remove .pyc files
+    for f in list(env_dir.rglob("*.pyc")):
+        f.unlink(missing_ok=True)
+
+    if send_output:
+        send_output("Stripped test files, caches, and debug symbols.\n")
+
+
+def build_standalone_env(
+    install_path: str | Path,
+    python_version: str = "3.13",
+    pbs_release: str | None = None,
+    gpu: str | None = None,
+    cuda_tag: str | None = None,
+    torch_version: str | None = None,
+    torch_spec: list[str] | None = None,
+    torch_index_url: str | None = None,
+    comfyui_ref: str | None = None,
+    send_output: Callable[[str], None] | None = None,
+    max_cache_entries: int | None = None,
+) -> dict[str, Any]:
+    """Build a standalone environment from scratch without pre-built releases.
+
+    This replicates what the ComfyUI-Standalone-Environments CI does:
+    1. Download python-build-standalone
+    2. Install torch + ComfyUI dependencies via pip
+    3. Bundle uv
+    4. Strip unnecessary files
+    5. Write manifest.json
+
+    Args:
+        install_path: Root directory for the installation
+        python_version: Python version (e.g. "3.12" or "3.12.12")
+        pbs_release: Optional PBS release tag (e.g. "20260211")
+        gpu: GPU type override (nvidia/amd/intel/mps/cpu)
+        cuda_tag: CUDA tag override (e.g. "cu128", "rocm7.1")
+        torch_version: Torch version (e.g. "2.10.0"). Defaults to _DEFAULT_TORCH_VERSION.
+        torch_spec: Full custom torch package specs (overrides gpu/cuda_tag/torch_version)
+        torch_index_url: Custom PyTorch index URL (used with torch_spec)
+        comfyui_ref: ComfyUI ref to record in manifest (not cloned here)
+        send_output: Callback for progress output
+        max_cache_entries: Max download cache entries
+
+    Returns:
+        manifest dict with build details
+    """
+    from . import cache as download_cache
+
+    install_path = Path(install_path)
+    env_dir = install_path / "standalone-env"
+
+    # 1. Resolve and download python-build-standalone
+    if send_output:
+        send_output("=== Resolving Python build ===\n")
+
+    pbs_url, resolved_python, resolved_pbs_tag = _resolve_pbs_release(
+        python_version, pbs_release, send_output
+    )
+
+    # Cache the PBS download
+    cache_key = f"pbs_{resolved_python}_{resolved_pbs_tag}"
+    cache_dir = download_cache.get_cache_path(cache_key)
+
+    # Extract filename from URL
+    pbs_filename = pbs_url.rsplit("/", 1)[-1]
+    cached_archive = cache_dir / pbs_filename
+
+    if _is_download_complete(cached_archive, 0):
+        if send_output:
+            send_output(f"Using cached Python {resolved_python} ({pbs_filename})\n")
+    else:
+        if send_output:
+            send_output(f"Downloading Python {resolved_python} ({pbs_filename})...\n")
+        _download_file_resumable(
+            pbs_url, cached_archive, 0,
+            send_output=send_output,
+        )
+
+    download_cache.touch(cache_key)
+    if max_cache_entries is not None:
+        download_cache.evict(max_entries=max_cache_entries)
+
+    # Extract to standalone-env
+    if send_output:
+        send_output(f"Extracting Python to {env_dir}...\n")
+
+    if env_dir.exists():
+        shutil.rmtree(env_dir)
+
+    # PBS archives extract to a 'python/' directory, we need to rename to 'standalone-env'
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=str(install_path)) as tmp:
+        tmp_path = Path(tmp)
+        _extract_archive(cached_archive, tmp_path, send_output)
+        # The archive extracts to python/ subdirectory
+        extracted_python = tmp_path / "python"
+        if extracted_python.exists():
+            shutil.move(str(extracted_python), str(env_dir))
+        else:
+            # Some archives may extract directly
+            # Find the first directory that looks like a python install
+            for child in tmp_path.iterdir():
+                if child.is_dir():
+                    shutil.move(str(child), str(env_dir))
+                    break
+            else:
+                raise RuntimeError("Could not find extracted Python directory")
+
+    # 2. Set up pip in the standalone Python
+    if send_output:
+        send_output("\n=== Setting up pip ===\n")
+
+    master_python = get_master_python_path(install_path)
+    if not master_python.exists():
+        raise RuntimeError(f"Master Python not found at {master_python} after extraction")
+
+    # Set executable permissions on Unix
+    if sys.platform != "win32":
+        _chmod_binaries(env_dir / "bin")
+
+    _build_run_cmd(
+        [str(master_python), "-m", "ensurepip", "--upgrade"],
+        send_output, label="ensurepip", check=False,
+    )
+    _build_run_cmd(
+        [str(master_python), "-m", "pip", "install", "--upgrade", "pip"],
+        send_output, label="upgrade pip",
+    )
+
+    # 3. Install torch
+    if send_output:
+        send_output("\n=== Installing PyTorch ===\n")
+
+    if torch_spec:
+        # User provided exact specs
+        pip_args = [str(master_python), "-m", "pip", "install", "--no-cache-dir"]
+        if torch_index_url:
+            pip_args.extend(["--extra-index-url", torch_index_url])
+        pip_args.extend(torch_spec)
+        actual_torch_packages = torch_spec
+        actual_index_url = torch_index_url
+    else:
+        torch_packages, preset_index_url = _resolve_torch_preset(gpu, cuda_tag, torch_version)
+        actual_index_url = torch_index_url or preset_index_url
+        actual_torch_packages = torch_packages
+        pip_args = [str(master_python), "-m", "pip", "install", "--no-cache-dir"]
+        if actual_index_url:
+            pip_args.extend(["--extra-index-url", actual_index_url])
+        pip_args.extend(torch_packages)
+
+    if send_output:
+        send_output(f"Packages: {' '.join(actual_torch_packages)}\n")
+        if actual_index_url:
+            send_output(f"Index URL: {actual_index_url}\n")
+
+    _build_run_cmd(pip_args, send_output, label="install torch")
+
+    # 4. Install ComfyUI + manager requirements (if ComfyUI is already cloned)
+    comfyui_dir = install_path / "ComfyUI"
+    comfyui_reqs = comfyui_dir / "requirements.txt"
+    manager_reqs = comfyui_dir / "manager_requirements.txt"
+
+    if comfyui_reqs.exists():
+        if send_output:
+            send_output("\n=== Installing ComfyUI dependencies ===\n")
+
+        pip_args = [
+            str(master_python), "-m", "pip", "install", "--no-cache-dir",
+            "-r", str(comfyui_reqs),
+        ]
+        if manager_reqs.exists():
+            pip_args.extend(["-r", str(manager_reqs)])
+        pip_args.append("pygit2")
+
+        _build_run_cmd(pip_args, send_output, label="install ComfyUI deps")
+
+    # 5. Download uv
+    if send_output:
+        send_output("\n=== Installing uv ===\n")
+
+    _download_uv(install_path, send_output)
+
+    # 6. Strip unnecessary files
+    if send_output:
+        send_output("\n=== Stripping unnecessary files ===\n")
+
+    _strip_build(env_dir, send_output)
+
+    # 7. Smoke test
+    if send_output:
+        send_output("\n=== Smoke test ===\n")
+
+    _build_run_cmd(
+        [str(master_python), "-c", "import torch; print(f'torch {torch.__version__}')"],
+        send_output, label="smoke test", check=False,
+    )
+
+    # 8. Detect actual installed versions for manifest
+    torch_ver_actual = _get_installed_version(master_python, "torch")
+    tv_ver_actual = _get_installed_version(master_python, "torchvision")
+    ta_ver_actual = _get_installed_version(master_python, "torchaudio")
+
+    # 9. Write manifest.json
+    from datetime import datetime, timezone
+    manifest = {
+        "id": f"adhoc-build",
+        "version": "adhoc",
+        "comfyui_ref": comfyui_ref or "",
+        "python_version": resolved_python,
+        "torch_version": torch_ver_actual or "",
+        "torchvision_version": tv_ver_actual or "",
+        "torchaudio_version": ta_ver_actual or "",
+        "pbs_release": resolved_pbs_tag,
+        "build_date": datetime.now(timezone.utc).isoformat(),
+        "build_mode": "adhoc",
+    }
+
+    manifest_path = install_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    if send_output:
+        send_output(f"\nStandalone environment built successfully.\n")
+        send_output(f"  Python: {resolved_python}\n")
+        send_output(f"  Torch: {torch_ver_actual or 'unknown'}\n")
+
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # Env creation — mirrors pythonEnv.ts createEnv
 # ---------------------------------------------------------------------------
 

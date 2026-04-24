@@ -282,6 +282,145 @@ class TestReadManifest:
 # strip_master_packages / BULKY_PREFIXES
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Ad-hoc build helpers
+# ---------------------------------------------------------------------------
+
+class TestGetPbsPlatform:
+    def test_windows_amd64(self, monkeypatch):
+        monkeypatch.setattr("platform.system", lambda: "Windows")
+        monkeypatch.setattr("platform.machine", lambda: "AMD64")
+        from comfy_runner.environment import _get_pbs_platform
+        assert _get_pbs_platform() == "x86_64-pc-windows-msvc"
+
+    def test_linux_x86_64(self, monkeypatch):
+        monkeypatch.setattr("platform.system", lambda: "Linux")
+        monkeypatch.setattr("platform.machine", lambda: "x86_64")
+        from comfy_runner.environment import _get_pbs_platform
+        assert _get_pbs_platform() == "x86_64-unknown-linux-gnu"
+
+    def test_darwin_arm64(self, monkeypatch):
+        monkeypatch.setattr("platform.system", lambda: "Darwin")
+        monkeypatch.setattr("platform.machine", lambda: "arm64")
+        from comfy_runner.environment import _get_pbs_platform
+        assert _get_pbs_platform() == "aarch64-apple-darwin"
+
+    def test_unsupported_raises(self, monkeypatch):
+        monkeypatch.setattr("platform.system", lambda: "FreeBSD")
+        monkeypatch.setattr("platform.machine", lambda: "x86_64")
+        from comfy_runner.environment import _get_pbs_platform
+        with pytest.raises(RuntimeError, match="No python-build-standalone"):
+            _get_pbs_platform()
+
+
+class TestTorchvisionVer:
+    def test_torch_2_10_0(self):
+        from comfy_runner.environment import _torchvision_ver
+        assert _torchvision_ver("2.10.0") == "0.25.0"
+
+    def test_torch_2_5_1(self):
+        from comfy_runner.environment import _torchvision_ver
+        assert _torchvision_ver("2.5.1") == "0.20.1"
+
+    def test_torch_2_0_0(self):
+        from comfy_runner.environment import _torchvision_ver
+        assert _torchvision_ver("2.0.0") == "0.15.0"
+
+    def test_invalid_fallback(self):
+        from comfy_runner.environment import _torchvision_ver
+        assert _torchvision_ver("bad") == "0.25.0"
+
+
+class TestResolveTorchPreset:
+    def test_nvidia_default(self, monkeypatch):
+        monkeypatch.setattr("comfy_runner.environment.detect_gpu", lambda: "nvidia")
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset()
+        assert "torch==2.10.0+cu130" in packages
+        assert "torchvision==0.25.0+cu130" in packages
+        assert "torchaudio==2.10.0+cu130" in packages
+        assert index_url == "https://download.pytorch.org/whl/cu130"
+
+    def test_cuda_tag_override(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(cuda_tag="cu128")
+        assert "torch==2.10.0+cu128" in packages
+        assert index_url == "https://download.pytorch.org/whl/cu128"
+
+    def test_cuda_tag_custom(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(cuda_tag="cu124")
+        assert "torch==2.10.0+cu124" in packages
+        assert index_url == "https://download.pytorch.org/whl/cu124"
+
+    def test_mps(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(gpu="mps")
+        assert "torch==2.10.0" in packages
+        assert index_url is None
+
+    def test_cpu(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(gpu="cpu")
+        assert "torch==2.10.0+cpu" in packages
+        assert index_url == "https://download.pytorch.org/whl/cpu"
+
+    def test_custom_torch_version(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, _ = _resolve_torch_preset(gpu="nvidia", torch_version="2.5.1")
+        assert "torch==2.5.1+cu130" in packages
+        assert "torchvision==0.20.1+cu130" in packages
+        assert "torchaudio==2.5.1+cu130" in packages
+
+    def test_amd(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(gpu="amd")
+        assert "torch==2.10.0+rocm7.1" in packages
+        assert index_url == "https://download.pytorch.org/whl/rocm7.1"
+
+    def test_intel(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(gpu="intel")
+        assert "torch==2.10.0+xpu" in packages
+        assert index_url == "https://download.pytorch.org/whl/xpu"
+
+    def test_rocm_cuda_tag(self):
+        from comfy_runner.environment import _resolve_torch_preset
+        packages, index_url = _resolve_torch_preset(cuda_tag="rocm7.1")
+        assert "torch==2.10.0+rocm7.1" in packages
+        assert index_url == "https://download.pytorch.org/whl/rocm7.1"
+
+
+class TestStripBuild:
+    def test_removes_expected_dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.platform", "linux")
+        from comfy_runner.environment import _strip_build
+        sp = tmp_path / "lib" / "python3.13" / "site-packages"
+        sp.mkdir(parents=True)
+        (sp / "torch" / "include" / "header.h").parent.mkdir(parents=True)
+        (sp / "torch" / "include" / "header.h").touch()
+        (sp / "torch" / "share" / "cmake").parent.mkdir(parents=True)
+        (sp / "torch" / "share" / "cmake").touch()
+        (sp / "torch" / "test" / "test_foo.py").parent.mkdir(parents=True)
+        (sp / "torch" / "test" / "test_foo.py").touch()
+        (sp / "caffe2" / "data.bin").parent.mkdir(parents=True)
+        (sp / "caffe2" / "data.bin").touch()
+        # This should survive
+        (sp / "torch" / "nn" / "module.py").parent.mkdir(parents=True)
+        (sp / "torch" / "nn" / "module.py").touch()
+        (sp / "requests" / "__init__.py").parent.mkdir(parents=True)
+        (sp / "requests" / "__init__.py").touch()
+
+        _strip_build(tmp_path)
+
+        assert not (sp / "torch" / "include").exists()
+        assert not (sp / "torch" / "share").exists()
+        assert not (sp / "torch" / "test").exists()
+        assert not (sp / "caffe2").exists()
+        assert (sp / "torch" / "nn" / "module.py").exists()
+        assert (sp / "requests" / "__init__.py").exists()
+
+
 class TestStripMasterPackages:
     def test_removes_bulky_dirs(self, tmp_path, monkeypatch):
         monkeypatch.setattr("sys.platform", "linux")
