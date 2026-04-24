@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import requests
 
+from safe_file import is_safe_path_component
 from .git_utils import git_clone, read_git_head, read_git_remote_url, _resolve_git_dir
 
 CNR_API_URL = "https://api.comfy.org/nodes"
@@ -29,8 +30,7 @@ _SKIP_PREFIXES = (".", "__pycache__")
 # Path validation — mirrors cnr.ts isSafePathComponent
 # ---------------------------------------------------------------------------
 
-def _is_safe_path_component(name: str) -> bool:
-    return bool(name) and name == Path(name).name and name not in (".", "..")
+_is_safe_path_component = is_safe_path_component
 
 
 # ---------------------------------------------------------------------------

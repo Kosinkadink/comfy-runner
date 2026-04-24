@@ -293,6 +293,48 @@ class RemoteRunner:
             params={"directory": directory, "name": filename},
         )
 
+    # ------------------------------------------------------------------
+    # Testing
+    # ------------------------------------------------------------------
+
+    def run_tests(
+        self,
+        suite_path: str,
+        name: str = "main",
+        timeout: int = 600,
+        http_timeout: int = 30,
+        formats: str = "json,html,markdown",
+    ) -> dict[str, Any]:
+        """POST /test/run — queue an async test suite run.
+
+        Returns the response dict with ``job_id``.
+        """
+        body: dict[str, Any] = {
+            "suite": suite_path,
+            "name": name,
+            "timeout": timeout,
+            "http_timeout": http_timeout,
+            "formats": formats,
+        }
+        return self._request("POST", "/test/run", json=body)
+
+    def get_test_results(
+        self,
+        suite_path: str,
+        run_id: str,
+        fmt: str | None = None,
+    ) -> dict[str, Any]:
+        """GET /test/results/{run_id} — retrieve test run results."""
+        params: dict[str, str] = {"suite": suite_path}
+        if fmt:
+            params["format"] = fmt
+        return self._request("GET", f"/test/results/{run_id}", params=params)
+
+    def list_test_suites(self, search_dir: str = ".") -> list[dict[str, Any]]:
+        """GET /test/suites — list available test suites."""
+        data = self._request("GET", "/test/suites", params={"dir": search_dir})
+        return data.get("suites", [])
+
 
 class _ProgressReader:
     """File wrapper that calls on_progress(bytes_sent, total) during read."""

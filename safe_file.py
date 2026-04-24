@@ -87,3 +87,8 @@ def atomic_read(path: Path) -> str | None:
         pass
 
     return None
+
+
+def is_safe_path_component(name: str) -> bool:
+    """Check that *name* is a single safe filename component (no slashes, no `.` / `..`)."""
+    return bool(name) and name == Path(name).name and name not in (".", "..")

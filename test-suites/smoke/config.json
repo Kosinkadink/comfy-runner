@@ -1,0 +1,8 @@
+{
+  "overrides": {
+    "seed": 42
+  },
+  "compare": {
+    "default": {"method": "existence"}
+  }
+}

@@ -113,6 +113,51 @@ class TestTestBaseline:
         assert out["ok"] is True
         assert "wf1" in out["skipped"]
 
+    def test_path_traversal_rejected(self, tmp_path, capsys):
+        suite_dir = _make_suite(tmp_path)
+        run_dir = tmp_path / "run_output"
+        run_dir.mkdir()
+        with pytest.raises(SystemExit):
+            main(["--json", "test", "baseline", str(suite_dir), str(run_dir),
+                  "--workflow", "../../etc/passwd"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is False
+        assert "Invalid workflow name" in out["error"]
+
+    def test_dotdot_traversal_rejected(self, tmp_path, capsys):
+        suite_dir = _make_suite(tmp_path)
+        run_dir = tmp_path / "run_output"
+        run_dir.mkdir()
+        with pytest.raises(SystemExit):
+            main(["--json", "test", "baseline", str(suite_dir), str(run_dir),
+                  "--workflow", ".."])
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is False
+        assert "Invalid workflow name" in out["error"]
+
+    def test_collision_warning(self, tmp_path, capsys):
+        suite_dir = _make_suite(tmp_path)
+        run_dir = tmp_path / "run_output"
+        # Two different node_id dirs with the same filename
+        for node_id in ("9", "12"):
+            d = run_dir / "wf1" / node_id
+            d.mkdir(parents=True)
+            (d / "out.png").write_bytes(node_id.encode())
+        main(["--json", "test", "baseline", str(suite_dir), str(run_dir),
+              "--workflow", "wf1"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is True
+        assert "wf1" in out["approved"]
+        assert "wf1/out.png" in out["collisions"]
+
+    def test_workflow_and_approve_all_exclusive(self, tmp_path, capsys):
+        suite_dir = _make_suite(tmp_path)
+        run_dir = tmp_path / "run_output"
+        run_dir.mkdir()
+        with pytest.raises(SystemExit):
+            main(["--json", "test", "baseline", str(suite_dir), str(run_dir),
+                  "--workflow", "wf1", "--approve-all"])
+
 
 # ---------------------------------------------------------------------------
 # test report
@@ -160,6 +205,29 @@ class TestTestReport:
             main(["--json", "test", "report", str(run_dir)])
         out = json.loads(capsys.readouterr().out)
         assert out["ok"] is False
+
+    def test_malformed_report_json(self, tmp_path, capsys):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        # report.json with suite_name key but missing required fields
+        (run_dir / "report.json").write_text(json.dumps({
+            "suite_name": "Test",
+        }), encoding="utf-8")
+        with pytest.raises(SystemExit):
+            main(["--json", "test", "report", str(run_dir)])
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is False
+        assert "Malformed" in out["error"]
+
+    def test_invalid_json_file(self, tmp_path, capsys):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "report.json").write_text("not valid json", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            main(["--json", "test", "report", str(run_dir)])
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is False
+        assert "Failed to read" in out["error"]
 
 
 # ---------------------------------------------------------------------------

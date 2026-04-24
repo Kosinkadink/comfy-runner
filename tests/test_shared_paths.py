@@ -43,7 +43,8 @@ class TestGenerateExtraModelPathsYaml:
     def test_base_path_uses_models_subdir(self, tmp_path):
         shared = tmp_path / "shared"
         yaml = generate_extra_model_paths_yaml(shared)
-        models_dir = (shared / "models").resolve()
+        # The function converts backslashes to forward slashes for YAML safety
+        models_dir = str((shared / "models").resolve()).replace("\\", "/")
         assert f'base_path: "{models_dir}"' in yaml
 
 
