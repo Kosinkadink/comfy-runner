@@ -52,8 +52,10 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
     if curl -fsSL https://tailscale.com/install.sh | sh; then
         TAILSCALE_STATE="/var/lib/tailscale"
         if [ -d "/workspace" ] && [ -w "/workspace" ]; then
-            TAILSCALE_STATE="/workspace/.tailscale"
-            mkdir -p "${TAILSCALE_STATE}"
+            # Persist state across pod restarts via the network volume.
+            # tailscaled --state expects a FILE path, not a directory.
+            mkdir -p "/workspace/.tailscale"
+            TAILSCALE_STATE="/workspace/.tailscale/tailscaled.state"
         fi
         mkdir -p /var/run/tailscale
         # Use userspace networking — RunPod containers lack /dev/net/tun
