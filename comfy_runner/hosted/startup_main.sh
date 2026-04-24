@@ -68,11 +68,14 @@ if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
 
         TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
         TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
-        if tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}"; then
+        if timeout 30 tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}" 2>&1; then
             log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
             SERVER_TAILSCALE="--tailscale"
         else
-            log "WARNING: tailscale up failed (exit $?) — continuing without Tailscale"
+            TS_EXIT=$?
+            log "WARNING: tailscale up failed (exit ${TS_EXIT}) — continuing without Tailscale"
+            # Dump tailscaled logs for debugging
+            tailscale bugreport 2>/dev/null || true
         fi
     else
         log "WARNING: Tailscale install failed — continuing without Tailscale"
