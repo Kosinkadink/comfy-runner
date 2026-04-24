@@ -215,6 +215,41 @@ comfy_runner.py tunnel config --rm-domain example.ngrok.io
 
 These tunnels expose individual ComfyUI instances (their `--port`), not the runner server itself. For exposing the runner server, see **Tailscale Serve** below.
 
+### Testing
+
+```bash
+# Run a test suite against a local ComfyUI instance
+comfy_runner.py test run ./test-suites/smoke --target http://localhost:8188
+
+# Run against a remote pod (via its comfy-runner server)
+comfy_runner.py test run ./test-suites/smoke --target remote:https://mybox.tailnet.ts.net:9189
+
+# Run on an ephemeral RunPod pod (provision → deploy → test → teardown)
+comfy_runner.py test run ./test-suites/smoke --runpod --gpu "NVIDIA L40S"
+
+# Deploy a PR before testing
+comfy_runner.py test run ./test-suites/smoke --runpod --gpu "NVIDIA L40S" --pr 1234
+
+# Fleet test — same suite across multiple targets in parallel
+comfy_runner.py test fleet ./test-suites/smoke \
+  --target local:http://localhost:8188 \
+  --target remote:https://pod1.tailnet.ts.net:9189 \
+  --target runpod:NVIDIA\ L40S
+
+# List available test suites
+comfy_runner.py test list --dir ./test-suites
+
+# Approve test outputs as new baselines
+comfy_runner.py test baseline ./test-suites/smoke ./test-suites/smoke/runs/20250424-120000 --approve-all
+
+# Regenerate reports from a previous run
+comfy_runner.py test report ./test-suites/smoke/runs/20250424-120000
+```
+
+Target spec formats: `local:<url>`, `remote:<server_url>`, `runpod:<gpu_type>`.
+
+A test suite is a directory containing `suite.json`, `workflows/` (API-format JSON), optional `baselines/` and `config.json`. See `test-suites/smoke/` for an example.
+
 ### Hosted GPU Deployments (RunPod)
 
 Manage cloud GPU pods and network volumes via the RunPod REST API.
@@ -316,6 +351,53 @@ comfy_runner.py tailscale-serve stop
 
 # Show tailscale serve status
 comfy_runner.py tailscale-serve status
+```
+
+### Station (Fleet Orchestration)
+
+The `station` subcommand interacts with a central comfy-runner server that manages a fleet of RunPod pods. Team members don't need RunPod or Tailscale API keys — the central server holds all credentials. Auth is implicit via Tailscale identity.
+
+Requires a `station.json` file in the current directory or a parent directory (provided by [comfy-runner-station](https://github.com/Comfy-Org/comfy-runner-station)).
+
+```bash
+# Show station config and verify connectivity
+comfy_runner.py station info
+
+# Open the fleet dashboard in browser
+comfy_runner.py station dashboard
+
+# List all pods
+comfy_runner.py station pods
+
+# Create a pod (GPU defaults from station.json)
+comfy_runner.py station pods create my-pod --gpu "NVIDIA L40S"
+
+# Deploy a PR to a pod
+comfy_runner.py station pods deploy my-pod --pr 1234
+
+# Stop / start / terminate a pod
+comfy_runner.py station pods stop my-pod
+comfy_runner.py station pods start my-pod
+comfy_runner.py station pods terminate my-pod
+
+# Run tests against a pod via the central server
+comfy_runner.py station tests run smoke --target remote:my-pod
+
+# Fleet test across multiple pods
+comfy_runner.py station tests fleet smoke --target remote:pod-l40s --target remote:pod-4090
+
+# List recent test runs
+comfy_runner.py station tests list
+
+# Check test status / get report
+comfy_runner.py station tests status <id>
+comfy_runner.py station tests report <id>
+
+# List active jobs on the central server
+comfy_runner.py station jobs
+
+# Override the central server URL
+comfy_runner.py station --server http://myserver:9189 pods
 ```
 
 ## HTTP API Server
@@ -430,6 +512,25 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 | `POST` | `/{name}/tunnel/stop` | Stop a tunnel |
 | `POST` | `/{name}/rename` | Rename an installation (must be stopped) |
 | `POST` | `/self-update` | Git pull and restart the server process |
+| | | **Testing (Local)** |
+| `POST` | `/test/run` | Run a test suite on a local installation (async) |
+| `GET` | `/test/results/{run_id}` | Get test results |
+| `GET` | `/test/suites` | List available test suites |
+| | | **Central Orchestration — Pods** |
+| `GET` | `/pods` | List all pods with live status |
+| `POST` | `/pods/create` | Create a RunPod pod (async) |
+| `POST` | `/pods/{name}/deploy` | Deploy to a pod (async) |
+| `POST` | `/pods/{name}/start` | Start a stopped pod (async) |
+| `POST` | `/pods/{name}/stop` | Stop a pod |
+| `DELETE` | `/pods/{name}` | Terminate a pod |
+| | | **Central Orchestration — Tests** |
+| `POST` | `/tests/run` | Run a test suite against a target (async) |
+| `POST` | `/tests/fleet` | Run a suite across multiple targets (async) |
+| `GET` | `/tests` | List recent test runs |
+| `GET` | `/tests/{id}` | Get test run status |
+| `GET` | `/tests/{id}/report` | Get test report (JSON/HTML/Markdown) |
+| | | **Dashboard** |
+| `GET` | `/dashboard` | HTML status page (auto-refreshes) |
 
 ### Self-Update
 

@@ -266,6 +266,289 @@ def _force_release_lock(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Test run index — tracks test runs separately from generic jobs
+# ---------------------------------------------------------------------------
+
+_test_runs_lock = threading.Lock()
+_test_runs: dict[str, dict[str, Any]] = {}
+
+
+def _register_test_run(job_id: str, meta: dict[str, Any]) -> None:
+    """Register a test run keyed by its job_id."""
+    with _test_runs_lock:
+        _test_runs[job_id] = {
+            "id": job_id,
+            "created_at": time.time(),
+            **meta,
+        }
+
+
+def _finish_test_run(job_id: str, updates: dict[str, Any], status: str = "done") -> None:
+    """Update a test run with final results and persist status."""
+    with _test_runs_lock:
+        run = _test_runs.get(job_id)
+        if run:
+            run.update(updates)
+            run["status"] = status
+            run["finished_at"] = time.time()
+
+
+_MAX_TEST_RUNS = 200
+
+
+def _gc_test_runs() -> None:
+    """Evict oldest test runs beyond the limit (caller must hold lock)."""
+    if len(_test_runs) <= _MAX_TEST_RUNS:
+        return
+    by_time = sorted(_test_runs.keys(), key=lambda k: _test_runs[k].get("created_at", 0))
+    to_remove = len(_test_runs) - _MAX_TEST_RUNS
+    for k in by_time[:to_remove]:
+        del _test_runs[k]
+
+
+def _list_test_runs(limit: int = 50) -> list[dict[str, Any]]:
+    """Return test runs newest-first, merged with current job status."""
+    with _test_runs_lock:
+        _gc_test_runs()
+        runs = sorted(
+            _test_runs.values(),
+            key=lambda r: r.get("created_at", 0),
+            reverse=True,
+        )[:limit]
+    # Merge in current job status — prefer persisted status over live job
+    enriched = []
+    for run in runs:
+        entry = dict(run)
+        job = _jobs.get(run["id"])
+        if job:
+            entry["status"] = job["status"]
+        elif "status" not in entry:
+            entry["status"] = "expired"
+        enriched.append(entry)
+    return enriched
+
+
+# Per-pod locks — prevent concurrent operations on the same pod
+_pod_locks: dict[str, threading.Lock] = {}
+_pod_locks_guard = threading.Lock()
+
+
+def _get_pod_lock(name: str) -> threading.Lock:
+    """Return a per-pod lock, creating one if needed."""
+    with _pod_locks_guard:
+        if name not in _pod_locks:
+            _pod_locks[name] = threading.Lock()
+        return _pod_locks[name]
+
+
+def _remove_pod_lock(name: str) -> None:
+    """Remove a pod lock entry after termination (only if unlocked)."""
+    with _pod_locks_guard:
+        lock = _pod_locks.get(name)
+        if lock is not None and not lock.locked():
+            _pod_locks.pop(name, None)
+
+
+def _get_runpod_provider():
+    """Create a RunPodProvider instance. Raises RuntimeError if not configured."""
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+    return RunPodProvider()
+
+
+def _get_pod_server_url(pod_name: str) -> str:
+    """Resolve the comfy-runner server URL for a named pod via Tailscale."""
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+    provider = RunPodProvider()
+    url = provider.get_pod_tailscale_url(pod_name, port=9189)
+    if url:
+        return url
+    # Fallback: try RunPod proxy via pod record
+    from comfy_runner.hosted.config import get_pod_record
+    rec = get_pod_record("runpod", pod_name)
+    if rec and rec.get("id"):
+        return f"https://{rec['id']}-9189.proxy.runpod.net"
+    raise RuntimeError(f"Cannot resolve server URL for pod '{pod_name}'")
+
+
+def _wait_for_remote_server(
+    server_url: str,
+    timeout: int = 300,
+    poll_interval: int = 10,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Poll a remote comfy-runner server until it responds."""
+    import requests as _requests
+    out = send_output or (lambda _: None)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = _requests.get(f"{server_url}/system-info", timeout=5)
+            if resp.ok:
+                resp.json()
+                out("Remote server is ready.\n")
+                return
+        except Exception:
+            pass
+        remaining = int(deadline - time.monotonic())
+        out(f"\rWaiting for remote server... ({remaining}s remaining)")
+        time.sleep(poll_interval)
+    raise RuntimeError(f"Remote server at {server_url} did not become ready within {timeout}s")
+
+
+def _build_test_target(target_body: dict[str, Any]):
+    """Build a fleet TestTarget from a request body target dict."""
+    from comfy_runner.testing.fleet import LocalTarget, RemoteTarget, EphemeralTarget
+    kind = target_body.get("kind", "")
+
+    if kind == "local":
+        url = target_body.get("url", "")
+        if not url:
+            raise ValueError("local target requires 'url'")
+        if "://" not in url:
+            url = f"http://{url}"
+        return LocalTarget(url=url, label=target_body.get("label"))
+
+    elif kind == "remote":
+        # Resolve by pod_name or explicit server_url
+        pod_name = target_body.get("pod_name")
+        server_url = target_body.get("server_url")
+        if pod_name and not server_url:
+            server_url = _get_pod_server_url(pod_name)
+        if not server_url:
+            raise ValueError("remote target requires 'pod_name' or 'server_url'")
+        return RemoteTarget(
+            server_url=server_url,
+            install_name=target_body.get("install", "main"),
+            label=target_body.get("label") or pod_name,
+        )
+
+    elif kind == "runpod":
+        return EphemeralTarget(
+            gpu_type=target_body.get("gpu_type", ""),
+            label=target_body.get("label"),
+            image=target_body.get("image"),
+            volume_id=target_body.get("volume_id"),
+            install_name=target_body.get("install", "main"),
+        )
+
+    else:
+        raise ValueError(f"Unknown target kind: '{kind}'. Expected: local, remote, runpod")
+
+
+def _validate_pod_name(name: str) -> str | None:
+    """Validate a pod name from a URL path parameter.
+
+    Returns an error message if invalid, else None.
+    """
+    from safe_file import is_safe_path_component
+    if not name or not is_safe_path_component(name):
+        return f"Invalid pod name: '{name}'"
+    return None
+
+
+def _validate_suite_path(suite: str) -> str | None:
+    """Validate a suite path from a request body.
+
+    Ensures the path resolves to an existing directory containing suite.json.
+    Returns an error message if invalid, else None.
+    """
+    if not suite:
+        return "'suite' is required"
+    suite_path = Path(suite).resolve()
+    if not suite_path.is_dir():
+        return f"Suite directory not found: {suite}"
+    if not (suite_path / "suite.json").is_file():
+        return f"Not a valid test suite (missing suite.json): {suite}"
+    return None
+
+
+_DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>comfy-runner Dashboard</title>
+<meta http-equiv="refresh" content="15">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+         background: #1a1a2e; color: #e0e0e0; margin: 2rem; }
+  h1 { color: #00d9ff; }
+  h2 { color: #7c8db5; border-bottom: 1px solid #2a2a4e; padding-bottom: 0.3rem; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+  th, td { text-align: left; padding: 0.5rem 1rem; border-bottom: 1px solid #2a2a4e; }
+  th { color: #7c8db5; font-weight: 600; }
+  .running { color: #4caf50; }
+  .stopped, .exited { color: #ff9800; }
+  .terminated, .error { color: #f44336; }
+  .done { color: #4caf50; }
+  .cancelled { color: #ff9800; }
+  a { color: #00d9ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .refresh { color: #555; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>comfy-runner Dashboard</h1>
+<p class="refresh">Auto-refreshes every 15 seconds</p>
+
+<h2>Pods</h2>
+{% if pods %}
+<table>
+<tr><th>Name</th><th>Status</th><th>GPU</th><th>$/hr</th><th>Server URL</th></tr>
+{% for p in pods %}
+<tr>
+  <td>{{ p.name }}</td>
+  <td class="{{ p.status|lower }}">{{ p.status }}</td>
+  <td>{{ p.gpu_type }}</td>
+  <td>{{ "%.2f"|format(p.cost_per_hr) }}</td>
+  <td>{% if p.server_url %}<a href="{{ p.server_url }}">{{ p.server_url }}</a>{% else %}-{% endif %}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No pods configured.</p>
+{% endif %}
+
+<h2>Recent Test Runs</h2>
+{% if test_runs %}
+<table>
+<tr><th>ID</th><th>Kind</th><th>Suite</th><th>Status</th><th>Targets</th></tr>
+{% for t in test_runs %}
+<tr>
+  <td><a href="/tests/{{ t.id }}">{{ t.id }}</a></td>
+  <td>{{ t.kind }}</td>
+  <td>{{ t.suite }}</td>
+  <td class="{{ t.status }}">{{ t.status }}</td>
+  <td>{{ t.targets|length }}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No test runs.</p>
+{% endif %}
+
+<h2>Active Jobs</h2>
+{% if jobs %}
+<table>
+<tr><th>ID</th><th>Label</th><th>Status</th><th>Started</th></tr>
+{% for j in jobs %}
+<tr>
+  <td><a href="/job/{{ j.id }}">{{ j.id }}</a></td>
+  <td>{{ j.label }}</td>
+  <td class="{{ j.status }}">{{ j.status }}</td>
+  <td>{{ j.started_at|int }}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No active jobs.</p>
+{% endif %}
+
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Flask app factory
 # ---------------------------------------------------------------------------
 
@@ -2006,6 +2289,656 @@ def create_app() -> Any:
             }
             for s in suites
         ]})
+
+    # ==================================================================
+    # Central Orchestration — Pod Management
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /pods — list all pods with status
+    # ------------------------------------------------------------------
+    @app.route("/pods", methods=["GET"])
+    def route_pods_list() -> Any:
+        from comfy_runner.hosted.config import list_pod_records
+
+        try:
+            provider = _get_runpod_provider()
+        except RuntimeError as e:
+            return _err(str(e))
+
+        try:
+            live_pods = provider.list_pods()
+            live_map = {p.name: p for p in live_pods}
+
+            records = list_pod_records("runpod")
+            result = []
+
+            # Merge config records with live pod data
+            seen_names = set()
+            for name, rec in records.items():
+                seen_names.add(name)
+                pod_id = rec.get("id", "")
+                live = live_map.get(name)
+                # Also try matching by ID
+                if not live:
+                    for lp in live_pods:
+                        if lp.id == pod_id:
+                            live = lp
+                            break
+                entry: dict[str, Any] = {
+                    "name": name,
+                    "id": pod_id,
+                    "gpu_type": rec.get("gpu_type", ""),
+                    "datacenter": rec.get("datacenter", ""),
+                    "image": rec.get("image", ""),
+                }
+                if live:
+                    entry["status"] = live.status
+                    entry["cost_per_hr"] = live.cost_per_hr
+                    entry["gpu_type"] = live.gpu_type or entry["gpu_type"]
+                else:
+                    entry["status"] = "UNKNOWN"
+                # Add URLs
+                ts_url = provider.get_pod_tailscale_url(name, port=9189)
+                if ts_url:
+                    entry["server_url"] = ts_url
+                    entry["comfy_url"] = ts_url.rsplit(":", 1)[0] + ":8188"
+                result.append(entry)
+
+            return jsonify({"ok": True, "pods": result})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /pods/create — provision a RunPod pod (async)
+    # ------------------------------------------------------------------
+    @app.route("/pods/create", methods=["POST"])
+    def route_pods_create() -> Any:
+        from safe_file import is_safe_path_component
+
+        body = request.get_json(silent=True) or {}
+        name = body.get("name", "")
+        if not name or not is_safe_path_component(name):
+            return _err("'name' is required and must be a safe identifier")
+
+        gpu_type = body.get("gpu_type")
+        image = body.get("image")
+        volume_id = body.get("volume_id")
+        volume_size_gb = body.get("volume_size_gb")
+        datacenter = body.get("datacenter")
+        cloud_type = body.get("cloud_type")
+        gpu_count = body.get("gpu_count", 1)
+        env = body.get("env")
+        wait_ready = body.get("wait_ready", True)
+
+        job_id = _jobs.create(label=f"pod create {name}")
+
+        def _run() -> None:
+            from comfy_runner.hosted.config import get_pod_record, set_pod_record
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+
+                # Check if pod already exists
+                rec = get_pod_record("runpod", name)
+                if rec:
+                    pod = provider.get_pod(rec["id"])
+                    if pod and pod.status not in ("TERMINATED", "EXITED"):
+                        if pod.status != "RUNNING":
+                            out(f"Pod '{name}' exists but is {pod.status}, starting...\n")
+                            provider.start_pod(rec["id"])
+                        else:
+                            out(f"Pod '{name}' already running.\n")
+                        server_url = provider.get_pod_tailscale_url(name, port=9189) or ""
+                        if wait_ready and server_url:
+                            _wait_for_remote_server(server_url, send_output=out)
+                        _jobs.finish(job_id, {
+                            "name": name,
+                            "id": rec["id"],
+                            "status": "RUNNING",
+                            "server_url": server_url,
+                            "reused": True,
+                        }, lines)
+                        return
+
+                out(f"Creating pod '{name}'...\n")
+                pod = provider.create_pod(
+                    name=name,
+                    gpu_type=gpu_type,
+                    image=image,
+                    volume_id=volume_id,
+                    volume_size_gb=volume_size_gb,
+                    datacenter=datacenter,
+                    cloud_type=cloud_type,
+                    gpu_count=gpu_count,
+                    env=env,
+                )
+                set_pod_record("runpod", name, {
+                    "id": pod.id,
+                    "gpu_type": pod.gpu_type,
+                    "datacenter": pod.datacenter,
+                    "image": pod.image,
+                })
+                out(f"Pod created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
+
+                server_url = provider.get_pod_tailscale_url(name, port=9189) or ""
+                if wait_ready and server_url:
+                    _wait_for_remote_server(server_url, send_output=out)
+
+                _jobs.finish(job_id, {
+                    "name": name,
+                    "id": pod.id,
+                    "status": "RUNNING",
+                    "gpu_type": pod.gpu_type,
+                    "cost_per_hr": pod.cost_per_hr,
+                    "server_url": server_url,
+                    "reused": False,
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/deploy — deploy a PR/branch/commit to a pod (async)
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/deploy", methods=["POST"])
+    def route_pods_deploy(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        body = request.get_json(silent=True) or {}
+        install_name = body.get("install", "main")
+
+        # Validate deploy mode
+        pr = body.get("pr")
+        branch = body.get("branch")
+        tag = body.get("tag")
+        commit = body.get("commit")
+        reset = body.get("reset", False)
+        latest = body.get("latest", False)
+        pull = body.get("pull", False)
+        modes = [pr is not None, bool(branch), bool(tag), bool(commit), reset, latest, pull]
+        if sum(modes) != 1:
+            return _err("Specify exactly one of: pr, branch, tag, commit, reset, latest, or pull")
+
+        job_id = _jobs.create(label=f"pod deploy {name}")
+
+        def _run() -> None:
+            from comfy_runner.hosted.remote import RemoteRunner
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                pod_id = rec["id"]
+
+                # Ensure pod is running
+                pod = provider.get_pod(pod_id)
+                if not pod or pod.status in ("TERMINATED", "EXITED"):
+                    _jobs.fail(job_id, f"Pod '{name}' is terminated or gone", lines)
+                    return
+                if pod.status != "RUNNING":
+                    out(f"Pod is {pod.status}, starting...\n")
+                    provider.start_pod(pod_id)
+
+                server_url = _get_pod_server_url(name)
+                out(f"Connecting to {server_url}...\n")
+                _wait_for_remote_server(server_url, send_output=out)
+
+                runner = RemoteRunner(server_url)
+
+                # Forward deploy
+                deploy_body: dict[str, Any] = {}
+                if pr is not None:
+                    deploy_body["pr"] = pr
+                if branch:
+                    deploy_body["branch"] = branch
+                if tag:
+                    deploy_body["tag"] = tag
+                if commit:
+                    deploy_body["commit"] = commit
+                if reset:
+                    deploy_body["reset"] = True
+                if latest:
+                    deploy_body["latest"] = True
+                if pull:
+                    deploy_body["pull"] = True
+                if body.get("start", True):
+                    deploy_body["start"] = True
+                if body.get("repo"):
+                    deploy_body["repo"] = body["repo"]
+                if body.get("title"):
+                    deploy_body["title"] = body["title"]
+                if body.get("launch_args"):
+                    deploy_body["launch_args"] = body["launch_args"]
+                if body.get("cuda_compat"):
+                    deploy_body["cuda_compat"] = True
+                if body.get("build"):
+                    deploy_body["build"] = True
+                    for bk in ("python_version", "pbs_release", "gpu",
+                                "cuda_tag", "torch_version", "torch_spec",
+                                "torch_index_url", "comfyui_ref"):
+                        if bk in body:
+                            deploy_body[bk] = body[bk]
+
+                out(f"Deploying to '{install_name}' on pod '{name}'...\n")
+                data = runner._request("POST", f"/{install_name}/deploy", json=deploy_body)
+
+                remote_job_id = data.get("job_id")
+                if remote_job_id:
+                    out(f"Remote job started: {remote_job_id}\n")
+                    result = runner.poll_job(
+                        remote_job_id, timeout=600, on_output=out,
+                    )
+                    _jobs.finish(job_id, {
+                        "pod_name": name,
+                        "server_url": server_url,
+                        "deploy_result": result,
+                    }, lines)
+                else:
+                    _jobs.finish(job_id, {
+                        "pod_name": name,
+                        "server_url": server_url,
+                        "deploy_result": data,
+                    }, lines)
+
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/stop — stop a pod (keep data)
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/stop", methods=["POST"])
+    def route_pods_stop(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        lock = _get_pod_lock(name)
+        if not lock.acquire(timeout=5):
+            return _err(f"Pod '{name}' is busy")
+        try:
+            provider = _get_runpod_provider()
+            provider.stop_pod(rec["id"])
+            return jsonify({"ok": True, "name": name, "action": "stopped"})
+        except Exception as e:
+            return _err(str(e))
+        finally:
+            lock.release()
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/start — start a stopped pod
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/start", methods=["POST"])
+    def route_pods_start(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        body = request.get_json(silent=True) or {}
+        wait_ready = body.get("wait_ready", True)
+
+        job_id = _jobs.create(label=f"pod start {name}")
+
+        def _run() -> None:
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                out(f"Starting pod '{name}'...\n")
+                provider.start_pod(rec["id"])
+
+                server_url = provider.get_pod_tailscale_url(name, port=9189) or ""
+                if wait_ready and server_url:
+                    _wait_for_remote_server(server_url, send_output=out)
+
+                _jobs.finish(job_id, {
+                    "name": name,
+                    "id": rec["id"],
+                    "status": "RUNNING",
+                    "server_url": server_url,
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # DELETE /pods/<name> — terminate a pod
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>", methods=["DELETE"])
+    def route_pods_terminate(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record, remove_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        lock = _get_pod_lock(name)
+        if not lock.acquire(timeout=5):
+            return _err(f"Pod '{name}' is busy")
+        try:
+            provider = _get_runpod_provider()
+            provider.terminate_pod(rec["id"])
+            remove_pod_record("runpod", name)
+            return jsonify({"ok": True, "name": name, "action": "terminated"})
+        except Exception as e:
+            return _err(str(e))
+        finally:
+            lock.release()
+            _remove_pod_lock(name)
+
+    # ==================================================================
+    # Central Orchestration — Test Execution
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # POST /tests/run — run a test suite against a single target (async)
+    # ------------------------------------------------------------------
+    @app.route("/tests/run", methods=["POST"])
+    def route_tests_run() -> Any:
+        body = request.get_json(silent=True) or {}
+        suite = body.get("suite", "")
+        suite_err = _validate_suite_path(suite)
+        if suite_err:
+            return _err(suite_err)
+
+        target_body = body.get("target")
+        if not target_body or not isinstance(target_body, dict):
+            return _err("'target' is required (object with 'kind' field)")
+
+        try:
+            target = _build_test_target(target_body)
+        except (ValueError, RuntimeError) as e:
+            return _err(str(e))
+
+        timeout = body.get("timeout", 600)
+        formats = body.get("formats", "json,html,markdown")
+
+        job_id = _jobs.create(label=f"test run {target.name}")
+        _register_test_run(job_id, {
+            "kind": "single",
+            "suite": suite,
+            "targets": [target_body],
+        })
+
+        def _run() -> None:
+            from comfy_runner.testing.suite import load_suite
+            out, lines = _make_collector(job_id)
+            try:
+                s = load_suite(suite)
+                run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+                out_dir = Path(suite) / "runs" / run_id
+
+                result = target.run(
+                    suite=s,
+                    output_dir=out_dir,
+                    timeout=timeout,
+                    send_output=out,
+                )
+
+                summary = result.to_dict()
+                _finish_test_run(job_id, {
+                    "output_dir": str(out_dir),
+                    "summary": summary,
+                })
+                _jobs.finish(job_id, {
+                    "run_id": run_id,
+                    "suite_name": s.name,
+                    "output_dir": str(out_dir),
+                    **summary,
+                }, lines)
+            except Exception as e:
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # POST /tests/fleet — run a suite across multiple targets (async)
+    # ------------------------------------------------------------------
+    @app.route("/tests/fleet", methods=["POST"])
+    def route_tests_fleet() -> Any:
+        from comfy_runner.testing.fleet import run_fleet
+
+        body = request.get_json(silent=True) or {}
+        suite = body.get("suite", "")
+        suite_err = _validate_suite_path(suite)
+        if suite_err:
+            return _err(suite_err)
+
+        target_bodies = body.get("targets", [])
+        if not target_bodies or not isinstance(target_bodies, list):
+            return _err("'targets' is required (list of target objects)")
+
+        try:
+            targets = [_build_test_target(t) for t in target_bodies]
+        except (ValueError, RuntimeError) as e:
+            return _err(str(e))
+
+        timeout = body.get("timeout", 600)
+        max_workers = body.get("max_workers")
+        formats = body.get("formats", "json,html,markdown")
+
+        target_names = [t.name for t in targets]
+        job_id = _jobs.create(label=f"fleet test ({len(targets)} targets)")
+        _register_test_run(job_id, {
+            "kind": "fleet",
+            "suite": suite,
+            "targets": target_bodies,
+        })
+
+        def _run() -> None:
+            out, lines = _make_collector(job_id)
+            try:
+                run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+                out_dir = Path(suite) / "runs" / f"fleet-{run_id}"
+
+                fleet_result = run_fleet(
+                    targets=targets,
+                    suite_path=suite,
+                    output_dir=out_dir,
+                    timeout=timeout,
+                    max_workers=max_workers,
+                    send_output=out,
+                    formats=formats,
+                )
+
+                summary = fleet_result.to_dict()
+                _finish_test_run(job_id, {
+                    "output_dir": str(out_dir),
+                    "summary": summary,
+                })
+                _jobs.finish(job_id, {
+                    "run_id": run_id,
+                    "output_dir": str(out_dir),
+                    **summary,
+                }, lines)
+            except Exception as e:
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "targets": target_names})
+
+    # ------------------------------------------------------------------
+    # GET /tests — list recent/active test runs
+    # ------------------------------------------------------------------
+    @app.route("/tests", methods=["GET"])
+    def route_tests_list() -> Any:
+        limit = request.args.get("limit", 50, type=int)
+        runs = _list_test_runs(limit=limit)
+        return jsonify({"ok": True, "runs": runs})
+
+    # ------------------------------------------------------------------
+    # GET /tests/<test_id> — poll test status + metadata
+    # ------------------------------------------------------------------
+    @app.route("/tests/<test_id>", methods=["GET"])
+    def route_tests_get(test_id: str) -> Any:
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
+
+        entry = dict(run)
+        job = _jobs.get(test_id)
+        if job:
+            entry["status"] = job["status"]
+            entry["output"] = job.get("output", [])
+            if job.get("result"):
+                entry["result"] = job["result"]
+            if job.get("error"):
+                entry["error"] = job["error"]
+        elif "status" not in entry:
+            entry["status"] = "expired"
+
+        return jsonify({"ok": True, **entry})
+
+    # ------------------------------------------------------------------
+    # GET /tests/<test_id>/report — retrieve test report
+    # ------------------------------------------------------------------
+    @app.route("/tests/<test_id>/report", methods=["GET"])
+    def route_tests_report(test_id: str) -> Any:
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
+
+        output_dir = run.get("output_dir")
+        if not output_dir:
+            return _err("Test run has no output directory yet (still running?)")
+
+        out_path = Path(output_dir)
+        fmt = request.args.get("format", "json")
+
+        if run.get("kind") == "fleet":
+            # Fleet report
+            report_file = out_path / "fleet-report.json"
+        else:
+            # Single target — look for report.json in the output dir
+            report_file = out_path / "report.json"
+
+        if fmt == "json":
+            if report_file.is_file():
+                import json as _json
+                data = _json.loads(report_file.read_text(encoding="utf-8"))
+                return jsonify({"ok": True, "test_id": test_id, "report": data})
+            # Fallback: return summary from the test run metadata
+            summary = run.get("summary")
+            if summary:
+                return jsonify({"ok": True, "test_id": test_id, "report": summary})
+            return _err("Report not available yet")
+
+        # For html/markdown, look for the file
+        is_fleet = run.get("kind") == "fleet"
+        ext_map = {
+            "html": "fleet-report.html" if is_fleet else "report.html",
+            "markdown": "fleet-report.md" if is_fleet else "report.md",
+        }
+        filename = ext_map.get(fmt)
+        if not filename:
+            return _err(f"Unknown format '{fmt}'. Expected: json, html, markdown")
+
+        report_path = out_path / filename
+        if not report_path.is_file():
+            return _err(f"{filename} not found in output directory")
+
+        from flask import send_file
+        return send_file(str(report_path))
+
+    # ==================================================================
+    # Dashboard — simple HTML status page
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /dashboard — HTML page showing pods, tests, jobs
+    # ------------------------------------------------------------------
+    @app.route("/dashboard", methods=["GET"])
+    def route_dashboard() -> Any:
+        from flask import render_template_string
+
+        # Gather data
+        try:
+            provider = _get_runpod_provider()
+            from comfy_runner.hosted.config import list_pod_records
+            pods_data = []
+            records = list_pod_records("runpod")
+            live_pods = provider.list_pods()
+            live_map = {}
+            for p in live_pods:
+                live_map[p.name] = p
+                live_map[p.id] = p
+            for pname, rec in records.items():
+                live = live_map.get(pname) or live_map.get(rec.get("id", ""))
+                ts_url = provider.get_pod_tailscale_url(pname, port=9189)
+                pods_data.append({
+                    "name": pname,
+                    "id": rec.get("id", ""),
+                    "status": live.status if live else "UNKNOWN",
+                    "gpu_type": (live.gpu_type if live else "") or rec.get("gpu_type", ""),
+                    "cost_per_hr": live.cost_per_hr if live else 0,
+                    "server_url": ts_url or "",
+                })
+        except Exception:
+            pods_data = []
+
+        test_runs = _list_test_runs(limit=20)
+        active_jobs = _jobs.list_active()
+
+        html = _DASHBOARD_HTML
+        return render_template_string(
+            html,
+            pods=pods_data,
+            test_runs=test_runs,
+            jobs=active_jobs,
+        )
 
     # ------------------------------------------------------------------
     # POST /self-update — git pull and restart the server process
