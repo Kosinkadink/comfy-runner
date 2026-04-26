@@ -270,7 +270,7 @@ def download_models(
             cancelled = False
 
             # Write to staging file, then move to final destination
-            staging_name = f"{model['directory']}--{model['name']}.part"
+            staging_name = f"{model['directory'].replace('/', '_')}--{model['name']}.part"
             tmp_path = staging_dir / staging_name
             try:
                 with open(tmp_path, "wb") as f:
