@@ -393,6 +393,14 @@ _ROUTES: list[dict[str, Any]] = [
                                     "Only applies when the installation doesn't exist yet and is created automatically."
                                 ),
                             },
+                            "python_version": {
+                                "type": "string",
+                                "description": (
+                                    "Python version for the venv when auto-initializing a new installation "
+                                    "(e.g. '3.12'). uv will fetch this Python version. Only applies when "
+                                    "the installation doesn't exist yet."
+                                ),
+                            },
                         },
                     }
                 }

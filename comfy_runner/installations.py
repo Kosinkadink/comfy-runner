@@ -40,6 +40,7 @@ def init_installation(
     install_dir: str | None = None,
     send_output: Callable[[str], None] | None = None,
     cuda_compat: bool = False,
+    python_version: str | None = None,
     max_cache_entries: int | None = None,
 ) -> dict[str, Any]:
     """Create a new ComfyUI installation from scratch.
@@ -142,7 +143,7 @@ def init_installation(
         if send_output:
             send_output("\n=== Creating default Python environment ===\n")
 
-        create_env(install_path, send_output)
+        create_env(install_path, send_output, python_version=python_version)
 
         # 6b. Ensure torch CUDA build matches host driver (hosted only)
         if cuda_compat:
@@ -173,7 +174,7 @@ def init_installation(
         "release_tag": tag,
         "status": "installed",
         "comfyui_ref": comfyui_ref or "",
-        "python_version": manifest.get("python_version", ""),
+        "python_version": python_version or manifest.get("python_version", ""),
         "head_commit": head_commit or "",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "launch_args": "--enable-manager",

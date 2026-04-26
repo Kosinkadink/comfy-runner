@@ -37,6 +37,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             install_dir=args.dir,
             send_output=None if args.json else _output,
             cuda_compat=getattr(args, "cuda_compat", False),
+            python_version=getattr(args, "python_version", None),
         )
         if args.json:
             print(json.dumps({"ok": True, "installation": record}, indent=2))
@@ -2453,6 +2454,7 @@ def main(argv: list[str] | None = None) -> None:
     p_init.add_argument("--dir", "-d", help="Custom installation directory")
     p_init.add_argument("--cuda-compat", action="store_true", default=False,
                         help="Auto-detect host NVIDIA driver and swap torch CUDA build if needed")
+    p_init.add_argument("--python-version", help="Python version for the venv (e.g. 3.12). Uses uv to fetch that Python instead of the bundled one.")
     p_init.set_defaults(func=cmd_init)
 
     # releases

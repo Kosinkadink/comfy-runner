@@ -887,6 +887,7 @@ def _extract_archive(
 def create_env(
     install_path: str | Path,
     send_output: Callable[[str], None] | None = None,
+    python_version: str | None = None,
 ) -> None:
     """Create a venv at ``ComfyUI/.venv`` via uv and copy site-packages.
 
@@ -917,8 +918,12 @@ def create_env(
     if sys.platform != "win32":
         _chmod_binaries(install_path / "standalone-env" / "bin")
 
+    python_spec = python_version if python_version else str(master_python)
+    if send_output and python_version:
+        send_output(f"Using Python {python_version} override (uv will fetch if needed)...\n")
+
     result = subprocess.run(
-        [str(uv), "venv", "--python", str(master_python), str(env_path)],
+        [str(uv), "venv", "--python", python_spec, str(env_path)],
         cwd=str(install_path),
         capture_output=True,
         text=True,
