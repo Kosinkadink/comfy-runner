@@ -401,12 +401,26 @@ def _list_tailscale_devices(force: bool = False) -> list[dict[str, Any]]:
 
 
 def _resolve_tailscale_hostname(pod_name: str, force: bool = False) -> str | None:
-    """Find the actual MagicDNS FQDN for a pod via Tailscale API.
+    """Find the actual host (IPv4 or MagicDNS name) for a pod via the Tailscale API.
 
-    Handles the case where the pod's hostname got auto-suffixed
-    (e.g. ``comfy-foo-1`` instead of ``comfy-foo``) due to a stale
-    device entry. Returns the FQDN to use for ``http://...:9189``,
-    or ``None`` if no matching device is found / API not configured.
+    Handles two failure modes:
+
+    * **Suffix drift** – the pod's hostname got auto-suffixed
+      (e.g. ``comfy-foo-1`` instead of ``comfy-foo``) because a stale
+      device with the same name was still online when the new pod joined.
+    * **Duplicate hostnames** – on tailnets that *don't* enforce unique
+      hostnames, the new pod and the stale (offline) one coexist with
+      the *same* hostname. MagicDNS would then ambiguously resolve to
+      either device's IP, often the dead one.
+
+    To dodge MagicDNS ambiguity entirely we return the chosen device's
+    Tailscale IP (the first IPv4 from its ``addresses`` field) when
+    available, falling back to the MagicDNS FQDN. The chosen device is
+    always the most-recently-seen match — i.e. the live pod.
+
+    Returns the host string (e.g. ``"100.86.23.124"`` or
+    ``"comfy-foo-1.tailnet.ts.net"``), or ``None`` if no matching
+    device is found / API not configured.
     """
     import re
     expected = f"comfy-{pod_name}"
@@ -414,24 +428,27 @@ def _resolve_tailscale_hostname(pod_name: str, force: bool = False) -> str | Non
     if not devices:
         return None
     suffix_re = re.compile(r"^" + re.escape(expected) + r"(-\d+)?$")
-    exact: dict[str, Any] | None = None
-    suffixed: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
     for d in devices:
         host = d.get("hostname", "") or ""
         if not host:
             fqdn = d.get("name", "") or ""
             host = fqdn.split(".", 1)[0]
-        if host == expected:
-            exact = d
-        elif suffix_re.match(host):
-            suffixed.append(d)
-    chosen = exact
-    if not chosen and suffixed:
-        # Pick the most recently created suffixed match
-        suffixed.sort(key=lambda d: d.get("created", ""), reverse=True)
-        chosen = suffixed[0]
-    if not chosen:
+        if suffix_re.match(host):
+            matches.append(d)
+    if not matches:
         return None
+    # Most-recently-seen first; ISO 8601 timestamps sort correctly as strings.
+    matches.sort(
+        key=lambda d: (d.get("lastSeen", ""), d.get("created", "")),
+        reverse=True,
+    )
+    chosen = matches[0]
+    # Prefer the device's IPv4 address (bypasses MagicDNS ambiguity).
+    for addr in chosen.get("addresses", []) or []:
+        if addr and "." in addr and ":" not in addr:
+            return addr
+    # Fallback to the MagicDNS FQDN.
     return chosen.get("name") or None
 
 
