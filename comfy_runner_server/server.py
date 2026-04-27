@@ -460,20 +460,26 @@ def _get_pod_server_url(
     """Resolve the comfy-runner server URL for a named pod.
 
     This is the single source of truth for pod URL resolution. It tries:
-      1. The actual MagicDNS name from the Tailscale REST API (handles
-         hostname drift like ``comfy-foo-1`` after a stale device).
-      2. The expected unsuffixed Tailscale URL (``http://comfy-<name>.<tailnet>:<port>``).
-      3. The RunPod public proxy (``https://<pod_id>-<port>.proxy.runpod.net``).
+      1. The actual host (IPv4 or MagicDNS name) from the Tailscale REST
+         API — handles hostname drift like ``comfy-foo-1`` and
+         duplicate-hostname ambiguity by always picking the
+         most-recently-seen device.
+      2. The expected unsuffixed Tailscale MagicDNS URL
+         (``http://comfy-<name>.<tailnet>:<port>``) for tailnets
+         where API access isn't configured.
+
+    The RunPod public proxy is intentionally NOT a fallback: pods no
+    longer expose public ports, so it would always be unreachable.
 
     When ``raise_on_error`` is False, returns ``None`` if nothing
     could be resolved instead of raising.
     """
-    # 1. Tailscale API lookup — finds drifted hostnames
-    fqdn = _resolve_tailscale_hostname(pod_name)
-    if fqdn:
-        return f"http://{fqdn}:{port}"
+    # 1. Tailscale API lookup — finds drifted hostnames and live devices
+    host = _resolve_tailscale_hostname(pod_name)
+    if host:
+        return f"http://{host}:{port}"
 
-    # 2. Expected (unsuffixed) Tailscale URL
+    # 2. Expected (unsuffixed) Tailscale MagicDNS URL
     try:
         from comfy_runner.hosted.runpod_provider import RunPodProvider
         provider = RunPodProvider()
@@ -483,14 +489,12 @@ def _get_pod_server_url(
     except Exception:
         pass
 
-    # 3. RunPod proxy fallback
-    from comfy_runner.hosted.config import get_pod_record
-    rec = get_pod_record("runpod", pod_name)
-    if rec and rec.get("id"):
-        return f"https://{rec['id']}-{port}.proxy.runpod.net"
-
     if raise_on_error:
-        raise RuntimeError(f"Cannot resolve server URL for pod '{pod_name}'")
+        raise RuntimeError(
+            f"Cannot resolve server URL for pod '{pod_name}'. "
+            f"Tailscale must be configured (auth key) and the pod must "
+            f"be on the tailnet."
+        )
     return None
 
 

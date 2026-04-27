@@ -12,7 +12,11 @@ from .provider import PodInfo, VolumeInfo
 from .runpod_api import RunPodAPI
 
 DEFAULT_IMAGE = "ghcr.io/kosinkadink/comfy-runner:latest"
-DEFAULT_PORTS = ["8188/http", "9189/http", "22/tcp"]
+# No public ports: pods are reachable only via the Tailscale tunnel
+# (HTTP for ComfyUI / comfy-runner, plus Tailscale SSH on port 22).
+# The RunPod public proxy is intentionally disabled to remove the
+# public attack surface; all access is gated by your tailnet ACL.
+DEFAULT_PORTS: list[str] = []
 DEFAULT_CUDA_VERSIONS = ["13.0"]
 
 
@@ -150,11 +154,16 @@ class RunPodProvider:
         return [_pod_info(d) for d in self.api.list_pods()]
 
     def get_pod_url(self, pod_id: str, port: int) -> str | None:
-        """Return the proxy URL for a running pod, or ``None``."""
+        """Return the Tailscale URL for a running pod, or ``None``.
+
+        Pods are reachable only via the Tailscale tunnel — the RunPod
+        public proxy is no longer enabled. Returns ``None`` if the pod
+        is not running or Tailscale is not configured.
+        """
         pod = self.get_pod(pod_id)
         if pod is None or pod.status != "RUNNING":
             return None
-        return f"https://{pod_id}-{port}.proxy.runpod.net"
+        return self.get_pod_tailscale_url(pod.name, port=port)
 
     def get_pod_tailscale_url(self, pod_name: str, port: int = 9189) -> str | None:
         """Return the Tailscale URL for a pod, or None if tailscale is not configured."""

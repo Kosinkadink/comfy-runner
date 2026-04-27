@@ -2509,18 +2509,23 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 record["volume_name"] = volume_name
             set_pod_record("runpod", args.name, record)
 
-            server_url = f"https://{pod.id}-9189.proxy.runpod.net"
-            comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
-            ts_url = provider.get_pod_tailscale_url(args.name)
-            pod_info = _build_pod_info(pod, server_url, comfy_url, ts_url)
+            # Tailscale-only access -- no public RunPod proxy URLs.
+            server_url = provider.get_pod_tailscale_url(args.name, port=9189) or ""
+            comfy_url = provider.get_pod_tailscale_url(args.name, port=8188) or ""
+            pod_info = _build_pod_info(pod, server_url, comfy_url, server_url)
             if args.json:
                 print(json.dumps({"ok": True, "pod": pod_info}, indent=2))
             else:
                 console.print(f"Pod [cyan]{pod.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
-                console.print(f"  Server:    {server_url}")
-                console.print(f"  ComfyUI:   {comfy_url}")
-                if "tailscale_url" in pod_info:
-                    console.print(f"  Tailscale: {pod_info['tailscale_url']}")
+                if server_url:
+                    console.print(f"  Server:    {server_url}")
+                    console.print(f"  ComfyUI:   {comfy_url}")
+                else:
+                    console.print(
+                        "  [yellow]Tailscale not configured -- set "
+                        "tailscale_auth_key (and tailscale_domain) in "
+                        "the runpod provider config to get a URL.[/yellow]",
+                    )
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2587,8 +2592,14 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 console.print(f"  Image:      {pod.image}")
                 console.print(f"  Cost:       ${pod.cost_per_hr:.2f}/hr")
                 if pod.status == "RUNNING":
-                    url = f"https://{pod.id}-8188.proxy.runpod.net"
-                    console.print(f"  ComfyUI:    [link={url}]{url}[/link]")
+                    url = provider.get_pod_tailscale_url(pod.name, port=8188)
+                    if url:
+                        console.print(f"  ComfyUI:    [link={url}]{url}[/link]")
+                    else:
+                        console.print(
+                            "  ComfyUI:    [dim](no Tailscale URL -- "
+                            "configure tailscale_auth_key)[/dim]",
+                        )
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2741,10 +2752,10 @@ def _hosted_init(args: argparse.Namespace) -> None:
             record["volume_name"] = volume_name
         set_pod_record("runpod", args.name, record)
 
-        server_url = f"https://{pod.id}-9189.proxy.runpod.net"
-        comfy_url = f"https://{pod.id}-8188.proxy.runpod.net"
-        ts_url = provider.get_pod_tailscale_url(args.name)
-        pod_info = _build_pod_info(pod, server_url, comfy_url, ts_url)
+        # Tailscale-only access -- no public RunPod proxy URLs.
+        server_url = provider.get_pod_tailscale_url(args.name, port=9189) or ""
+        comfy_url = provider.get_pod_tailscale_url(args.name, port=8188) or ""
+        pod_info = _build_pod_info(pod, server_url, comfy_url, server_url)
 
         if args.json:
             result: dict = {"ok": True, "pod": pod_info}
@@ -2753,10 +2764,15 @@ def _hosted_init(args: argparse.Namespace) -> None:
             print(json.dumps(result, indent=2))
         else:
             console.print(f"Pod [cyan]{args.name}[/cyan] created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)")
-            console.print(f"  Server:    {server_url}")
-            console.print(f"  ComfyUI:   {comfy_url}")
-            if "tailscale_url" in pod_info:
-                console.print(f"  Tailscale: {pod_info['tailscale_url']}")
+            if server_url:
+                console.print(f"  Server:    {server_url}")
+                console.print(f"  ComfyUI:   {comfy_url}")
+            else:
+                console.print(
+                    "  [yellow]Tailscale not configured -- set "
+                    "tailscale_auth_key (and tailscale_domain) in the "
+                    "runpod provider config to get a URL.[/yellow]",
+                )
             console.print()
             console.print("[dim]The pod is booting comfy-runner server. Once ready, use the server URL[/dim]")
             console.print("[dim]to deploy, start ComfyUI, etc. via the API.[/dim]")
@@ -2772,7 +2788,9 @@ def _hosted_init(args: argparse.Namespace) -> None:
 def _resolve_server_url(pod_name: str) -> str:
     """Resolve a pod name to its comfy-runner server URL.
 
-    Prefers Tailscale FQDN when configured, falls back to RunPod proxy.
+    Pods are reachable only via the Tailscale tunnel; the RunPod public
+    proxy is no longer enabled. Raises ``RuntimeError`` if Tailscale
+    isn't configured (no auth key / domain).
     """
     from comfy_runner.hosted.config import get_pod_record
     rec = get_pod_record("runpod", pod_name)
@@ -2781,7 +2799,6 @@ def _resolve_server_url(pod_name: str) -> str:
             f"No pod record for '{pod_name}'. "
             f"Create one with 'hosted init' or 'hosted pod create'."
         )
-    # Prefer Tailscale URL when configured
     from comfy_runner.hosted.runpod_provider import RunPodProvider
     try:
         provider = RunPodProvider()
@@ -2790,7 +2807,11 @@ def _resolve_server_url(pod_name: str) -> str:
             return ts_url
     except RuntimeError:
         pass
-    return f"https://{rec['id']}-9189.proxy.runpod.net"
+    raise RuntimeError(
+        f"Cannot resolve server URL for pod '{pod_name}' -- Tailscale "
+        f"is not configured. Set tailscale_auth_key (and tailscale_domain) "
+        f"in the runpod provider config."
+    )
 
 
 def _hosted_deploy(args: argparse.Namespace) -> None:

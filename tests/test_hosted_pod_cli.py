@@ -11,9 +11,25 @@ from comfy_runner.hosted.provider import PodInfo
 from comfy_runner_cli.cli import main
 
 
+class _MockProviderCtx:
+    """Patch RunPodProvider with sensible defaults for URL lookups.
+
+    Pods are Tailscale-only now; tests that don't care about URLs get
+    a deterministic ``None`` from ``get_pod_tailscale_url`` instead of
+    a non-serializable ``MagicMock``.
+    """
+    def __enter__(self):
+        self._patch = patch("comfy_runner.hosted.runpod_provider.RunPodProvider")
+        MockProv = self._patch.__enter__()
+        MockProv.return_value.get_pod_tailscale_url.return_value = None
+        return MockProv
+    def __exit__(self, *a):
+        return self._patch.__exit__(*a)
+
+
 def _mock_provider():
     """Return a patched RunPodProvider context manager."""
-    return patch("comfy_runner.hosted.runpod_provider.RunPodProvider")
+    return _MockProviderCtx()
 
 
 def _make_pod(**overrides) -> PodInfo:

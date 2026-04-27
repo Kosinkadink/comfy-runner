@@ -155,9 +155,15 @@ def run_on_runpod(
 
         result.pod_id = pod_id
 
-        # Resolve server URL (prefer Tailscale)
+        # Resolve server URL via Tailscale (no public proxy fallback).
         ts_url = provider.get_pod_tailscale_url(pod_name)
-        server_url = ts_url or f"https://{pod_id}-9189.proxy.runpod.net"
+        if not ts_url:
+            raise RuntimeError(
+                f"Cannot resolve server URL for pod '{pod_name}' -- "
+                f"Tailscale is not configured. Set tailscale_auth_key "
+                f"and tailscale_domain in the runpod provider config."
+            )
+        server_url = ts_url
         result.server_url = server_url
 
         # ── Step 2: Wait for server ready ──────────────────────────
@@ -205,8 +211,8 @@ def run_on_runpod(
         # ── Step 4: Run tests locally against remote ComfyUI ───────
         suite = load_suite(config.suite_path)
 
-        # Resolve remote ComfyUI URL (port 8188)
-        comfy_url = ts_url.rsplit(":", 1)[0] + ":8188" if ts_url else f"https://{pod_id}-8188.proxy.runpod.net"
+        # Resolve remote ComfyUI URL (port 8188) via Tailscale.
+        comfy_url = ts_url.rsplit(":", 1)[0] + ":8188"
         out(f"Running test suite '{suite.name}' against {comfy_url}\n")
 
         client = ComfyTestClient(comfy_url, timeout=config.http_timeout)

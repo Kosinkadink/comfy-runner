@@ -118,7 +118,8 @@ class TestRunOnRunpod:
         mock_prov = mock_prov_cls.return_value
         mock_pod = MagicMock(id="pod123", gpu_type="L40S", datacenter="US", cost_per_hr=0.5, image="img")
         mock_prov.create_pod.return_value = mock_pod
-        mock_prov.get_pod_tailscale_url.return_value = None
+        # Tailscale-only access -- pods have no public proxy URL.
+        mock_prov.get_pod_tailscale_url.return_value = "http://comfy-test.example.ts.net:9189"
 
         mock_runner = mock_runner_cls.return_value
         mock_runner.deploy.return_value = {"ok": True, "job_id": "deploy-job"}
@@ -163,7 +164,8 @@ class TestRunOnRunpod:
 
         mock_prov = mock_prov_cls.return_value
         mock_prov.get_pod.return_value = MagicMock(status="RUNNING")
-        mock_prov.get_pod_tailscale_url.return_value = None
+        # Tailscale-only access -- pods have no public proxy URL.
+        mock_prov.get_pod_tailscale_url.return_value = "http://comfy-test.example.ts.net:9189"
 
         mock_runner = mock_runner_cls.return_value
         mock_runner.get_status.return_value = {"running": True}
@@ -196,7 +198,8 @@ class TestRunOnRunpod:
         mock_prov = mock_prov_cls.return_value
         mock_pod = MagicMock(id="pod456", gpu_type="L40S", datacenter="US", cost_per_hr=0.5, image="img")
         mock_prov.create_pod.return_value = mock_pod
-        mock_prov.get_pod_tailscale_url.return_value = None
+        # Tailscale-only access -- pods have no public proxy URL.
+        mock_prov.get_pod_tailscale_url.return_value = "http://comfy-test.example.ts.net:9189"
 
         mock_wait.side_effect = RuntimeError("Server never came up")
 
@@ -227,7 +230,8 @@ class TestRunOnRunpod:
         mock_prov = mock_prov_cls.return_value
         mock_pod = MagicMock(id="pod789", gpu_type="L40S", datacenter="US", cost_per_hr=0.5, image="img")
         mock_prov.create_pod.return_value = mock_pod
-        mock_prov.get_pod_tailscale_url.return_value = None
+        # Tailscale-only access -- pods have no public proxy URL.
+        mock_prov.get_pod_tailscale_url.return_value = "http://comfy-test.example.ts.net:9189"
 
         mock_runner = mock_runner_cls.return_value
         mock_runner.get_status.return_value = {"running": True}
@@ -254,7 +258,8 @@ class TestRunOnRunpod:
         mock_prov = mock_prov_cls.return_value
         mock_pod = MagicMock(id="pod-int", gpu_type="L40S", datacenter="US", cost_per_hr=0.5, image="img")
         mock_prov.create_pod.return_value = mock_pod
-        mock_prov.get_pod_tailscale_url.return_value = None
+        # Tailscale-only access -- pods have no public proxy URL.
+        mock_prov.get_pod_tailscale_url.return_value = "http://comfy-test.example.ts.net:9189"
 
         mock_wait.side_effect = KeyboardInterrupt()
 
@@ -278,7 +283,8 @@ class TestRunOnRunpod:
         mock_prov = mock_prov_cls.return_value
         # Existing pod is terminated
         mock_prov.get_pod.return_value = MagicMock(status="TERMINATED")
-        mock_prov.get_pod_tailscale_url.return_value = None
+        # Tailscale-only access -- pods have no public proxy URL.
+        mock_prov.get_pod_tailscale_url.return_value = "http://comfy-test.example.ts.net:9189"
         # New pod will be created
         mock_new_pod = MagicMock(id="new-pod", gpu_type="L40S", datacenter="US", cost_per_hr=0.5, image="img")
         mock_prov.create_pod.return_value = mock_new_pod
