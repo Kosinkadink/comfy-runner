@@ -103,12 +103,25 @@ class RunPodProvider:
         if github_token:
             pod_env["GITHUB_TOKEN"] = github_token
         # Pass Tailscale auth key for automatic tailnet join
-        from .config import get_tailscale_auth_key
+        from .config import (
+            get_tailscale_api_key,
+            get_tailscale_auth_key,
+            get_tailscale_tailnet,
+        )
         ts_auth_key = get_tailscale_auth_key()
         if ts_auth_key:
             pod_env["TAILSCALE_AUTH_KEY"] = ts_auth_key
             # Use pod name as Tailscale hostname for easy identification
             pod_env["TAILSCALE_HOSTNAME"] = f"comfy-{name}"
+            # Pass API key + tailnet so the pod can clean up its own
+            # stale device entry before joining (avoids -1, -2 suffixes
+            # when a pod with the same name was previously connected).
+            ts_api_key = get_tailscale_api_key()
+            ts_tailnet = get_tailscale_tailnet()
+            if ts_api_key:
+                pod_env["TAILSCALE_API_KEY"] = ts_api_key
+            if ts_tailnet:
+                pod_env["TAILSCALE_TAILNET"] = ts_tailnet
         if env is not None:
             pod_env.update(env)
         if pod_env:

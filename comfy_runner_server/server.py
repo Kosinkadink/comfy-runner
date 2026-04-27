@@ -355,19 +355,126 @@ def _get_runpod_provider():
     return RunPodProvider()
 
 
-def _get_pod_server_url(pod_name: str) -> str:
-    """Resolve the comfy-runner server URL for a named pod via Tailscale."""
-    from comfy_runner.hosted.runpod_provider import RunPodProvider
-    provider = RunPodProvider()
-    url = provider.get_pod_tailscale_url(pod_name, port=9189)
-    if url:
-        return url
-    # Fallback: try RunPod proxy via pod record
+# Cache the Tailscale device list to avoid hammering the API when
+# resolving many pod URLs in a single dashboard / list request.
+_TS_DEVICES_CACHE: dict[str, Any] = {"at": 0.0, "devices": []}
+_TS_DEVICES_TTL = 30.0
+_TS_DEVICES_LOCK = threading.Lock()
+
+
+def _list_tailscale_devices(force: bool = False) -> list[dict[str, Any]]:
+    """Return cached Tailscale device list, refreshing if stale.
+
+    Returns ``[]`` if the API key/tailnet are not configured or the
+    request fails. Cached for ``_TS_DEVICES_TTL`` seconds.
+    """
+    from comfy_runner.hosted.config import (
+        get_tailscale_api_key,
+        get_tailscale_tailnet,
+    )
+    api_key = get_tailscale_api_key()
+    tailnet = get_tailscale_tailnet()
+    if not api_key or not tailnet:
+        return []
+    now = time.monotonic()
+    with _TS_DEVICES_LOCK:
+        if not force and now - _TS_DEVICES_CACHE["at"] < _TS_DEVICES_TTL:
+            return list(_TS_DEVICES_CACHE["devices"])
+    try:
+        import requests as _requests
+        resp = _requests.get(
+            f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/devices",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if not resp.ok:
+            log.warning("Tailscale device list failed: HTTP %s", resp.status_code)
+            return []
+        devices = resp.json().get("devices", []) or []
+    except Exception as e:
+        log.warning("Tailscale device list failed: %s", e)
+        return []
+    with _TS_DEVICES_LOCK:
+        _TS_DEVICES_CACHE["at"] = now
+        _TS_DEVICES_CACHE["devices"] = devices
+    return list(devices)
+
+
+def _resolve_tailscale_hostname(pod_name: str, force: bool = False) -> str | None:
+    """Find the actual MagicDNS FQDN for a pod via Tailscale API.
+
+    Handles the case where the pod's hostname got auto-suffixed
+    (e.g. ``comfy-foo-1`` instead of ``comfy-foo``) due to a stale
+    device entry. Returns the FQDN to use for ``http://...:9189``,
+    or ``None`` if no matching device is found / API not configured.
+    """
+    import re
+    expected = f"comfy-{pod_name}"
+    devices = _list_tailscale_devices(force=force)
+    if not devices:
+        return None
+    suffix_re = re.compile(r"^" + re.escape(expected) + r"(-\d+)?$")
+    exact: dict[str, Any] | None = None
+    suffixed: list[dict[str, Any]] = []
+    for d in devices:
+        host = d.get("hostname", "") or ""
+        if not host:
+            fqdn = d.get("name", "") or ""
+            host = fqdn.split(".", 1)[0]
+        if host == expected:
+            exact = d
+        elif suffix_re.match(host):
+            suffixed.append(d)
+    chosen = exact
+    if not chosen and suffixed:
+        # Pick the most recently created suffixed match
+        suffixed.sort(key=lambda d: d.get("created", ""), reverse=True)
+        chosen = suffixed[0]
+    if not chosen:
+        return None
+    return chosen.get("name") or None
+
+
+def _get_pod_server_url(
+    pod_name: str,
+    port: int = 9189,
+    raise_on_error: bool = True,
+) -> str | None:
+    """Resolve the comfy-runner server URL for a named pod.
+
+    This is the single source of truth for pod URL resolution. It tries:
+      1. The actual MagicDNS name from the Tailscale REST API (handles
+         hostname drift like ``comfy-foo-1`` after a stale device).
+      2. The expected unsuffixed Tailscale URL (``http://comfy-<name>.<tailnet>:<port>``).
+      3. The RunPod public proxy (``https://<pod_id>-<port>.proxy.runpod.net``).
+
+    When ``raise_on_error`` is False, returns ``None`` if nothing
+    could be resolved instead of raising.
+    """
+    # 1. Tailscale API lookup — finds drifted hostnames
+    fqdn = _resolve_tailscale_hostname(pod_name)
+    if fqdn:
+        return f"http://{fqdn}:{port}"
+
+    # 2. Expected (unsuffixed) Tailscale URL
+    try:
+        from comfy_runner.hosted.runpod_provider import RunPodProvider
+        provider = RunPodProvider()
+        url = provider.get_pod_tailscale_url(pod_name, port=port)
+        if url:
+            return url
+    except Exception:
+        pass
+
+    # 3. RunPod proxy fallback
     from comfy_runner.hosted.config import get_pod_record
     rec = get_pod_record("runpod", pod_name)
     if rec and rec.get("id"):
-        return f"https://{rec['id']}-9189.proxy.runpod.net"
-    raise RuntimeError(f"Cannot resolve server URL for pod '{pod_name}'")
+        return f"https://{rec['id']}-{port}.proxy.runpod.net"
+
+    if raise_on_error:
+        raise RuntimeError(f"Cannot resolve server URL for pod '{pod_name}'")
+    return None
 
 
 def _wait_for_remote_server(
@@ -393,6 +500,60 @@ def _wait_for_remote_server(
         out(f"\rWaiting for remote server... ({remaining}s remaining)")
         time.sleep(poll_interval)
     raise RuntimeError(f"Remote server at {server_url} did not become ready within {timeout}s")
+
+
+def _wait_for_pod_server(
+    pod_name: str,
+    timeout: int = 300,
+    poll_interval: int = 10,
+    send_output: Callable[[str], None] | None = None,
+) -> str:
+    """Poll a pod's comfy-runner server until it responds.
+
+    Re-resolves the pod URL on every iteration so that a drifted
+    Tailscale hostname (e.g. ``comfy-foo-1``) registered after pod
+    boot is picked up automatically. Returns the URL that finally
+    responded.
+    """
+    import requests as _requests
+    out = send_output or (lambda _: None)
+    deadline = time.monotonic() + timeout
+    last_url: str | None = None
+    last_logged_url: str | None = None
+    force_refresh = False
+    while time.monotonic() < deadline:
+        # Force a Tailscale device-list refresh periodically so a
+        # newly-registered (suffixed) device shows up in the cache.
+        url = _get_pod_server_url(
+            pod_name, raise_on_error=False,
+        ) if not force_refresh else None
+        if force_refresh:
+            _list_tailscale_devices(force=True)
+            url = _get_pod_server_url(pod_name, raise_on_error=False)
+            force_refresh = False
+        if url:
+            if url != last_logged_url:
+                out(f"Resolved pod URL: {url}\n")
+                last_logged_url = url
+            last_url = url
+            try:
+                resp = _requests.get(f"{url}/system-info", timeout=5)
+                if resp.ok:
+                    resp.json()
+                    out("Remote server is ready.\n")
+                    return url
+            except Exception:
+                pass
+        remaining = int(deadline - time.monotonic())
+        out(f"\rWaiting for pod '{pod_name}' server... ({remaining}s remaining)")
+        time.sleep(poll_interval)
+        # On each retry, force a Tailscale cache refresh so we pick up
+        # newly-registered (possibly suffixed) hostnames.
+        force_refresh = True
+    raise RuntimeError(
+        f"Pod '{pod_name}' server (last URL: {last_url or 'unresolved'}) "
+        f"did not become ready within {timeout}s",
+    )
 
 
 def _build_test_target(target_body: dict[str, Any]):
@@ -2362,11 +2523,11 @@ def create_app() -> Any:
                     entry["gpu_type"] = live.gpu_type or entry["gpu_type"]
                 else:
                     entry["status"] = "UNKNOWN"
-                # Add URLs
-                ts_url = provider.get_pod_tailscale_url(name, port=9189)
-                if ts_url:
-                    entry["server_url"] = ts_url
-                    entry["comfy_url"] = ts_url.rsplit(":", 1)[0] + ":8188"
+                # Add URLs (handles Tailscale hostname drift)
+                server_url = _get_pod_server_url(name, raise_on_error=False)
+                if server_url:
+                    entry["server_url"] = server_url
+                    entry["comfy_url"] = server_url.rsplit(":", 1)[0] + ":8188"
                 result.append(entry)
 
             return jsonify({"ok": True, "pods": result})
@@ -2421,9 +2582,12 @@ def create_app() -> Any:
                             provider.start_pod(rec["id"])
                         else:
                             out(f"Pod '{name}' already running.\n")
-                        server_url = provider.get_pod_tailscale_url(name, port=9189) or ""
-                        if wait_ready and server_url:
-                            _wait_for_remote_server(server_url, send_output=out)
+                        if wait_ready:
+                            server_url = _wait_for_pod_server(name, send_output=out)
+                        else:
+                            server_url = _get_pod_server_url(
+                                name, raise_on_error=False,
+                            ) or ""
                         _jobs.finish(job_id, {
                             "name": name,
                             "id": rec["id"],
@@ -2453,9 +2617,12 @@ def create_app() -> Any:
                 })
                 out(f"Pod created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
 
-                server_url = provider.get_pod_tailscale_url(name, port=9189) or ""
-                if wait_ready and server_url:
-                    _wait_for_remote_server(server_url, send_output=out)
+                if wait_ready:
+                    server_url = _wait_for_pod_server(name, send_output=out)
+                else:
+                    server_url = _get_pod_server_url(
+                        name, raise_on_error=False,
+                    ) or ""
 
                 _jobs.finish(job_id, {
                     "name": name,
@@ -2654,9 +2821,12 @@ def create_app() -> Any:
                 out(f"Starting pod '{name}'...\n")
                 provider.start_pod(rec["id"])
 
-                server_url = provider.get_pod_tailscale_url(name, port=9189) or ""
-                if wait_ready and server_url:
-                    _wait_for_remote_server(server_url, send_output=out)
+                if wait_ready:
+                    server_url = _wait_for_pod_server(name, send_output=out)
+                else:
+                    server_url = _get_pod_server_url(
+                        name, raise_on_error=False,
+                    ) or ""
 
                 _jobs.finish(job_id, {
                     "name": name,
@@ -3181,14 +3351,14 @@ def create_app() -> Any:
                 live_map[p.id] = p
             for pname, rec in records.items():
                 live = live_map.get(pname) or live_map.get(rec.get("id", ""))
-                ts_url = provider.get_pod_tailscale_url(pname, port=9189)
+                server_url = _get_pod_server_url(pname, raise_on_error=False) or ""
                 pods_data.append({
                     "name": pname,
                     "id": rec.get("id", ""),
                     "status": live.status if live else "UNKNOWN",
                     "gpu_type": (live.gpu_type if live else "") or rec.get("gpu_type", ""),
                     "cost_per_hr": live.cost_per_hr if live else 0,
-                    "server_url": ts_url or "",
+                    "server_url": server_url,
                 })
         except Exception:
             pods_data = []

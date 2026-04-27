@@ -115,6 +115,42 @@ def get_tailscale_auth_key() -> str:
     return get_provider_config("runpod").get("tailscale_auth_key", "")
 
 
+def get_tailscale_api_key() -> str:
+    """Get Tailscale API access token (for the Tailscale REST API).
+
+    Distinct from the auth key used by ``tailscale up``: this token has
+    permission to list and delete devices via ``api.tailscale.com``.
+    Read from env var ``TAILSCALE_API_KEY`` first, then provider config
+    key ``tailscale_api_key``.
+    """
+    token = os.environ.get("TAILSCALE_API_KEY", "")
+    if token:
+        return token
+    return get_provider_config("runpod").get("tailscale_api_key", "")
+
+
+def get_tailscale_tailnet() -> str:
+    """Get Tailscale tailnet name (e.g. ``example.com`` or ``-``).
+
+    Used as the ``{tailnet}`` path segment in Tailscale REST API calls.
+    Read from env var ``TAILSCALE_TAILNET`` first, then provider config
+    key ``tailscale_tailnet``, then ``tailscale_domain`` (which on
+    personal Tailscale accounts is the same as the tailnet name), and
+    finally falling back to ``-`` (Tailscale's magic alias for "the
+    default tailnet of the authenticated identity"), which is always
+    safe when only one tailnet is reachable from the credential.
+    """
+    name = os.environ.get("TAILSCALE_TAILNET", "")
+    if name:
+        return name
+    cfg = get_provider_config("runpod")
+    return (
+        cfg.get("tailscale_tailnet", "")
+        or cfg.get("tailscale_domain", "")
+        or "-"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pod registry — track created pods by name
 # ---------------------------------------------------------------------------
