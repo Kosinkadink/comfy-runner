@@ -443,11 +443,12 @@ _ROUTES: list[dict[str, Any]] = [
                                 "type": "boolean",
                                 "default": False,
                                 "description": (
-                                    "Build the standalone env locally (ad-hoc build) instead of downloading a "
-                                    "pre-built release. Implicitly enabled when any build-specific param "
+                                    "Build the standalone env locally (ad-hoc build) instead of downloading "
+                                    "a pre-built release. Implicitly enabled when any build-specific param "
                                     "(python_version, pbs_release, gpu, cuda_tag, torch_version, torch_spec, "
-                                    "torch_index_url) is supplied. Only applies when the installation doesn't "
-                                    "exist yet."
+                                    "torch_index_url) is supplied. An explicit `false` always wins and "
+                                    "suppresses the implicit trigger. Only applies when the installation "
+                                    "doesn't exist yet."
                                 ),
                             },
                             "python_version": {
@@ -493,7 +494,10 @@ _ROUTES: list[dict[str, Any]] = [
                             },
                             "comfyui_ref": {
                                 "type": "string",
-                                "description": "ComfyUI git ref to clone during auto-init.",
+                                "description": (
+                                    "ComfyUI git ref to clone during auto-init. Honored in both the prebuilt "
+                                    "and ad-hoc build flows (does NOT imply build=true)."
+                                ),
                             },
                         },
                     }
