@@ -162,9 +162,17 @@ def get_tailscale_tailnet() -> str:
 # ---------------------------------------------------------------------------
 
 def get_pod_record(provider: str, pod_name: str) -> dict[str, Any] | None:
-    """Return a named pod's record, or ``None`` if it doesn't exist."""
-    pods = get_provider_config(provider).get("pods", {})
-    return pods.get(pod_name)
+    """Return a named pod's record, or ``None`` if it doesn't exist.
+
+    Held under ``_pod_records_lock`` so it can never observe a partial
+    write performed by ``set_pod_record`` / ``update_pod_record`` /
+    ``remove_pod_record``. Returns a shallow copy so callers can mutate
+    the result without corrupting the in-memory config.
+    """
+    with _pod_records_lock:
+        pods = get_provider_config(provider).get("pods", {})
+        rec = pods.get(pod_name)
+        return dict(rec) if rec is not None else None
 
 
 def set_pod_record(provider: str, pod_name: str, data: dict[str, Any]) -> None:
@@ -225,5 +233,12 @@ def remove_pod_record(provider: str, pod_name: str) -> bool:
 
 
 def list_pod_records(provider: str) -> dict[str, dict[str, Any]]:
-    """Return all pod records for a provider."""
-    return get_provider_config(provider).get("pods", {})
+    """Return all pod records for a provider.
+
+    Held under ``_pod_records_lock`` so it never observes a partial
+    write. Returns a fresh dict of shallow record copies so callers
+    can iterate and mutate without corrupting the in-memory config.
+    """
+    with _pod_records_lock:
+        pods = get_provider_config(provider).get("pods", {})
+        return {name: dict(rec) for name, rec in pods.items()}

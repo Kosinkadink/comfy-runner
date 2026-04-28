@@ -241,40 +241,39 @@ def run_on_runpod(
             out_dir = Path(config.suite_path) / "runs" / run_id
 
         # Suite-level watchdog: body-level override beats suite value.
-        budget = config.max_runtime_s
-        if budget is None:
-            suite_budget = getattr(suite, "max_runtime_s", None)
-            if isinstance(suite_budget, int):
-                budget = suite_budget
         # If the caller provided their own ``cancelled`` event we trust
-        # them to also manage the Timer (e.g. the server route handler).
-        # Only spin up an inner Timer when we own the event end-to-end.
-        external_cancellation = cancelled is not None
-        local_cancelled = cancelled if external_cancellation else threading.Event()
-        watchdog: threading.Timer | None = None
-        if not external_cancellation and isinstance(budget, int) and budget > 0:
-            def _abort() -> None:
+        # them to also manage the Timer (e.g. the server route handler);
+        # otherwise we arm our own Timer via the shared context manager.
+        if cancelled is not None:
+            suite_run = run_suite(
+                client, suite, out_dir,
+                timeout=config.timeout,
+                send_output=send_output,
+                cancelled=cancelled,
+            )
+        else:
+            from comfy_runner.testing.client import watchdog as _watchdog
+            budget = config.max_runtime_s
+            if budget is None:
+                suite_budget = getattr(suite, "max_runtime_s", None)
+                if isinstance(suite_budget, int):
+                    budget = suite_budget
+
+            def _on_abort() -> None:
                 out(f"Watchdog: budget {budget}s exceeded — aborting suite\n")
-                local_cancelled.set()
                 # Best-effort interrupt of the running ComfyUI prompt.
                 try:
                     client.interrupt()
                 except Exception:
                     pass
-            watchdog = threading.Timer(budget, _abort)
-            watchdog.daemon = True
-            watchdog.start()
 
-        try:
-            suite_run = run_suite(
-                client, suite, out_dir,
-                timeout=config.timeout,
-                send_output=send_output,
-                cancelled=local_cancelled,
-            )
-        finally:
-            if watchdog is not None:
-                watchdog.cancel()
+            with _watchdog(budget, on_abort=_on_abort) as local_cancelled:
+                suite_run = run_suite(
+                    client, suite, out_dir,
+                    timeout=config.timeout,
+                    send_output=send_output,
+                    cancelled=local_cancelled,
+                )
 
         target_info = {"name": pod_name, "url": comfy_url}
         report = build_report(suite_run, target_info=target_info)

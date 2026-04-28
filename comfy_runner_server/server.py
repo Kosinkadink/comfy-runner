@@ -770,6 +770,44 @@ def _wait_for_pod_server(
 
 
 _VALID_ON_OVERRUN = ("none", "stop", "terminate")
+_VALID_PURPOSES = ("pr", "persistent", "test")
+
+
+def _comfy_url_for_target(target_body: dict[str, Any]) -> str | None:
+    """Resolve the ComfyUI HTTP URL for a target body (best-effort).
+
+    Used by the watchdog's abort callback to send POST /interrupt to
+    the live ComfyUI prompt. Returns ``None`` when the URL cannot be
+    determined (e.g. ephemeral runpod targets that own their own
+    interrupt path inside ``run_on_runpod``).
+    """
+    kind = target_body.get("kind")
+    if kind == "remote":
+        pn = target_body.get("pod_name")
+        if pn:
+            surl = _get_pod_server_url(pn, raise_on_error=False)
+            if surl:
+                return surl.rsplit(":", 1)[0] + ":8188"
+            return None
+        if target_body.get("server_url"):
+            surl = target_body["server_url"]
+            return surl.rsplit(":", 1)[0] + ":8188"
+    elif kind == "local":
+        url = target_body.get("url", "")
+        if url:
+            if "://" not in url:
+                url = f"http://{url}"
+            return url
+    return None
+
+
+def _interrupt_comfy(comfy_url: str) -> None:
+    """Best-effort POST /interrupt to a ComfyUI URL — never raises."""
+    try:
+        from comfy_runner.testing.client import ComfyTestClient
+        ComfyTestClient(comfy_url).interrupt()
+    except Exception:
+        pass
 
 
 def _default_on_overrun_for_kind(kind: str) -> str:
@@ -2947,8 +2985,10 @@ def create_app() -> Any:
         # ``persistent`` by default; let the body override (e.g. ``test``,
         # though test pods normally come from the test runner path).
         purpose = body.get("purpose", "persistent")
-        if not isinstance(purpose, str) or not purpose:
-            return _err("'purpose' must be a non-empty string")
+        if purpose not in _VALID_PURPOSES:
+            return _err(
+                "'purpose' must be one of: " + ", ".join(_VALID_PURPOSES)
+            )
 
         job_id = _jobs.create(label=f"pod create {name}")
 
@@ -3796,48 +3836,18 @@ def create_app() -> Any:
                 if budget is None and isinstance(s.max_runtime_s, int):
                     budget = s.max_runtime_s
 
-                cancelled = threading.Event()
-                watchdog: threading.Timer | None = None
-                if isinstance(budget, int) and budget > 0:
-                    def _abort() -> None:
-                        out(
-                            f"Watchdog: max_runtime_s={budget} exceeded "
-                            f"— aborting test run\n",
-                        )
-                        cancelled.set()
-                        # Best-effort interrupt of the live ComfyUI prompt
-                        # for remote / local targets where we know the URL.
-                        comfy_url = None
-                        if target_body.get("kind") == "remote":
-                            pn = target_body.get("pod_name")
-                            if pn:
-                                surl = _get_pod_server_url(pn, raise_on_error=False)
-                                if surl:
-                                    comfy_url = (
-                                        surl.rsplit(":", 1)[0] + ":8188"
-                                    )
-                            elif target_body.get("server_url"):
-                                surl = target_body["server_url"]
-                                comfy_url = surl.rsplit(":", 1)[0] + ":8188"
-                        elif target_body.get("kind") == "local":
-                            url = target_body.get("url", "")
-                            if url:
-                                if "://" not in url:
-                                    url = f"http://{url}"
-                                comfy_url = url
-                        if comfy_url:
-                            try:
-                                from comfy_runner.testing.client import (
-                                    ComfyTestClient,
-                                )
-                                ComfyTestClient(comfy_url).interrupt()
-                            except Exception:
-                                pass
-                    watchdog = threading.Timer(budget, _abort)
-                    watchdog.daemon = True
-                    watchdog.start()
+                from comfy_runner.testing.client import watchdog as _watchdog
 
-                try:
+                def _on_abort() -> None:
+                    out(
+                        f"Watchdog: max_runtime_s={budget} exceeded "
+                        f"— aborting test run\n",
+                    )
+                    comfy_url = _comfy_url_for_target(target_body)
+                    if comfy_url:
+                        _interrupt_comfy(comfy_url)
+
+                with _watchdog(budget, on_abort=_on_abort) as cancelled:
                     result = target.run(
                         suite=s,
                         output_dir=out_dir,
@@ -3845,9 +3855,6 @@ def create_app() -> Any:
                         send_output=out,
                         cancelled=cancelled,
                     )
-                finally:
-                    if watchdog is not None:
-                        watchdog.cancel()
 
                 summary = result.to_dict()
                 aborted = bool(
@@ -3947,20 +3954,15 @@ def create_app() -> Any:
                 if budget is None and isinstance(s.max_runtime_s, int):
                     budget = s.max_runtime_s
 
-                cancelled = threading.Event()
-                watchdog: threading.Timer | None = None
-                if isinstance(budget, int) and budget > 0:
-                    def _abort() -> None:
-                        out(
-                            f"Watchdog: max_runtime_s={budget} exceeded "
-                            f"— aborting fleet run\n",
-                        )
-                        cancelled.set()
-                    watchdog = threading.Timer(budget, _abort)
-                    watchdog.daemon = True
-                    watchdog.start()
+                from comfy_runner.testing.client import watchdog as _watchdog
 
-                try:
+                def _on_abort() -> None:
+                    out(
+                        f"Watchdog: max_runtime_s={budget} exceeded "
+                        f"— aborting fleet run\n",
+                    )
+
+                with _watchdog(budget, on_abort=_on_abort) as cancelled:
                     fleet_result = run_fleet(
                         targets=targets,
                         suite_path=str(suite_path),
@@ -3971,9 +3973,6 @@ def create_app() -> Any:
                         formats=formats,
                         cancelled=cancelled,
                     )
-                finally:
-                    if watchdog is not None:
-                        watchdog.cancel()
 
                 summary = fleet_result.to_dict()
                 aborted = cancelled.is_set()

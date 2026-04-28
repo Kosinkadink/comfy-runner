@@ -563,6 +563,22 @@ class TestRoutePodsCreatePurpose:
         rec = get_pod_record("runpod", "explicit-pod")
         assert rec["purpose"] == "test"
 
+    def test_invalid_purpose_is_rejected(self, client, tmp_config_dir):
+        """Anything outside the {pr, persistent, test} enum is a 400."""
+        for bad in ("foo", "", None, 42, "PERSISTENT"):
+            resp = client.post("/pods/create", json={
+                "name": "rejecto",
+                "wait_ready": False,
+                "purpose": bad,
+            })
+            assert resp.status_code == 400, (
+                f"purpose={bad!r} should be rejected, got {resp.status_code}"
+            )
+            err = resp.get_json()["error"]
+            assert "purpose" in err
+        # Sanity: no record was ever created for any of the rejected attempts.
+        assert get_pod_record("runpod", "rejecto") is None
+
 
 # =====================================================================
 # /pods/cleanup also removes records

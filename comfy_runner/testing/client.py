@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import requests
 
@@ -21,6 +22,61 @@ _POLL_INTERVAL = 2
 
 class WatchdogAborted(RuntimeError):
     """Raised when a watchdog ``cancelled`` Event fires mid-execution."""
+
+
+@contextmanager
+def watchdog(
+    budget: int | None,
+    on_abort: Callable[[], None] | None = None,
+) -> Iterator[threading.Event]:
+    """Arm a wall-clock watchdog and yield its ``cancelled`` Event.
+
+    If *budget* is None or non-positive, yields an Event that is never
+    set and arms no Timer.
+
+    Otherwise a daemon ``threading.Timer`` is armed for *budget* seconds.
+    When it fires, ``cancelled`` is set and *on_abort* (if given) runs
+    in the Timer thread; exceptions in *on_abort* are swallowed.
+
+    A ``completed`` flag protected by an internal lock guarantees a
+    "first one wins" handoff: when the body of the ``with`` block
+    finishes, the flag is set under the lock before the Timer is
+    cancelled. If the Timer's callback has not yet entered its critical
+    section, it returns without touching ``cancelled``; if it has, the
+    main thread will already see ``cancelled.is_set()`` after the
+    context exits. This eliminates the race where a normally-completing
+    run could be marked aborted because the Timer fired between
+    ``timer.cancel()`` being called and the callback actually running.
+    """
+    cancelled = threading.Event()
+    if not isinstance(budget, int) or budget <= 0:
+        yield cancelled
+        return
+
+    state_lock = threading.Lock()
+    completed = False
+
+    def _fire() -> None:
+        nonlocal completed
+        with state_lock:
+            if completed:
+                return
+            cancelled.set()
+        if on_abort is not None:
+            try:
+                on_abort()
+            except Exception:
+                pass
+
+    timer = threading.Timer(budget, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield cancelled
+    finally:
+        with state_lock:
+            completed = True
+        timer.cancel()
 
 
 @dataclass

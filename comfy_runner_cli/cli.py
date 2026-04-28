@@ -1840,34 +1840,25 @@ def _test_run(args: argparse.Namespace) -> None:
     send_output = None if args.json else (lambda t: console.print(t, end=""))
 
     # Suite-level watchdog: --max-runtime overrides suite.json.
-    import threading as _threading
+    from comfy_runner.testing.client import watchdog as _watchdog
     budget = getattr(args, "max_runtime", None)
     if budget is None and isinstance(suite.max_runtime_s, int):
         budget = suite.max_runtime_s
-    cancelled = _threading.Event()
-    watchdog: _threading.Timer | None = None
-    if isinstance(budget, int) and budget > 0:
-        def _abort() -> None:
-            cancelled.set()
-            try:
-                client.interrupt()
-            except Exception:
-                pass
-        watchdog = _threading.Timer(budget, _abort)
-        watchdog.daemon = True
-        watchdog.start()
+
+    def _on_abort() -> None:
+        try:
+            client.interrupt()
+        except Exception:
+            pass
 
     try:
-        try:
+        with _watchdog(budget, on_abort=_on_abort) as cancelled:
             suite_run = run_suite(
                 client, suite, out_dir,
                 timeout=args.timeout,
                 send_output=send_output,
                 cancelled=cancelled,
             )
-        finally:
-            if watchdog is not None:
-                watchdog.cancel()
     except Exception as e:
         if args.json:
             print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2235,7 +2226,7 @@ def _test_fleet(args: argparse.Namespace) -> None:
     send_output = None if args.json else (lambda t: console.print(t, end=""))
 
     # Fleet-level watchdog: --max-runtime overrides suite.json.
-    import threading as _threading
+    from comfy_runner.testing.client import watchdog as _watchdog
     from comfy_runner.testing.suite import load_suite as _load_suite_for_budget
     budget = getattr(args, "max_runtime", None)
     if budget is None:
@@ -2245,15 +2236,9 @@ def _test_fleet(args: argparse.Namespace) -> None:
                 budget = _suite.max_runtime_s
         except Exception:
             pass
-    cancelled = _threading.Event()
-    watchdog: _threading.Timer | None = None
-    if isinstance(budget, int) and budget > 0:
-        watchdog = _threading.Timer(budget, cancelled.set)
-        watchdog.daemon = True
-        watchdog.start()
 
     try:
-        try:
+        with _watchdog(budget) as cancelled:
             fleet_result = run_fleet(
                 targets=targets,
                 suite_path=args.suite,
@@ -2264,9 +2249,6 @@ def _test_fleet(args: argparse.Namespace) -> None:
                 formats=args.format,
                 cancelled=cancelled,
             )
-        finally:
-            if watchdog is not None:
-                watchdog.cancel()
     except Exception as e:
         if args.json:
             print(json.dumps({"ok": False, "error": str(e)}, indent=2))
