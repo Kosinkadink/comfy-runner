@@ -247,6 +247,20 @@ def _allocate_ngrok_domain(domains: list[str], port: int) -> str:
 # TailscaleTunnel
 # ---------------------------------------------------------------------------
 
+def _stop_tailscale_funnel() -> None:
+    """Best-effort: turn off the tailscale funnel on the default :443 endpoint.
+
+    Funnel only supports a small set of ports; comfy-runner always uses 443,
+    so the off command is the same regardless of which port the state file
+    recorded. Errors are swallowed because callers run this during cleanup
+    paths where partial failure should not propagate.
+    """
+    try:
+        _run_tailscale(["funnel", "--https=443", "off"])
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _funnel_allowed() -> bool:
     """Return True if tailscale funnel (public exposure) is enabled in config.
 
@@ -309,12 +323,7 @@ class TailscaleTunnel:
         return url
 
     def stop(self) -> None:
-        # Funnel uses default port 443 — turn it off via config
-        try:
-            _run_tailscale(["funnel", "--https=443", "off"])
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
+        _stop_tailscale_funnel()
         if self._port is not None:
             _remove_tunnel_state(self._port)
 
@@ -558,42 +567,34 @@ def cleanup_stale_serves(
             continue  # ngrok-style provider with a live child process
 
         if provider == "tailscale" and pid == 0:
+            # active: True = funnel running, False = definitely not running,
+            # None = could not determine.
             active = _tailscale_funnel_active(port)
-            if active is True:
-                if funnel_allowed:
-                    # Operator opted in; preserve the URL across restart.
-                    continue
-                # Orphan funnel discovered while funnels are disallowed —
-                # shut it down so the cleanup is consistent.
-                if send_output:
-                    send_output(
-                        f"  Found active tailscale funnel on port {port} but "
-                        f"tunnel.tailscale.allow_funnel is false; shutting it down.\n"
-                    )
-                try:
-                    _run_tailscale(["funnel", "--https=443", "off"])
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
-            elif active is None:
-                # Could not verify. Best-effort cleanup if funnels aren't
-                # allowed; otherwise preserve and warn.
-                if funnel_allowed:
-                    if send_output:
-                        send_output(
-                            f"  Could not verify tailscale funnel for port {port}; "
-                            f"preserving state file.\n"
-                        )
-                    continue
-                if send_output:
+
+            # When funnels are allowed AND the funnel is (or might be) live,
+            # preserve the state so get_tunnel_url keeps reporting the URL.
+            if funnel_allowed and active is not False:
+                if active is None and send_output:
                     send_output(
                         f"  Could not verify tailscale funnel for port {port}; "
-                        f"attempting best-effort shutdown.\n"
+                        f"preserving state file.\n"
                     )
-                try:
-                    _run_tailscale(["funnel", "--https=443", "off"])
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
-            # active is False: nothing to shut down, just remove the stale file.
+                continue
+
+            # Otherwise: if a funnel is (or might be) live, shut it down so
+            # the runner's view and the actual public exposure stay in sync.
+            if active is True and send_output:
+                send_output(
+                    f"  Found active tailscale funnel on port {port} but "
+                    f"tunnel.tailscale.allow_funnel is false; shutting it down.\n"
+                )
+            elif active is None and send_output:
+                send_output(
+                    f"  Could not verify tailscale funnel for port {port}; "
+                    f"attempting best-effort shutdown.\n"
+                )
+            if active is not False:
+                _stop_tailscale_funnel()
 
         _remove_tunnel_state(port)
         if send_output:
