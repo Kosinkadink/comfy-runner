@@ -439,6 +439,62 @@ _ROUTES: list[dict[str, Any]] = [
                                     "Only applies when the installation doesn't exist yet."
                                 ),
                             },
+                            "build": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Build the standalone env locally (ad-hoc build) instead of downloading a "
+                                    "pre-built release. Implicitly enabled when any build-specific param "
+                                    "(python_version, pbs_release, gpu, cuda_tag, torch_version, torch_spec, "
+                                    "torch_index_url) is supplied. Only applies when the installation doesn't "
+                                    "exist yet."
+                                ),
+                            },
+                            "python_version": {
+                                "type": "string",
+                                "description": (
+                                    "Python version for the ad-hoc build (e.g. '3.12', '3.13.12'). "
+                                    "Setting this implies build=true. Only applies during auto-init."
+                                ),
+                            },
+                            "pbs_release": {
+                                "type": "string",
+                                "description": (
+                                    "python-build-standalone release tag (e.g. '20260211'). "
+                                    "Implies build=true. Only applies during auto-init."
+                                ),
+                            },
+                            "gpu": {
+                                "type": "string",
+                                "description": (
+                                    "GPU preset for ad-hoc build (e.g. 'nvidia', 'nvidia-cu128', 'amd', 'cpu'). "
+                                    "Implies build=true. Only applies during auto-init."
+                                ),
+                            },
+                            "cuda_tag": {
+                                "type": "string",
+                                "description": "Override torch CUDA tag (e.g. 'cu130'). Implies build=true.",
+                            },
+                            "torch_version": {
+                                "type": "string",
+                                "description": "Override torch version (e.g. '2.10.0'). Implies build=true.",
+                            },
+                            "torch_spec": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Full torch install spec (overrides torch_version/cuda_tag). "
+                                    "Implies build=true."
+                                ),
+                            },
+                            "torch_index_url": {
+                                "type": "string",
+                                "description": "Override torch index URL. Implies build=true.",
+                            },
+                            "comfyui_ref": {
+                                "type": "string",
+                                "description": "ComfyUI git ref to clone during auto-init.",
+                            },
                         },
                     }
                 }

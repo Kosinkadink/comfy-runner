@@ -1038,12 +1038,21 @@ def create_app() -> Any:
                         cache_kw: dict = {}
                         if isinstance(cache_releases, int):
                             cache_kw["max_cache_entries"] = cache_releases
+                        # Any build-specific param implicitly enables build mode,
+                        # since these only make sense for the ad-hoc build flow
+                        # (the prebuilt flow ships a fixed Python/torch combo).
+                        _build_trigger_keys = (
+                            "python_version", "pbs_release", "gpu",
+                            "cuda_tag", "torch_version", "torch_spec",
+                            "torch_index_url",
+                        )
+                        build_requested = bool(body.get("build")) or any(
+                            k in body for k in _build_trigger_keys
+                        )
                         build_kw: dict = {}
-                        if body.get("build"):
+                        if build_requested:
                             build_kw["build"] = True
-                            for bk in ("python_version", "pbs_release", "gpu",
-                                       "cuda_tag", "torch_version", "torch_spec",
-                                       "torch_index_url", "comfyui_ref"):
+                            for bk in _build_trigger_keys + ("comfyui_ref",):
                                 if bk in body:
                                     build_kw[bk] = body[bk]
                         init_installation(
@@ -2747,11 +2756,15 @@ def create_app() -> Any:
                     deploy_body["launch_args"] = body["launch_args"]
                 if body.get("cuda_compat"):
                     deploy_body["cuda_compat"] = True
-                if body.get("build"):
+                # Any build-specific param implicitly enables build mode.
+                _build_trigger_keys = (
+                    "python_version", "pbs_release", "gpu",
+                    "cuda_tag", "torch_version", "torch_spec",
+                    "torch_index_url",
+                )
+                if body.get("build") or any(k in body for k in _build_trigger_keys):
                     deploy_body["build"] = True
-                    for bk in ("python_version", "pbs_release", "gpu",
-                                "cuda_tag", "torch_version", "torch_spec",
-                                "torch_index_url", "comfyui_ref"):
+                    for bk in _build_trigger_keys + ("comfyui_ref",):
                         if bk in body:
                             deploy_body[bk] = body[bk]
 
