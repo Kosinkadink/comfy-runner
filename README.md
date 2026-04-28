@@ -530,11 +530,14 @@ This gives you private HTTPS access to the control API via Tailscale, with the a
 | `GET` | `/test/results/{run_id}` | Get test results |
 | `GET` | `/test/suites` | List available test suites |
 | | | **Central Orchestration — Pods** |
-| `GET` | `/pods` | List all pods with live status |
-| `POST` | `/pods/create` | Create a RunPod pod (async) |
+| `GET` | `/pods` | List all pods with live status (filter with `?purpose=pr\|persistent\|test`) |
+| `POST` | `/pods/create` | Create a RunPod pod (async); body `purpose` defaults to `persistent` |
+| `POST` | `/pods/launch-pr` | Atomic create-or-wake + deploy a PR (tags `purpose=pr`, async) |
 | `POST` | `/pods/{name}/deploy` | Deploy to a pod (async) |
 | `POST` | `/pods/{name}/start` | Start a stopped pod (async) |
 | `POST` | `/pods/{name}/stop` | Stop a pod |
+| `POST` | `/pods/{name}/touch` | Reset the idle timer on a PR pod |
+| `POST` | `/pods/cleanup` | Terminate orphaned test pods (also removes registry records) |
 | `DELETE` | `/pods/{name}` | Terminate a pod |
 | | | **Central Orchestration — Tests** |
 | `POST` | `/tests/run` | Run a test suite against a target (async) |

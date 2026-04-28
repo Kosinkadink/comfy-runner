@@ -1292,11 +1292,13 @@ _ROUTES: list[dict[str, Any]] = [
                             "wait_ready": {"type": "boolean", "default": True, "description": "Wait for the pod's comfy-runner server to be reachable"},
                             "purpose": {
                                 "type": "string",
+                                "enum": ["pr", "persistent", "test"],
                                 "default": "persistent",
                                 "description": (
                                     "Recorded purpose tag for the pod. Defaults to ``persistent``. "
                                     "Use ``pr`` for review pods (also stamped automatically by /pods/launch-pr) "
-                                    "or ``test`` for ephemeral test-runner pods (stamped automatically by the test runner)."
+                                    "or ``test`` for ephemeral test-runner pods (stamped automatically by the test runner). "
+                                    "Any other value is rejected with HTTP 400."
                                 ),
                             },
                         },
