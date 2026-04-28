@@ -375,6 +375,14 @@ comfy_runner.py station pods create my-pod --gpu "NVIDIA L40S"
 # Deploy a PR to a pod
 comfy_runner.py station pods deploy my-pod --pr 1234
 
+# Launch a PR-review pod in one step (create-or-wake + deploy --pr)
+# Names the pod ``pr-<repo-slug>-<num>`` and tags it for the idle reaper.
+comfy_runner.py station pods launch-pr 1234 --repo comfy-org/ComfyUI
+
+# PR-review pods auto-stop after 10 min of inactivity (default).
+# Defer the reaper or wake a sleeping pod manually:
+comfy_runner.py station pods touch pr-comfy-org-comfyui-1234
+
 # Stop / start / terminate a pod
 comfy_runner.py station pods stop my-pod
 comfy_runner.py station pods start my-pod
@@ -385,6 +393,11 @@ comfy_runner.py station tests run smoke --target remote:my-pod
 
 # Fleet test across multiple pods
 comfy_runner.py station tests fleet smoke --target remote:pod-l40s --target remote:pod-4090
+
+# Cap runtime with a watchdog and choose what to do on overrun
+# (--on-overrun: none | stop | terminate; defaults depend on target type)
+comfy_runner.py station tests run smoke --target remote:my-pod \
+    --max-runtime 1800 --on-overrun stop
 
 # List recent test runs
 comfy_runner.py station tests list

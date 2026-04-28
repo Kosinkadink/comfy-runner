@@ -275,7 +275,7 @@ class TestRunSuite:
         test_file = wf1_out / "out.png"
         test_file.write_bytes(b"test data")
 
-        def _mock_run(wf, od, timeout=600):
+        def _mock_run(wf, od, timeout=600, cancelled=None):
             result = _mock_prompt_result()
             # Set local_path on the output file
             result.outputs["9"][0].local_path = test_file
@@ -293,3 +293,84 @@ class TestRunSuite:
         assert test_run.comparisons["wf1"][0].result.passed is True
         # wf2 has no baseline → no comparisons
         assert "wf2" not in test_run.comparisons
+
+
+# ---------------------------------------------------------------------------
+# Watchdog cancellation
+# ---------------------------------------------------------------------------
+
+class TestRunSuiteCancellation:
+    def test_pre_set_event_aborts_immediately(self, tmp_path):
+        """When ``cancelled`` is already set, no workflows run and a
+        synthetic ``__watchdog__`` failure row is appended."""
+        import threading
+
+        suite_dir = _make_suite_dir(tmp_path)
+        suite = load_suite(suite_dir)
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.side_effect = AssertionError(
+            "should not be called when cancelled is pre-set"
+        )
+
+        out_dir = tmp_path / "run_output"
+        cancelled = threading.Event()
+        cancelled.set()
+
+        test_run = run_suite(client, suite, out_dir, cancelled=cancelled)
+
+        assert test_run.timed_out is True
+        assert test_run.aborted_reason == "overrun"
+        assert test_run.failed >= 1
+        # Synthetic row inserted because no workflow ran.
+        assert any(r.workflow_name == "__watchdog__" for r in test_run.results)
+        client.run_workflow.assert_not_called()
+
+    def test_event_set_between_workflows(self, tmp_path):
+        """Setting cancelled after the first workflow runs prevents the
+        second workflow from running."""
+        import threading
+
+        suite_dir = _make_suite_dir(tmp_path)
+        suite = load_suite(suite_dir)
+
+        cancelled = threading.Event()
+        call_count = {"n": 0}
+
+        def _run(wf, od, timeout=600, cancelled=None):
+            call_count["n"] += 1
+            # Trip the watchdog after the first workflow completes.
+            if cancelled is not None:
+                cancelled.set()
+            return _mock_prompt_result()
+
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.side_effect = _run
+
+        out_dir = tmp_path / "run_output"
+        test_run = run_suite(client, suite, out_dir, cancelled=cancelled)
+
+        assert call_count["n"] == 1, "second workflow must be skipped"
+        assert test_run.timed_out is True
+        # First workflow result is preserved; synthetic row added because
+        # no in-flight workflow recorded ``error="overrun"``.
+        assert any(r.error == "overrun" for r in test_run.results)
+
+
+class TestRunWorkflowCancellation:
+    def test_aborts_on_watchdog_event(self, tmp_path):
+        """``WatchdogAborted`` raised inside ``client.run_workflow``
+        becomes a result row with ``error='overrun'``."""
+        import threading
+        from comfy_runner.testing.client import WatchdogAborted
+
+        suite_dir = _make_suite_dir(tmp_path)
+        wf_path = suite_dir / "workflows" / "wf1.json"
+        client = MagicMock(spec=ComfyTestClient)
+        client.run_workflow.side_effect = WatchdogAborted("aborted")
+
+        result = run_workflow(
+            client, wf_path, tmp_path / "out",
+            cancelled=threading.Event(),
+        )
+        assert result.passed is False
+        assert result.error == "overrun"

@@ -54,6 +54,10 @@ class Suite:
     workflows: list[Path]
     baselines_dir: Path
     config: dict[str, Any] = field(default_factory=dict)
+    # Optional wall-clock budget for one target's run of this suite, in
+    # seconds. If exceeded, the watchdog (in the server worker thread or
+    # ``run_on_runpod``) aborts the run and dispatches ``on_overrun``.
+    max_runtime_s: int | None = None
 
     def has_baseline(self, workflow_stem: str) -> bool:
         """Check if approved baselines exist for a workflow."""
@@ -111,6 +115,20 @@ def load_suite(suite_path: str | Path) -> TestSuite:
     name = meta.get("name", suite_path.name)
     description = meta.get("description", "")
     required_models = meta.get("required_models", [])
+    raw_max_runtime = meta.get("max_runtime_s")
+    if raw_max_runtime is None:
+        max_runtime_s: int | None = None
+    else:
+        try:
+            max_runtime_s = int(raw_max_runtime)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid max_runtime_s in suite.json: {raw_max_runtime!r}"
+            ) from exc
+        if max_runtime_s <= 0:
+            raise ValueError(
+                f"max_runtime_s must be > 0, got {max_runtime_s}"
+            )
 
     # Discover workflows
     workflows_dir = suite_path / "workflows"
@@ -142,6 +160,7 @@ def load_suite(suite_path: str | Path) -> TestSuite:
         workflows=workflows,
         baselines_dir=baselines_dir,
         config=config,
+        max_runtime_s=max_runtime_s,
     )
 
 

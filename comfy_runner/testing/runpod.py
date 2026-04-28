@@ -10,6 +10,7 @@ suite directory to exist on the pod's filesystem.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,11 @@ from typing import Any, Callable
 
 import requests
 
-from comfy_runner.hosted.config import get_pod_record, set_pod_record
+from comfy_runner.hosted.config import (
+    get_pod_record,
+    remove_pod_record,
+    set_pod_record,
+)
 from comfy_runner.hosted.remote import RemoteRunner
 from comfy_runner.hosted.runpod_provider import RunPodProvider
 from comfy_runner.testing.client import ComfyTestClient
@@ -46,6 +51,15 @@ class RunPodTestConfig:
     terminate: bool = True
     install_name: str = "main"
     output_dir: str | None = None
+    # Suite-level wall-clock budget. Falls back to ``suite.max_runtime_s``
+    # loaded from suite.json when None.
+    max_runtime_s: int | None = None
+    # ``"none"`` | ``"stop"`` | ``"terminate"`` — only ``"terminate"``
+    # is meaningful inside ``run_on_runpod`` (it forces teardown of the
+    # pod even when ``terminate=False``); other values are honored by
+    # the server-side route handler. Defaults to None which behaves as
+    # ``"terminate"`` for ephemeral pods.
+    on_overrun: str | None = None
 
 
 @dataclass
@@ -60,6 +74,8 @@ class RunPodTestResult:
     error: str | None = None
     terminated: bool = False
     report: Any = None  # SuiteReport, kept as Any to avoid circular-ish typing
+    timed_out: bool = False
+    aborted_reason: str | None = None
 
 
 def _wait_for_server(
@@ -98,6 +114,7 @@ def _wait_for_server(
 def run_on_runpod(
     config: RunPodTestConfig,
     send_output: Callable[[str], None] | None = None,
+    cancelled: threading.Event | None = None,
 ) -> RunPodTestResult:
     """Execute the full provision → deploy → test → teardown lifecycle.
 
@@ -147,6 +164,7 @@ def run_on_runpod(
                 "gpu_type": pod.gpu_type,
                 "datacenter": pod.datacenter,
                 "image": pod.image,
+                "purpose": "test",
             })
             out(f"Pod created (id: {pod_id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
         elif pod and pod.status != "RUNNING":
@@ -222,11 +240,41 @@ def run_on_runpod(
         else:
             out_dir = Path(config.suite_path) / "runs" / run_id
 
-        suite_run = run_suite(
-            client, suite, out_dir,
-            timeout=config.timeout,
-            send_output=send_output,
-        )
+        # Suite-level watchdog: body-level override beats suite value.
+        budget = config.max_runtime_s
+        if budget is None:
+            suite_budget = getattr(suite, "max_runtime_s", None)
+            if isinstance(suite_budget, int):
+                budget = suite_budget
+        # If the caller provided their own ``cancelled`` event we trust
+        # them to also manage the Timer (e.g. the server route handler).
+        # Only spin up an inner Timer when we own the event end-to-end.
+        external_cancellation = cancelled is not None
+        local_cancelled = cancelled if external_cancellation else threading.Event()
+        watchdog: threading.Timer | None = None
+        if not external_cancellation and isinstance(budget, int) and budget > 0:
+            def _abort() -> None:
+                out(f"Watchdog: budget {budget}s exceeded — aborting suite\n")
+                local_cancelled.set()
+                # Best-effort interrupt of the running ComfyUI prompt.
+                try:
+                    client.interrupt()
+                except Exception:
+                    pass
+            watchdog = threading.Timer(budget, _abort)
+            watchdog.daemon = True
+            watchdog.start()
+
+        try:
+            suite_run = run_suite(
+                client, suite, out_dir,
+                timeout=config.timeout,
+                send_output=send_output,
+                cancelled=local_cancelled,
+            )
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
 
         target_info = {"name": pod_name, "url": comfy_url}
         report = build_report(suite_run, target_info=target_info)
@@ -235,6 +283,8 @@ def run_on_runpod(
         write_report(report, out_dir, formats=formats_list)
 
         result.report = report
+        result.timed_out = bool(getattr(suite_run, "timed_out", False))
+        result.aborted_reason = getattr(suite_run, "aborted_reason", None)
         result.test_result = {
             "run_id": run_id,
             "suite_name": suite.name,
@@ -243,8 +293,13 @@ def run_on_runpod(
             "passed": report.passed,
             "failed": report.failed,
             "duration": report.duration,
+            "timed_out": result.timed_out,
+            "aborted_reason": result.aborted_reason,
         }
-        out("Tests complete.\n")
+        if result.timed_out:
+            out("Tests aborted by watchdog (overrun).\n")
+        else:
+            out("Tests complete.\n")
 
     except KeyboardInterrupt:
         out("\nInterrupted.\n")
@@ -254,12 +309,24 @@ def run_on_runpod(
         out(f"Error: {e}\n")
     finally:
         # ── Step 5: Teardown ───────────────────────────────────────
-        if config.terminate and pod_id and created_pod:
+        # Force termination on overrun if the watchdog says so, even
+        # when ``terminate=False`` was specified — otherwise a hung
+        # ephemeral pod could keep burning GPU after we've given up.
+        force_terminate = (
+            result.timed_out and config.on_overrun == "terminate"
+        )
+        if (config.terminate or force_terminate) and pod_id and created_pod:
             try:
                 out(f"Terminating pod '{pod_name}'...\n")
                 provider.terminate_pod(pod_id)
                 result.terminated = True
                 out("Pod terminated.\n")
+                # Mirror /pods/<name> DELETE: remove the record so the
+                # registry doesn't accumulate stale test-pod entries.
+                try:
+                    remove_pod_record("runpod", pod_name)
+                except Exception as re:
+                    out(f"Warning: failed to remove pod record: {re}\n")
             except Exception as te:
                 out(f"Warning: failed to terminate pod: {te}\n")
 

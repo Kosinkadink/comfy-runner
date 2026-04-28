@@ -7,6 +7,7 @@ WebSockets to simplify proxying through the comfy-runner server.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,10 @@ import requests
 
 _TIMEOUT = 30
 _POLL_INTERVAL = 2
+
+
+class WatchdogAborted(RuntimeError):
+    """Raised when a watchdog ``cancelled`` Event fires mid-execution."""
 
 
 @dataclass
@@ -104,15 +109,34 @@ class ComfyTestClient:
         self,
         prompt_id: str,
         timeout: int = 600,
+        cancelled: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Poll ``/history/{prompt_id}`` until the prompt completes.
 
         Returns the raw history entry dict.
         Raises ``RuntimeError`` on timeout or execution error.
+        Raises ``WatchdogAborted`` if *cancelled* is set during the poll
+        loop — used by the suite-level watchdog to abort an in-flight
+        workflow.
         """
         deadline = time.monotonic() + timeout
 
         while True:
+            if cancelled is not None and cancelled.is_set():
+                # Best-effort cancel of the ComfyUI side as well, so we
+                # don't leave the GPU spinning past our budget. The
+                # watchdog Timer normally calls this directly via
+                # ``client.interrupt()``, but the runner's poll loop
+                # also calls it here so callers without direct Timer
+                # access (e.g. simple unit tests) still send the
+                # interrupt.
+                try:
+                    self.interrupt()
+                except Exception:
+                    pass
+                raise WatchdogAborted(
+                    f"Prompt {prompt_id} aborted by watchdog"
+                )
             if time.monotonic() > deadline:
                 raise RuntimeError(
                     f"Prompt {prompt_id} timed out after {timeout}s"
@@ -144,6 +168,25 @@ class ComfyTestClient:
 
             # Completed (status_str == "success" or outputs are present)
             return entry
+
+    # ------------------------------------------------------------------
+    # Interrupt — abort the currently executing prompt
+    # ------------------------------------------------------------------
+
+    def interrupt(self) -> bool:
+        """Issue ``POST /interrupt`` to ComfyUI to cancel the running prompt.
+
+        Returns ``True`` if the request returned a 2xx response, ``False``
+        on any HTTP error (e.g. unreachable server). Never raises — this
+        is best-effort signalling from the watchdog.
+        """
+        try:
+            resp = requests.post(
+                f"{self.base_url}/interrupt", timeout=self.timeout,
+            )
+            return resp.ok
+        except requests.RequestException:
+            return False
 
     # ------------------------------------------------------------------
     # Output extraction
@@ -243,6 +286,7 @@ class ComfyTestClient:
         workflow: dict[str, Any],
         output_dir: Path,
         timeout: int = 600,
+        cancelled: threading.Event | None = None,
     ) -> PromptResult:
         """Queue a workflow, wait for completion, and download outputs.
 
@@ -252,7 +296,9 @@ class ComfyTestClient:
         prompt_id = self.queue_prompt(workflow)
 
         t0 = time.monotonic()
-        history = self.wait_for_completion(prompt_id, timeout=timeout)
+        history = self.wait_for_completion(
+            prompt_id, timeout=timeout, cancelled=cancelled,
+        )
         elapsed = time.monotonic() - t0
 
         outputs = self.download_all_outputs(history, output_dir)
