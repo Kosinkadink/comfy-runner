@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from comfy_runner.config import get_github_token
 from .config import get_provider_config, get_runpod_api_key
 
 import os
@@ -11,8 +12,12 @@ from .provider import PodInfo, VolumeInfo
 from .runpod_api import RunPodAPI
 
 DEFAULT_IMAGE = "ghcr.io/kosinkadink/comfy-runner:latest"
-DEFAULT_PORTS = ["8188/http", "9189/http", "22/tcp"]
-DEFAULT_CUDA_VERSIONS = ["12.4", "12.6", "12.8", "13.0"]
+# No public ports: pods are reachable only via the Tailscale tunnel
+# (HTTP for ComfyUI / comfy-runner, plus Tailscale SSH on port 22).
+# The RunPod public proxy is intentionally disabled to remove the
+# public attack surface; all access is gated by your tailnet ACL.
+DEFAULT_PORTS: list[str] = []
+DEFAULT_CUDA_VERSIONS = ["13.0"]
 
 
 def _pod_info(data: dict[str, Any]) -> PodInfo:
@@ -53,16 +58,10 @@ class RunPodProvider:
             )
         self.api = RunPodAPI(api_key)
         cfg = get_provider_config("runpod")
-        self.default_gpu: str = cfg.get("default_gpu", "NVIDIA L40S")
-        self.default_datacenter: str = cfg.get("default_datacenter", "US-KS-2")
+        self.default_gpu: str = cfg.get("default_gpu", "NVIDIA GeForce RTX 5090")
+        self.default_datacenter: str = cfg.get("default_datacenter", "")
         self.default_cloud_type: str = cfg.get("default_cloud_type", "SECURE")
         self.default_image: str = cfg.get("default_image", DEFAULT_IMAGE)
-
-    @staticmethod
-    def _get_github_token() -> str:
-        """Get GitHub token for private repo cloning on pods."""
-        from comfy_runner.config import get_github_token
-        return get_github_token()
 
     # ------------------------------------------------------------------
     # Pod methods
@@ -102,11 +101,31 @@ class RunPodProvider:
             params["networkVolumeId"] = volume_id
         elif volume_size_gb is not None:
             params["volumeInGb"] = volume_size_gb
-        # Build env vars — inject GITHUB_TOKEN for private repo cloning
+        # Build env vars — pass GITHUB_TOKEN for API rate limits
         pod_env: dict[str, str] = {}
-        github_token = self._get_github_token()
+        github_token = get_github_token()
         if github_token:
             pod_env["GITHUB_TOKEN"] = github_token
+        # Pass Tailscale auth key for automatic tailnet join
+        from .config import (
+            get_tailscale_api_key,
+            get_tailscale_auth_key,
+            get_tailscale_tailnet,
+        )
+        ts_auth_key = get_tailscale_auth_key()
+        if ts_auth_key:
+            pod_env["TAILSCALE_AUTH_KEY"] = ts_auth_key
+            # Use pod name as Tailscale hostname for easy identification
+            pod_env["TAILSCALE_HOSTNAME"] = f"comfy-{name}"
+            # Pass API key + tailnet so the pod can clean up its own
+            # stale device entry before joining (avoids -1, -2 suffixes
+            # when a pod with the same name was previously connected).
+            ts_api_key = get_tailscale_api_key()
+            ts_tailnet = get_tailscale_tailnet()
+            if ts_api_key:
+                pod_env["TAILSCALE_API_KEY"] = ts_api_key
+            if ts_tailnet:
+                pod_env["TAILSCALE_TAILNET"] = ts_tailnet
         if env is not None:
             pod_env.update(env)
         if pod_env:
@@ -135,11 +154,29 @@ class RunPodProvider:
         return [_pod_info(d) for d in self.api.list_pods()]
 
     def get_pod_url(self, pod_id: str, port: int) -> str | None:
-        """Return the proxy URL for a running pod, or ``None``."""
+        """Return the Tailscale URL for a running pod, or ``None``.
+
+        Pods are reachable only via the Tailscale tunnel — the RunPod
+        public proxy is no longer enabled. Returns ``None`` if the pod
+        is not running or Tailscale is not configured.
+        """
         pod = self.get_pod(pod_id)
         if pod is None or pod.status != "RUNNING":
             return None
-        return f"https://{pod_id}-{port}.proxy.runpod.net"
+        return self.get_pod_tailscale_url(pod.name, port=port)
+
+    def get_pod_tailscale_url(self, pod_name: str, port: int = 9189) -> str | None:
+        """Return the Tailscale URL for a pod, or None if tailscale is not configured."""
+        from .config import get_tailscale_auth_key
+        if not get_tailscale_auth_key():
+            return None
+        ts_domain = get_provider_config("runpod").get("tailscale_domain", "")
+        if not ts_domain:
+            return None
+        # Use HTTP — Tailscale in userspace-networking mode (required on RunPod)
+        # doesn't support tailscale serve (HTTPS proxy), but the Tailscale
+        # tunnel itself provides encryption.
+        return f"http://comfy-{pod_name}.{ts_domain}:{port}"
 
     # ------------------------------------------------------------------
     # Volume methods

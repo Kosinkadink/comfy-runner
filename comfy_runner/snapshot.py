@@ -796,10 +796,10 @@ def restore_custom_nodes(
     Mirrors snapshots.ts restoreCustomNodes. Returns a result dict with
     installed/removed/switched/enabled/disabled/skipped/failed lists.
     """
+    from safe_file import is_safe_path_component as _is_safe_path_component
     from .nodes import (
         scan_custom_nodes, node_key, add_cnr_node, add_git_node,
         enable_node, disable_node, remove_node, _run_post_install,
-        _is_safe_path_component,
     )
     from .git_utils import is_git_available, git_fetch_and_checkout
 

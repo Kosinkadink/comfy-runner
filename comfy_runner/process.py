@@ -28,6 +28,7 @@ HEALTH_ENDPOINT = "/api/system_stats"
 HEALTH_TIMEOUT_S = 300
 HEALTH_POLL_INTERVAL_S = 1.0
 STOP_TIMEOUT_S = 10
+PORT_RELEASE_TIMEOUT_S = 5
 
 # Sensitive arg names whose *values* should be redacted in logged commands
 _SENSITIVE_ARG_RE_STR = r"^--(api[-_]?key|token|secret|password|auth)$"
@@ -71,15 +72,15 @@ def is_process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if sys.platform == "win32":
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            return str(pid) in result.stdout
-        except (subprocess.TimeoutExpired, OSError):
-            return False
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
     else:
         try:
             os.kill(pid, 0)
@@ -210,6 +211,38 @@ def find_available_port(
     return None
 
 
+def wait_for_port_release(
+    port: int,
+    timeout_s: float = PORT_RELEASE_TIMEOUT_S,
+    send_output: Callable[[str], None] | None = None,
+) -> bool:
+    """Wait until a port is no longer in use. Returns True if released."""
+    if not is_port_in_use(port):
+        return True
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(0.3)
+        if not is_port_in_use(port):
+            return True
+    if send_output:
+        send_output(f"⚠ Port {port} still in use after {timeout_s}s\n")
+    return False
+
+
+def kill_port_occupants(
+    port: int,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Find and kill any processes listening on a port."""
+    pids = find_pids_by_port(port)
+    if not pids:
+        return
+    if send_output:
+        send_output(f"Killing stale process(es) on port {port}: {pids}\n")
+    for pid in pids:
+        kill_process_tree(pid)
+
+
 # ---------------------------------------------------------------------------
 # Build launch command — mirrors standalone.ts getLaunchCommand
 # ---------------------------------------------------------------------------
@@ -302,6 +335,17 @@ def _redact_cmd_line(cmd: str, args: list[str]) -> str:
     return " ".join(parts)
 
 
+def _merge_env(
+    record_env: dict[str, str] | None,
+    overrides: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Merge persisted env vars with runtime overrides. Returns None if empty."""
+    merged = dict(record_env or {})
+    if overrides:
+        merged.update(overrides)
+    return merged or None
+
+
 def spawn_comfyui(
     install_path: str | Path,
     extra_args: str = "",
@@ -311,6 +355,7 @@ def spawn_comfyui(
     stdout: Any = None,
     stderr: Any = None,
     send_output: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Spawn the ComfyUI process.
 
@@ -363,7 +408,7 @@ def spawn_comfyui(
         send_output(f"> {cmd_line}\n\n")
 
     # Spawn with PYTHONIOENCODING=utf-8 (mirrors Desktop 2.0)
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", **(env_overrides or {})}
 
     kwargs: dict[str, Any] = {
         "cwd": launch["cwd"],
@@ -473,6 +518,7 @@ def start_installation(
     port_conflict: str = "auto",
     extra_args: str | None = None,
     send_output: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Start a ComfyUI installation in background mode. Returns running state dict."""
     record = get_installation(name)
@@ -502,6 +548,8 @@ def start_installation(
     if extra_args:
         launch_args = f"{launch_args} {extra_args}".strip()
 
+    merged_env = _merge_env(record.get("env"), env_overrides)
+
     if send_output:
         send_output(f"Starting '{name}'...\n")
 
@@ -517,7 +565,7 @@ def start_installation(
     pre_extras: set[str] | None = None
     if shared_dir:
         from .shared_paths import discover_extra_model_folders
-        pre_extras = discover_extra_model_folders(install_path)
+        pre_extras = discover_extra_model_folders(install_path, shared_dir)
 
     try:
         result = spawn_comfyui(
@@ -529,6 +577,7 @@ def start_installation(
             stdout=log_fh,
             stderr=log_fh,
             send_output=send_output,
+            env_overrides=merged_env or None,
         )
     except Exception:
         log_fh.close()
@@ -539,12 +588,19 @@ def start_installation(
     # prevents rotate_log() from renaming it on next restart.
     log_fh.close()
 
-    # Wait for health check
-    wait_for_ready(
-        port=result["port"],
-        pid=result["pid"],
-        send_output=send_output,
-    )
+    # Wait for health check — kill the process if it never becomes ready
+    try:
+        wait_for_ready(
+            port=result["port"],
+            pid=result["pid"],
+            send_output=send_output,
+        )
+    except RuntimeError:
+        # Clean up the spawned process so it doesn't linger
+        kill_process_tree(result["pid"])
+        _remove_pidfile(install_path)
+        remove_port_lock(result["port"])
+        raise
 
     # Post-boot: check if custom nodes created new model folders
     if shared_dir and pre_extras is not None:
@@ -564,6 +620,10 @@ def start_installation(
                 time.sleep(0.3)
             _remove_pidfile(install_path)
             remove_port_lock(result["port"])
+            # Kill orphaned children and wait for port release before respawn
+            if is_port_in_use(result["port"]):
+                kill_port_occupants(result["port"], send_output=send_output)
+            wait_for_port_release(result["port"], send_output=send_output)
 
             # Append to current log and respawn (YAML was already rewritten by sync)
             log_fh2 = open(log_file, "a", encoding="utf-8")
@@ -578,6 +638,7 @@ def start_installation(
                 stdout=log_fh2,
                 stderr=log_fh2,
                 send_output=send_output,
+                env_overrides=merged_env or None,
             )
             log_fh2.close()
             wait_for_ready(
@@ -643,6 +704,10 @@ def stop_installation(
     _remove_pidfile(install_path)
     if port:
         remove_port_lock(port)
+        # Kill any orphaned child processes still holding the port
+        if is_port_in_use(port):
+            kill_port_occupants(port, send_output=send_output)
+        wait_for_port_release(port, send_output=send_output)
 
 
 def get_status(name: str) -> dict[str, Any]:
@@ -725,6 +790,7 @@ def start_foreground(
     port_conflict: str = "auto",
     extra_args: str | None = None,
     send_output: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Start ComfyUI and stream output to send_output, blocking until exit.
 
@@ -756,6 +822,8 @@ def start_foreground(
     if extra_args:
         launch_args = f"{launch_args} {extra_args}".strip()
 
+    merged_env = _merge_env(record.get("env"), env_overrides)
+
     result = spawn_comfyui(
         install_path=install_path,
         extra_args=launch_args,
@@ -765,6 +833,7 @@ def start_foreground(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         send_output=send_output,
+        env_overrides=merged_env or None,
     )
 
     proc = result["process"]

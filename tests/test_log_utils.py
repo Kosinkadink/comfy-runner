@@ -145,7 +145,7 @@ class TestReadLogAfter:
         log = tmp_path / LOG_FILENAME
         initial = "line1\nline2\n"
         log.write_text(initial)
-        offset = len(initial.encode("utf-8"))
+        offset = log.stat().st_size  # use actual file size (accounts for CRLF on Windows)
 
         # Append more content
         with open(log, "a") as f:

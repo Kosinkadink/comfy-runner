@@ -147,7 +147,13 @@ class TestRemoteRunnerMethods:
 # ---------------------------------------------------------------------------
 
 def _setup_pod_record(tmp_config_dir):
-    from comfy_runner.hosted.config import set_pod_record
+    from comfy_runner.hosted.config import set_pod_record, set_provider_value
+    # Seed RunPod + Tailscale config so _resolve_server_url can produce
+    # a URL (pods are Tailscale-only now -- no public proxy fallback).
+    # RunPodProvider() also requires an api_key during __init__.
+    set_provider_value("runpod", "api_key", "rk-test")
+    set_provider_value("runpod", "tailscale_auth_key", "tskey-auth-test")
+    set_provider_value("runpod", "tailscale_domain", "example.ts.net")
     set_pod_record("runpod", "my-pod", {"id": "pod_abc"})
 
 
@@ -238,7 +244,21 @@ class TestResolveServerUrl:
             _resolve_server_url("nonexistent")
 
     def test_resolves_correctly(self, tmp_config_dir):
-        from comfy_runner.hosted.config import set_pod_record
+        from comfy_runner.hosted.config import set_pod_record, set_provider_value
         from comfy_runner_cli.cli import _resolve_server_url
+        # Tailscale is now the only path -- seed config so resolution works.
+        set_provider_value("runpod", "api_key", "rk-test")
+        set_provider_value("runpod", "tailscale_auth_key", "tskey-auth-test")
+        set_provider_value("runpod", "tailscale_domain", "example.ts.net")
         set_pod_record("runpod", "test", {"id": "pod_xyz"})
-        assert _resolve_server_url("test") == "https://pod_xyz-9189.proxy.runpod.net"
+        assert _resolve_server_url("test") == "http://comfy-test.example.ts.net:9189"
+
+    def test_no_tailscale_raises(self, tmp_config_dir):
+        from comfy_runner.hosted.config import set_pod_record, set_provider_value
+        from comfy_runner_cli.cli import _resolve_server_url
+        # Pod record exists, RunPod API key is set, but Tailscale isn't
+        # configured -- should raise.
+        set_provider_value("runpod", "api_key", "rk-test")
+        set_pod_record("runpod", "test", {"id": "pod_xyz"})
+        with pytest.raises(RuntimeError, match="Tailscale is not configured"):
+            _resolve_server_url("test")

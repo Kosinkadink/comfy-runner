@@ -174,17 +174,41 @@ class TestRunPodProviderCreatePod:
 # ---------------------------------------------------------------------------
 
 class TestGetPodUrl:
+    @patch("comfy_runner.hosted.config.get_tailscale_auth_key")
     @patch("comfy_runner.hosted.runpod_provider.get_provider_config")
     @patch("comfy_runner.hosted.runpod_provider.get_runpod_api_key")
-    def test_running_pod_returns_url(self, mock_key, mock_cfg):
+    def test_running_pod_returns_url(self, mock_key, mock_cfg, mock_ts_auth):
         mock_key.return_value = "rk_test"
-        mock_cfg.return_value = {}
+        # get_provider_config is called both in RunPodProvider.__init__ and
+        # inside get_pod_tailscale_url. Both call sites need a tailnet
+        # domain so we can return a Tailscale URL.
+        mock_cfg.return_value = {"tailscale_domain": "example.ts.net"}
+        mock_ts_auth.return_value = "tskey-auth-test"
         prov = RunPodProvider()
         prov.api = MagicMock()
-        prov.api.get_pod.return_value = {"id": "pod_x", "desiredStatus": "RUNNING"}
+        prov.api.get_pod.return_value = {
+            "id": "pod_x", "name": "my-pod", "desiredStatus": "RUNNING",
+        }
 
         url = prov.get_pod_url("pod_x", 8188)
-        assert url == "https://pod_x-8188.proxy.runpod.net"
+        assert url == "http://comfy-my-pod.example.ts.net:8188"
+
+    @patch("comfy_runner.hosted.config.get_tailscale_auth_key")
+    @patch("comfy_runner.hosted.runpod_provider.get_provider_config")
+    @patch("comfy_runner.hosted.runpod_provider.get_runpod_api_key")
+    def test_running_pod_no_tailscale_returns_none(self, mock_key, mock_cfg, mock_ts_auth):
+        # Pod is running but Tailscale isn't configured -- pods are
+        # Tailscale-only now, so there's no URL to return.
+        mock_key.return_value = "rk_test"
+        mock_cfg.return_value = {}
+        mock_ts_auth.return_value = ""
+        prov = RunPodProvider()
+        prov.api = MagicMock()
+        prov.api.get_pod.return_value = {
+            "id": "pod_x", "name": "my-pod", "desiredStatus": "RUNNING",
+        }
+
+        assert prov.get_pod_url("pod_x", 8188) is None
 
     @patch("comfy_runner.hosted.runpod_provider.get_provider_config")
     @patch("comfy_runner.hosted.runpod_provider.get_runpod_api_key")

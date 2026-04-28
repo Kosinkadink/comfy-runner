@@ -75,6 +75,18 @@ def _err(msg: str, status: int = 400) -> tuple[Any, int]:
     return jsonify({"ok": False, "error": msg}), status
 
 
+def _validate_env_dict(env: Any) -> str | None:
+    """Return an error message if *env* is not a valid ``dict[str, str]``, else None."""
+    if env is None:
+        return None
+    if not isinstance(env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str)
+        for k, v in env.items()
+    ):
+        return "'env' must be a dict of string key-value pairs"
+    return None
+
+
 def _get_record(name: str) -> tuple[dict | None, str]:
     """Get an installation record, returning (record, error_msg)."""
     from comfy_runner.config import get_installation
@@ -244,6 +256,504 @@ def _get_install_lock(name: str) -> threading.Lock:
         return _install_locks[name]
 
 
+def _force_release_lock(name: str) -> bool:
+    """Replace a stuck lock with a fresh one. Returns True if a lock existed."""
+    with _install_locks_guard:
+        if name in _install_locks:
+            _install_locks[name] = threading.Lock()
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Test run index — tracks test runs separately from generic jobs
+# ---------------------------------------------------------------------------
+
+_test_runs_lock = threading.Lock()
+_test_runs: dict[str, dict[str, Any]] = {}
+
+
+def _register_test_run(job_id: str, meta: dict[str, Any]) -> None:
+    """Register a test run keyed by its job_id."""
+    with _test_runs_lock:
+        _test_runs[job_id] = {
+            "id": job_id,
+            "created_at": time.time(),
+            **meta,
+        }
+
+
+def _finish_test_run(job_id: str, updates: dict[str, Any], status: str = "done") -> None:
+    """Update a test run with final results and persist status."""
+    with _test_runs_lock:
+        run = _test_runs.get(job_id)
+        if run:
+            run.update(updates)
+            run["status"] = status
+            run["finished_at"] = time.time()
+
+
+_MAX_TEST_RUNS = 200
+
+
+def _gc_test_runs() -> None:
+    """Evict oldest test runs beyond the limit (caller must hold lock)."""
+    if len(_test_runs) <= _MAX_TEST_RUNS:
+        return
+    by_time = sorted(_test_runs.keys(), key=lambda k: _test_runs[k].get("created_at", 0))
+    to_remove = len(_test_runs) - _MAX_TEST_RUNS
+    for k in by_time[:to_remove]:
+        del _test_runs[k]
+
+
+def _list_test_runs(limit: int = 50) -> list[dict[str, Any]]:
+    """Return test runs newest-first, merged with current job status."""
+    with _test_runs_lock:
+        _gc_test_runs()
+        runs = sorted(
+            _test_runs.values(),
+            key=lambda r: r.get("created_at", 0),
+            reverse=True,
+        )[:limit]
+    # Merge in current job status — prefer persisted status over live job
+    enriched = []
+    for run in runs:
+        entry = dict(run)
+        job = _jobs.get(run["id"])
+        if job:
+            entry["status"] = job["status"]
+        elif "status" not in entry:
+            entry["status"] = "expired"
+        enriched.append(entry)
+    return enriched
+
+
+# Per-pod locks — prevent concurrent operations on the same pod
+_pod_locks: dict[str, threading.Lock] = {}
+_pod_locks_guard = threading.Lock()
+
+
+def _get_pod_lock(name: str) -> threading.Lock:
+    """Return a per-pod lock, creating one if needed."""
+    with _pod_locks_guard:
+        if name not in _pod_locks:
+            _pod_locks[name] = threading.Lock()
+        return _pod_locks[name]
+
+
+def _remove_pod_lock(name: str) -> None:
+    """Remove a pod lock entry after termination (only if unlocked)."""
+    with _pod_locks_guard:
+        lock = _pod_locks.get(name)
+        if lock is not None and not lock.locked():
+            _pod_locks.pop(name, None)
+
+
+def _get_runpod_provider():
+    """Create a RunPodProvider instance. Raises RuntimeError if not configured."""
+    from comfy_runner.hosted.runpod_provider import RunPodProvider
+    return RunPodProvider()
+
+
+# Cache the Tailscale device list to avoid hammering the API when
+# resolving many pod URLs in a single dashboard / list request.
+_TS_DEVICES_CACHE: dict[str, Any] = {"at": 0.0, "devices": []}
+_TS_DEVICES_TTL = 30.0
+_TS_DEVICES_LOCK = threading.Lock()
+
+
+def _list_tailscale_devices(force: bool = False) -> list[dict[str, Any]]:
+    """Return cached Tailscale device list, refreshing if stale.
+
+    Returns ``[]`` if the API key/tailnet are not configured or the
+    request fails. Cached for ``_TS_DEVICES_TTL`` seconds.
+    """
+    from comfy_runner.hosted.config import (
+        get_tailscale_api_key,
+        get_tailscale_tailnet,
+    )
+    api_key = get_tailscale_api_key()
+    tailnet = get_tailscale_tailnet()
+    if not api_key or not tailnet:
+        return []
+    now = time.monotonic()
+    with _TS_DEVICES_LOCK:
+        if not force and now - _TS_DEVICES_CACHE["at"] < _TS_DEVICES_TTL:
+            return list(_TS_DEVICES_CACHE["devices"])
+    try:
+        import requests as _requests
+        resp = _requests.get(
+            f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/devices",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if not resp.ok:
+            log.warning("Tailscale device list failed: HTTP %s", resp.status_code)
+            return []
+        devices = resp.json().get("devices", []) or []
+    except Exception as e:
+        log.warning("Tailscale device list failed: %s", e)
+        return []
+    with _TS_DEVICES_LOCK:
+        _TS_DEVICES_CACHE["at"] = now
+        _TS_DEVICES_CACHE["devices"] = devices
+    return list(devices)
+
+
+def _resolve_tailscale_hostname(pod_name: str, force: bool = False) -> str | None:
+    """Find the actual host (IPv4 or MagicDNS name) for a pod via the Tailscale API.
+
+    Handles two failure modes:
+
+    * **Suffix drift** – the pod's hostname got auto-suffixed
+      (e.g. ``comfy-foo-1`` instead of ``comfy-foo``) because a stale
+      device with the same name was still online when the new pod joined.
+    * **Duplicate hostnames** – on tailnets that *don't* enforce unique
+      hostnames, the new pod and the stale (offline) one coexist with
+      the *same* hostname. MagicDNS would then ambiguously resolve to
+      either device's IP, often the dead one.
+
+    To dodge MagicDNS ambiguity entirely we return the chosen device's
+    Tailscale IP (the first IPv4 from its ``addresses`` field) when
+    available, falling back to the MagicDNS FQDN. The chosen device is
+    always the most-recently-seen match — i.e. the live pod.
+
+    Returns the host string (e.g. ``"100.86.23.124"`` or
+    ``"comfy-foo-1.tailnet.ts.net"``), or ``None`` if no matching
+    device is found / API not configured.
+    """
+    import re
+    expected = f"comfy-{pod_name}"
+    devices = _list_tailscale_devices(force=force)
+    if not devices:
+        return None
+    suffix_re = re.compile(r"^" + re.escape(expected) + r"(-\d+)?$")
+    matches: list[dict[str, Any]] = []
+    for d in devices:
+        host = d.get("hostname", "") or ""
+        if not host:
+            fqdn = d.get("name", "") or ""
+            host = fqdn.split(".", 1)[0]
+        if suffix_re.match(host):
+            matches.append(d)
+    if not matches:
+        return None
+    # Most-recently-seen first; ISO 8601 timestamps sort correctly as strings.
+    matches.sort(
+        key=lambda d: (d.get("lastSeen", ""), d.get("created", "")),
+        reverse=True,
+    )
+    chosen = matches[0]
+    # Prefer the device's IPv4 address (bypasses MagicDNS ambiguity).
+    for addr in chosen.get("addresses", []) or []:
+        if addr and "." in addr and ":" not in addr:
+            return addr
+    # Fallback to the MagicDNS FQDN.
+    return chosen.get("name") or None
+
+
+def _get_pod_server_url(
+    pod_name: str,
+    port: int = 9189,
+    raise_on_error: bool = True,
+) -> str | None:
+    """Resolve the comfy-runner server URL for a named pod.
+
+    This is the single source of truth for pod URL resolution. It tries:
+      1. The actual host (IPv4 or MagicDNS name) from the Tailscale REST
+         API — handles hostname drift like ``comfy-foo-1`` and
+         duplicate-hostname ambiguity by always picking the
+         most-recently-seen device.
+      2. The expected unsuffixed Tailscale MagicDNS URL
+         (``http://comfy-<name>.<tailnet>:<port>``) for tailnets
+         where API access isn't configured.
+
+    The RunPod public proxy is intentionally NOT a fallback: pods no
+    longer expose public ports, so it would always be unreachable.
+
+    When ``raise_on_error`` is False, returns ``None`` if nothing
+    could be resolved instead of raising.
+    """
+    # 1. Tailscale API lookup — finds drifted hostnames and live devices
+    host = _resolve_tailscale_hostname(pod_name)
+    if host:
+        return f"http://{host}:{port}"
+
+    # 2. Expected (unsuffixed) Tailscale MagicDNS URL
+    try:
+        from comfy_runner.hosted.runpod_provider import RunPodProvider
+        provider = RunPodProvider()
+        url = provider.get_pod_tailscale_url(pod_name, port=port)
+        if url:
+            return url
+    except Exception:
+        pass
+
+    if raise_on_error:
+        raise RuntimeError(
+            f"Cannot resolve server URL for pod '{pod_name}'. "
+            f"Tailscale must be configured (auth key) and the pod must "
+            f"be on the tailnet."
+        )
+    return None
+
+
+def _wait_for_remote_server(
+    server_url: str,
+    timeout: int = 300,
+    poll_interval: int = 10,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Poll a remote comfy-runner server until it responds."""
+    import requests as _requests
+    out = send_output or (lambda _: None)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = _requests.get(f"{server_url}/system-info", timeout=5)
+            if resp.ok:
+                resp.json()
+                out("Remote server is ready.\n")
+                return
+        except Exception:
+            pass
+        remaining = int(deadline - time.monotonic())
+        out(f"\rWaiting for remote server... ({remaining}s remaining)")
+        time.sleep(poll_interval)
+    raise RuntimeError(f"Remote server at {server_url} did not become ready within {timeout}s")
+
+
+def _wait_for_pod_server(
+    pod_name: str,
+    timeout: int = 300,
+    poll_interval: int = 10,
+    send_output: Callable[[str], None] | None = None,
+) -> str:
+    """Poll a pod's comfy-runner server until it responds.
+
+    Re-resolves the pod URL on every iteration so that a drifted
+    Tailscale hostname (e.g. ``comfy-foo-1``) registered after pod
+    boot is picked up automatically. Returns the URL that finally
+    responded.
+    """
+    import requests as _requests
+    out = send_output or (lambda _: None)
+    deadline = time.monotonic() + timeout
+    last_url: str | None = None
+    last_logged_url: str | None = None
+    force_refresh = False
+    while time.monotonic() < deadline:
+        # Force a Tailscale device-list refresh periodically so a
+        # newly-registered (suffixed) device shows up in the cache.
+        url = _get_pod_server_url(
+            pod_name, raise_on_error=False,
+        ) if not force_refresh else None
+        if force_refresh:
+            _list_tailscale_devices(force=True)
+            url = _get_pod_server_url(pod_name, raise_on_error=False)
+            force_refresh = False
+        if url:
+            if url != last_logged_url:
+                out(f"Resolved pod URL: {url}\n")
+                last_logged_url = url
+            last_url = url
+            try:
+                resp = _requests.get(f"{url}/system-info", timeout=5)
+                if resp.ok:
+                    resp.json()
+                    out("Remote server is ready.\n")
+                    return url
+            except Exception:
+                pass
+        remaining = int(deadline - time.monotonic())
+        out(f"\rWaiting for pod '{pod_name}' server... ({remaining}s remaining)")
+        time.sleep(poll_interval)
+        # On each retry, force a Tailscale cache refresh so we pick up
+        # newly-registered (possibly suffixed) hostnames.
+        force_refresh = True
+    raise RuntimeError(
+        f"Pod '{pod_name}' server (last URL: {last_url or 'unresolved'}) "
+        f"did not become ready within {timeout}s",
+    )
+
+
+def _build_test_target(target_body: dict[str, Any]):
+    """Build a fleet TestTarget from a request body target dict."""
+    from comfy_runner.testing.fleet import LocalTarget, RemoteTarget, EphemeralTarget
+    kind = target_body.get("kind", "")
+
+    if kind == "local":
+        url = target_body.get("url", "")
+        if not url:
+            raise ValueError("local target requires 'url'")
+        if "://" not in url:
+            url = f"http://{url}"
+        return LocalTarget(url=url, label=target_body.get("label"))
+
+    elif kind == "remote":
+        # Resolve by pod_name or explicit server_url
+        pod_name = target_body.get("pod_name")
+        server_url = target_body.get("server_url")
+        if pod_name and not server_url:
+            server_url = _get_pod_server_url(pod_name)
+        if not server_url:
+            raise ValueError("remote target requires 'pod_name' or 'server_url'")
+        return RemoteTarget(
+            server_url=server_url,
+            install_name=target_body.get("install", "main"),
+            label=target_body.get("label") or pod_name,
+        )
+
+    elif kind == "runpod":
+        return EphemeralTarget(
+            gpu_type=target_body.get("gpu_type", ""),
+            label=target_body.get("label"),
+            image=target_body.get("image"),
+            volume_id=target_body.get("volume_id"),
+            install_name=target_body.get("install", "main"),
+        )
+
+    else:
+        raise ValueError(f"Unknown target kind: '{kind}'. Expected: local, remote, runpod")
+
+
+def _validate_pod_name(name: str) -> str | None:
+    """Validate a pod name from a URL path parameter.
+
+    Returns an error message if invalid, else None.
+    """
+    from safe_file import is_safe_path_component
+    if not name or not is_safe_path_component(name):
+        return f"Invalid pod name: '{name}'"
+    return None
+
+
+_SUITES_DIR = Path("test-suites")
+
+
+def _get_suites_dir() -> Path:
+    """Return the managed test-suites directory, creating if needed."""
+    d = _SUITES_DIR.resolve()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _resolve_suite(suite: str) -> tuple[Path, str | None]:
+    """Resolve a suite name or path to an absolute path.
+
+    If ``suite`` is a bare name (no separators), look in the managed
+    suites directory.  Otherwise treat it as a literal path.
+
+    Returns ``(resolved_path, error_message)``.  error_message is None
+    on success.
+    """
+    from safe_file import is_safe_path_component
+
+    if not suite:
+        return Path(), "'suite' is required"
+
+    # Bare name → managed directory
+    if is_safe_path_component(suite):
+        candidate = _get_suites_dir() / suite
+        if candidate.is_dir() and (candidate / "suite.json").is_file():
+            return candidate.resolve(), None
+        return Path(), f"Suite '{suite}' not found on server"
+
+    # Literal path (backward compat for direct local use)
+    suite_path = Path(suite).resolve()
+    if not suite_path.is_dir():
+        return Path(), f"Suite directory not found: {suite}"
+    if not (suite_path / "suite.json").is_file():
+        return Path(), f"Not a valid test suite (missing suite.json): {suite}"
+    return suite_path, None
+
+
+_DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>comfy-runner Dashboard</title>
+<meta http-equiv="refresh" content="15">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+         background: #1a1a2e; color: #e0e0e0; margin: 2rem; }
+  h1 { color: #00d9ff; }
+  h2 { color: #7c8db5; border-bottom: 1px solid #2a2a4e; padding-bottom: 0.3rem; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+  th, td { text-align: left; padding: 0.5rem 1rem; border-bottom: 1px solid #2a2a4e; }
+  th { color: #7c8db5; font-weight: 600; }
+  .running { color: #4caf50; }
+  .stopped, .exited { color: #ff9800; }
+  .terminated, .error { color: #f44336; }
+  .done { color: #4caf50; }
+  .cancelled { color: #ff9800; }
+  a { color: #00d9ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .refresh { color: #555; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>comfy-runner Dashboard</h1>
+<p class="refresh">Auto-refreshes every 15 seconds</p>
+
+<h2>Pods</h2>
+{% if pods %}
+<table>
+<tr><th>Name</th><th>Status</th><th>GPU</th><th>$/hr</th><th>Server URL</th></tr>
+{% for p in pods %}
+<tr>
+  <td>{{ p.name }}</td>
+  <td class="{{ p.status|lower }}">{{ p.status }}</td>
+  <td>{{ p.gpu_type }}</td>
+  <td>{{ "%.2f"|format(p.cost_per_hr) }}</td>
+  <td>{% if p.server_url %}<a href="{{ p.server_url }}">{{ p.server_url }}</a>{% else %}-{% endif %}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No pods configured.</p>
+{% endif %}
+
+<h2>Recent Test Runs</h2>
+{% if test_runs %}
+<table>
+<tr><th>ID</th><th>Kind</th><th>Suite</th><th>Status</th><th>Targets</th></tr>
+{% for t in test_runs %}
+<tr>
+  <td><a href="/tests/{{ t.id }}">{{ t.id }}</a></td>
+  <td>{{ t.kind }}</td>
+  <td>{{ t.suite }}</td>
+  <td class="{{ t.status }}">{{ t.status }}</td>
+  <td>{{ t.targets|length }}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No test runs.</p>
+{% endif %}
+
+<h2>Active Jobs</h2>
+{% if jobs %}
+<table>
+<tr><th>ID</th><th>Label</th><th>Status</th><th>Started</th></tr>
+{% for j in jobs %}
+<tr>
+  <td><a href="/job/{{ j.id }}">{{ j.id }}</a></td>
+  <td>{{ j.label }}</td>
+  <td class="{{ j.status }}">{{ j.status }}</td>
+  <td>{{ j.started_at|int }}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No active jobs.</p>
+{% endif %}
+
+</body>
+</html>
+"""
+
+
 # ---------------------------------------------------------------------------
 # Flask app factory
 # ---------------------------------------------------------------------------
@@ -360,6 +870,18 @@ def create_app() -> Any:
         except Exception as e:
             return _err(str(e))
 
+    @app.route("/startup-log", methods=["GET"])
+    def route_startup_log() -> Any:
+        log_path = Path("/tmp/comfy-runner-startup.log")
+        if not log_path.is_file():
+            return _err("No startup log found", 404)
+        lines = int(request.args.get("lines", 200))
+        content = log_path.read_text(errors="replace")
+        all_lines = content.splitlines()
+        if lines > 0:
+            all_lines = all_lines[-lines:]
+        return jsonify({"ok": True, "lines": all_lines})
+
     # ------------------------------------------------------------------
     # GET /status — aggregate status (all installations)
     # ------------------------------------------------------------------
@@ -442,6 +964,7 @@ def create_app() -> Any:
                 "head_commit": record.get("head_commit"),
                 "python_version": record.get("python_version"),
                 "launch_args": record.get("launch_args"),
+                "env": record.get("env", {}),
                 "created_at": record.get("created_at"),
                 "deployed_pr": record.get("deployed_pr"),
                 "deployed_branch": record.get("deployed_branch"),
@@ -508,15 +1031,25 @@ def create_app() -> Any:
                     out(f"Installation '{name}' not found — initializing...\n")
                     try:
                         cuda_compat = body.get("cuda_compat", False)
+                        variant = body.get("variant")
                         from comfy_runner.hosted.config import get_provider_config
                         prov_cfg = get_provider_config("runpod")
                         cache_releases = prov_cfg.get("cache_releases")
                         cache_kw: dict = {}
                         if isinstance(cache_releases, int):
                             cache_kw["max_cache_entries"] = cache_releases
+                        build_kw: dict = {}
+                        if body.get("build"):
+                            build_kw["build"] = True
+                            for bk in ("python_version", "pbs_release", "gpu",
+                                       "cuda_tag", "torch_version", "torch_spec",
+                                       "torch_index_url", "comfyui_ref"):
+                                if bk in body:
+                                    build_kw[bk] = body[bk]
                         init_installation(
                             name=name, send_output=out, cuda_compat=cuda_compat,
-                            **cache_kw,
+                            variant=variant,
+                            **cache_kw, **build_kw,
                         )
                     except Exception as e:
                         _jobs.fail(job_id, f"Auto-init failed: {e}", lines)
@@ -628,6 +1161,10 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
+        env_overrides = body.get("env")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"restart {name}")
 
@@ -652,7 +1189,7 @@ def create_app() -> Any:
                 except RuntimeError:
                     pass
 
-                result = start_installation(name, port_override=running_port, extra_args=extra_args, send_output=out)
+                result = start_installation(name, port_override=running_port, extra_args=extra_args, env_overrides=env_overrides, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
@@ -700,6 +1237,14 @@ def create_app() -> Any:
             return _err(str(e))
 
     # ------------------------------------------------------------------
+    # POST /<name>/unlock — force-release a stuck installation lock
+    # ------------------------------------------------------------------
+    @app.route("/<name>/unlock", methods=["POST"])
+    def route_unlock(name: str) -> Any:
+        had_lock = _force_release_lock(name)
+        return jsonify({"ok": True, "lock_reset": had_lock})
+
+    # ------------------------------------------------------------------
     # DELETE /<name>
     # ------------------------------------------------------------------
     @app.route("/<name>", methods=["DELETE"])
@@ -745,10 +1290,14 @@ def create_app() -> Any:
             return _err(err, 404)
 
         body = request.get_json(silent=True) or {}
-        allowed_keys = {"launch_args"}
+        allowed_keys = {"launch_args", "env"}
         updated = {}
         for key in allowed_keys:
             if key in body:
+                if key == "env":
+                    env_err = _validate_env_dict(body[key])
+                    if env_err:
+                        return _err(env_err)
                 record[key] = body[key]
                 updated[key] = body[key]
 
@@ -1425,6 +1974,64 @@ def create_app() -> Any:
         return jsonify({"ok": True, "removed": removed})
 
     # ------------------------------------------------------------------
+    # POST /<name>/move-model
+    # ------------------------------------------------------------------
+    @app.route("/<name>/move-model", methods=["POST"])
+    def route_move_model(name: str) -> Any:
+        from comfy_runner.workflow_models import resolve_models_dir, _validate_model_path
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        body = request.get_json(silent=True) or {}
+        from_directory = body.get("from_directory", "")
+        to_directory = body.get("to_directory", "")
+        filename = body.get("name", "")
+        copy = body.get("copy", False)
+
+        if not from_directory:
+            return _err("Missing 'from_directory' field")
+        if not to_directory:
+            return _err("Missing 'to_directory' field")
+        if not filename:
+            return _err("Missing 'name' field")
+
+        try:
+            models_dir = resolve_models_dir(record["path"])
+
+            src = _validate_model_path(models_dir, from_directory, filename)
+            dst = _validate_model_path(models_dir, to_directory, filename)
+
+            if not src.is_file():
+                return _err(f"Source not found: {from_directory}/{filename}", 404)
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if dst.exists():
+                return _err(f"Destination already exists: {to_directory}/{filename}")
+
+            import shutil
+            if copy:
+                shutil.copy2(str(src), str(dst))
+            else:
+                shutil.move(str(src), str(dst))
+
+            action = "copied" if copy else "moved"
+            return jsonify({
+                "ok": True,
+                "action": action,
+                "name": filename,
+                "from_directory": from_directory,
+                "to_directory": to_directory,
+            })
+        except ValueError as e:
+            return _err(str(e))
+        except Exception as e:
+            log.error("Move/copy failed for '%s': %s", name, e)
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
     # POST /<name>/workflow-models  (async — returns job_id)
     # ------------------------------------------------------------------
     @app.route("/<name>/workflow-models", methods=["POST"])
@@ -1501,6 +2108,10 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         extra_args = body.get("extra_args")
+        env_overrides = body.get("env")
+        env_err = _validate_env_dict(env_overrides)
+        if env_err:
+            return _err(env_err)
 
         job_id = _jobs.create(label=f"start {name}")
 
@@ -1522,7 +2133,7 @@ def create_app() -> Any:
                 rec = get_installation(name)
                 install_path = rec["path"] if rec else ""
 
-                result = start_installation(name, extra_args=extra_args, send_output=out)
+                result = start_installation(name, extra_args=extra_args, env_overrides=env_overrides, send_output=out)
                 if _tailscale_mode and result.get("port"):
                     try:
                         from comfy_runner.tunnel import start_tailscale_serve_port
@@ -1736,6 +2347,1055 @@ def create_app() -> Any:
         return route_stop(_default_name())
 
     # ------------------------------------------------------------------
+    # POST /test/run — run test suite (async)
+    # ------------------------------------------------------------------
+    @app.route("/test/run", methods=["POST"])
+    def route_test_run() -> Any:
+        from comfy_runner.installations import show_list
+
+        body = request.get_json(silent=True) or {}
+        suite_path = body.get("suite")
+        if not suite_path:
+            return _err("'suite' is required", 400)
+
+        name = body.get("name")
+        if not name:
+            installs = show_list()
+            if not installs:
+                return _err("No installations available", 400)
+            name = installs[0]["name"]
+
+        timeout = body.get("timeout", 600)
+        http_timeout = body.get("http_timeout", 30)
+        formats = body.get("formats", "json,html,markdown")
+
+        if not isinstance(timeout, int) or timeout <= 0:
+            return _err("'timeout' must be a positive integer", 400)
+        if not isinstance(http_timeout, int) or http_timeout <= 0:
+            return _err("'http_timeout' must be a positive integer", 400)
+        if not isinstance(formats, str) or not formats.strip():
+            return _err("'formats' must be a non-empty string", 400)
+
+        record, err = _get_record(name)
+        if not record:
+            return _err(err, 404)
+
+        from comfy_runner.process import get_status
+        status = get_status(name)
+        if not status.get("running"):
+            return _err(f"Installation '{name}' is not running", 503)
+
+        suite_basename = Path(suite_path).name
+        job_id = _jobs.create(label=f"test run {suite_basename} on {name}")
+
+        def _run() -> None:
+            out, lines = _make_collector(job_id)
+            try:
+                from comfy_runner.testing.client import ComfyTestClient
+                from comfy_runner.testing.runner import run_suite
+                from comfy_runner.testing.suite import load_suite
+                from comfy_runner.testing.report import build_report, write_report
+
+                try:
+                    suite = load_suite(suite_path)
+                except ValueError as e:
+                    _jobs.fail(job_id, str(e), lines)
+                    return
+
+                # Re-check status inside the thread to get current port
+                cur_status = get_status(name)
+                if not cur_status.get("running"):
+                    _jobs.fail(job_id, f"Installation '{name}' stopped before test could start", lines)
+                    return
+                port = cur_status["port"]
+
+                comfy_url = f"http://127.0.0.1:{port}"
+                client = ComfyTestClient(comfy_url, timeout=http_timeout)
+
+                from datetime import datetime, timezone
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                out_dir = Path(suite_path) / "runs" / run_id
+
+                suite_run = run_suite(client, suite, out_dir, timeout=timeout, send_output=out)
+                report = build_report(suite_run, target_info={"name": name, "url": comfy_url})
+
+                formats_list = [f.strip() for f in formats.split(",")]
+                written = write_report(report, out_dir, formats=formats_list)
+
+                result = {
+                    "run_id": run_id,
+                    "suite_name": suite.name,
+                    "output_dir": str(out_dir),
+                    "total": report.total,
+                    "passed": report.passed,
+                    "failed": report.failed,
+                    "duration": report.duration,
+                    "report_files": {fmt: str(p) for fmt, p in written.items()},
+                    "report": report.to_dict(),
+                }
+                _jobs.finish(job_id, result, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # GET /test/results/<run_id> — retrieve test run results
+    # ------------------------------------------------------------------
+    @app.route("/test/results/<run_id>", methods=["GET"])
+    def route_test_results(run_id: str) -> Any:
+        from safe_file import is_safe_path_component
+
+        suite = request.args.get("suite")
+        if not suite:
+            return _err("'suite' query parameter is required", 400)
+
+        if not is_safe_path_component(run_id):
+            return _err("Invalid run_id", 400)
+
+        suite_path = Path(suite).resolve()
+        run_dir = suite_path / "runs" / run_id
+        if not run_dir.resolve().is_relative_to(suite_path):
+            return _err("Invalid run_id", 400)
+        if not run_dir.is_dir():
+            return _err(f"Run '{run_id}' not found", 404)
+
+        fmt = request.args.get("format")
+        if fmt == "json":
+            import json as _json
+            report_file = run_dir / "report.json"
+            if not report_file.is_file():
+                return _err("report.json not found in run directory", 404)
+            data = _json.loads(report_file.read_text(encoding="utf-8"))
+            return jsonify({"ok": True, "run_id": run_id, "report": data})
+
+        files = [
+            {"name": f.name, "size": f.stat().st_size}
+            for f in sorted(run_dir.iterdir()) if f.is_file()
+        ]
+        return jsonify({"ok": True, "run_id": run_id, "output_dir": str(run_dir), "files": files})
+
+    # ------------------------------------------------------------------
+    # GET /test/suites — list available test suites
+    # ------------------------------------------------------------------
+    @app.route("/test/suites", methods=["GET"])
+    def route_test_suites() -> Any:
+        from comfy_runner.testing.suite import discover_suites
+
+        search_dir = Path(request.args.get("dir", "."))
+        suites = discover_suites(search_dir)
+        return jsonify({"ok": True, "suites": [
+            {
+                "name": s.name,
+                "path": str(s.path),
+                "description": s.description,
+                "workflows": len(s.workflows),
+                "required_models": s.required_models,
+            }
+            for s in suites
+        ]})
+
+    # ==================================================================
+    # Central Orchestration — Pod Management
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /pods — list all pods with status
+    # ------------------------------------------------------------------
+    @app.route("/pods", methods=["GET"])
+    def route_pods_list() -> Any:
+        from comfy_runner.hosted.config import list_pod_records
+
+        try:
+            provider = _get_runpod_provider()
+        except RuntimeError as e:
+            return _err(str(e))
+
+        try:
+            live_pods = provider.list_pods()
+            live_map = {p.name: p for p in live_pods}
+
+            records = list_pod_records("runpod")
+            result = []
+
+            # Merge config records with live pod data
+            seen_names = set()
+            for name, rec in records.items():
+                seen_names.add(name)
+                pod_id = rec.get("id", "")
+                live = live_map.get(name)
+                # Also try matching by ID
+                if not live:
+                    for lp in live_pods:
+                        if lp.id == pod_id:
+                            live = lp
+                            break
+                entry: dict[str, Any] = {
+                    "name": name,
+                    "id": pod_id,
+                    "gpu_type": rec.get("gpu_type", ""),
+                    "datacenter": rec.get("datacenter", ""),
+                    "image": rec.get("image", ""),
+                }
+                if live:
+                    entry["status"] = live.status
+                    entry["cost_per_hr"] = live.cost_per_hr
+                    entry["gpu_type"] = live.gpu_type or entry["gpu_type"]
+                else:
+                    entry["status"] = "UNKNOWN"
+                # Add URLs (handles Tailscale hostname drift)
+                server_url = _get_pod_server_url(name, raise_on_error=False)
+                if server_url:
+                    entry["server_url"] = server_url
+                    entry["comfy_url"] = server_url.rsplit(":", 1)[0] + ":8188"
+                result.append(entry)
+
+            return jsonify({"ok": True, "pods": result})
+        except Exception as e:
+            return _err(str(e))
+
+    # ------------------------------------------------------------------
+    # POST /pods/create — provision a RunPod pod (async)
+    # ------------------------------------------------------------------
+    @app.route("/pods/create", methods=["POST"])
+    def route_pods_create() -> Any:
+        from safe_file import is_safe_path_component
+
+        body = request.get_json(silent=True) or {}
+        name = body.get("name", "")
+        if not name or not is_safe_path_component(name):
+            return _err("'name' is required and must be a safe identifier")
+
+        gpu_type = body.get("gpu_type")
+        image = body.get("image")
+        volume_id = body.get("volume_id")
+        volume_size_gb = body.get("volume_size_gb")
+        datacenter = body.get("datacenter")
+        cloud_type = body.get("cloud_type")
+        gpu_count = body.get("gpu_count", 1)
+        env = body.get("env")
+        wait_ready = body.get("wait_ready", True)
+
+        job_id = _jobs.create(label=f"pod create {name}")
+
+        def _run() -> None:
+            from comfy_runner.hosted.config import get_pod_record, set_pod_record
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+
+                # Check if pod already exists
+                rec = get_pod_record("runpod", name)
+                if rec:
+                    try:
+                        pod = provider.get_pod(rec["id"])
+                    except Exception:
+                        pod = None  # Pod gone from RunPod — stale record
+                    if pod and pod.status not in ("TERMINATED", "EXITED"):
+                        if pod.status != "RUNNING":
+                            out(f"Pod '{name}' exists but is {pod.status}, starting...\n")
+                            provider.start_pod(rec["id"])
+                        else:
+                            out(f"Pod '{name}' already running.\n")
+                        if wait_ready:
+                            server_url = _wait_for_pod_server(name, send_output=out)
+                        else:
+                            server_url = _get_pod_server_url(
+                                name, raise_on_error=False,
+                            ) or ""
+                        _jobs.finish(job_id, {
+                            "name": name,
+                            "id": rec["id"],
+                            "status": "RUNNING",
+                            "server_url": server_url,
+                            "reused": True,
+                        }, lines)
+                        return
+
+                out(f"Creating pod '{name}'...\n")
+                pod = provider.create_pod(
+                    name=name,
+                    gpu_type=gpu_type,
+                    image=image,
+                    volume_id=volume_id,
+                    volume_size_gb=volume_size_gb,
+                    datacenter=datacenter,
+                    cloud_type=cloud_type,
+                    gpu_count=gpu_count,
+                    env=env,
+                )
+                set_pod_record("runpod", name, {
+                    "id": pod.id,
+                    "gpu_type": pod.gpu_type,
+                    "datacenter": pod.datacenter,
+                    "image": pod.image,
+                })
+                out(f"Pod created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
+
+                if wait_ready:
+                    server_url = _wait_for_pod_server(name, send_output=out)
+                else:
+                    server_url = _get_pod_server_url(
+                        name, raise_on_error=False,
+                    ) or ""
+
+                _jobs.finish(job_id, {
+                    "name": name,
+                    "id": pod.id,
+                    "status": "RUNNING",
+                    "gpu_type": pod.gpu_type,
+                    "cost_per_hr": pod.cost_per_hr,
+                    "server_url": server_url,
+                    "reused": False,
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/deploy — deploy a PR/branch/commit to a pod (async)
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/deploy", methods=["POST"])
+    def route_pods_deploy(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        body = request.get_json(silent=True) or {}
+        install_name = body.get("install", "main")
+
+        # Validate deploy mode
+        pr = body.get("pr")
+        branch = body.get("branch")
+        tag = body.get("tag")
+        commit = body.get("commit")
+        reset = body.get("reset", False)
+        latest = body.get("latest", False)
+        pull = body.get("pull", False)
+        modes = [pr is not None, bool(branch), bool(tag), bool(commit), reset, latest, pull]
+        if sum(modes) != 1:
+            return _err("Specify exactly one of: pr, branch, tag, commit, reset, latest, or pull")
+
+        job_id = _jobs.create(label=f"pod deploy {name}")
+
+        def _run() -> None:
+            from comfy_runner.hosted.remote import RemoteRunner
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                pod_id = rec["id"]
+
+                # Ensure pod is running
+                pod = provider.get_pod(pod_id)
+                if not pod or pod.status in ("TERMINATED", "EXITED"):
+                    _jobs.fail(job_id, f"Pod '{name}' is terminated or gone", lines)
+                    return
+                if pod.status != "RUNNING":
+                    out(f"Pod is {pod.status}, starting...\n")
+                    provider.start_pod(pod_id)
+
+                server_url = _get_pod_server_url(name)
+                out(f"Connecting to {server_url}...\n")
+                _wait_for_remote_server(server_url, send_output=out)
+
+                runner = RemoteRunner(server_url)
+
+                # Forward deploy
+                deploy_body: dict[str, Any] = {}
+                if pr is not None:
+                    deploy_body["pr"] = pr
+                if branch:
+                    deploy_body["branch"] = branch
+                if tag:
+                    deploy_body["tag"] = tag
+                if commit:
+                    deploy_body["commit"] = commit
+                if reset:
+                    deploy_body["reset"] = True
+                if latest:
+                    deploy_body["latest"] = True
+                if pull:
+                    deploy_body["pull"] = True
+                if body.get("start", True):
+                    deploy_body["start"] = True
+                if body.get("repo"):
+                    deploy_body["repo"] = body["repo"]
+                if body.get("title"):
+                    deploy_body["title"] = body["title"]
+                if body.get("launch_args"):
+                    deploy_body["launch_args"] = body["launch_args"]
+                if body.get("cuda_compat"):
+                    deploy_body["cuda_compat"] = True
+                if body.get("build"):
+                    deploy_body["build"] = True
+                    for bk in ("python_version", "pbs_release", "gpu",
+                                "cuda_tag", "torch_version", "torch_spec",
+                                "torch_index_url", "comfyui_ref"):
+                        if bk in body:
+                            deploy_body[bk] = body[bk]
+
+                out(f"Deploying to '{install_name}' on pod '{name}'...\n")
+                data = runner._request("POST", f"/{install_name}/deploy", json=deploy_body)
+
+                remote_job_id = data.get("job_id")
+                if remote_job_id:
+                    out(f"Remote job started: {remote_job_id}\n")
+                    result = runner.poll_job(
+                        remote_job_id, timeout=600, on_output=out,
+                    )
+                    _jobs.finish(job_id, {
+                        "pod_name": name,
+                        "server_url": server_url,
+                        "deploy_result": result,
+                    }, lines)
+                else:
+                    _jobs.finish(job_id, {
+                        "pod_name": name,
+                        "server_url": server_url,
+                        "deploy_result": data,
+                    }, lines)
+
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/stop — stop a pod (keep data)
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/stop", methods=["POST"])
+    def route_pods_stop(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        lock = _get_pod_lock(name)
+        if not lock.acquire(timeout=5):
+            return _err(f"Pod '{name}' is busy")
+        try:
+            provider = _get_runpod_provider()
+            provider.stop_pod(rec["id"])
+            return jsonify({"ok": True, "name": name, "action": "stopped"})
+        except Exception as e:
+            return _err(str(e))
+        finally:
+            lock.release()
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/start — start a stopped pod
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/start", methods=["POST"])
+    def route_pods_start(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        body = request.get_json(silent=True) or {}
+        wait_ready = body.get("wait_ready", True)
+
+        job_id = _jobs.create(label=f"pod start {name}")
+
+        def _run() -> None:
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                out(f"Starting pod '{name}'...\n")
+                provider.start_pod(rec["id"])
+
+                if wait_ready:
+                    server_url = _wait_for_pod_server(name, send_output=out)
+                else:
+                    server_url = _get_pod_server_url(
+                        name, raise_on_error=False,
+                    ) or ""
+
+                _jobs.finish(job_id, {
+                    "name": name,
+                    "id": rec["id"],
+                    "status": "RUNNING",
+                    "server_url": server_url,
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # DELETE /pods/<name> — terminate a pod
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>", methods=["DELETE"])
+    def route_pods_terminate(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record, remove_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        lock = _get_pod_lock(name)
+        if not lock.acquire(timeout=5):
+            return _err(f"Pod '{name}' is busy")
+        try:
+            provider = _get_runpod_provider()
+            try:
+                provider.terminate_pod(rec["id"])
+            except Exception:
+                pass  # Pod may already be gone on RunPod
+            remove_pod_record("runpod", name)
+            return jsonify({"ok": True, "name": name, "action": "terminated"})
+        except Exception as e:
+            return _err(str(e))
+        finally:
+            lock.release()
+            _remove_pod_lock(name)
+
+    # ------------------------------------------------------------------
+    # POST /pods/cleanup — terminate orphaned test pods
+    # ------------------------------------------------------------------
+    @app.route("/pods/cleanup", methods=["POST"])
+    def route_pods_cleanup() -> Any:
+        body = request.get_json(silent=True) or {}
+        prefix = body.get("prefix", "test-")
+        dry_run = body.get("dry_run", False)
+        max_age_hours = body.get("max_age_hours")
+
+        try:
+            provider = _get_runpod_provider()
+            live_pods = provider.list_pods()
+
+            candidates = []
+            for pod in live_pods:
+                if not pod.name.startswith(prefix):
+                    continue
+                if pod.status in ("TERMINATED",):
+                    continue
+                candidates.append(pod)
+
+            terminated = []
+            skipped = []
+            for pod in candidates:
+                if dry_run:
+                    skipped.append({"name": pod.name, "id": pod.id, "status": pod.status})
+                else:
+                    try:
+                        provider.terminate_pod(pod.id)
+                        terminated.append({"name": pod.name, "id": pod.id})
+                    except Exception as e:
+                        skipped.append({"name": pod.name, "id": pod.id, "error": str(e)})
+
+            return jsonify({
+                "ok": True,
+                "prefix": prefix,
+                "dry_run": dry_run,
+                "terminated": terminated,
+                "skipped": skipped,
+                "total_found": len(candidates),
+                "total_terminated": len(terminated),
+            })
+        except Exception as e:
+            return _err(str(e))
+
+    # ==================================================================
+    # Central Orchestration — Suite Management
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /suites — list available test suites
+    # ------------------------------------------------------------------
+    @app.route("/suites", methods=["GET"])
+    def route_suites_list() -> Any:
+        suites_dir = _get_suites_dir()
+        result = []
+        for d in sorted(suites_dir.iterdir()):
+            suite_json = d / "suite.json"
+            if d.is_dir() and suite_json.is_file():
+                import json as _json
+                try:
+                    meta = _json.loads(suite_json.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
+                workflows_dir = d / "workflows"
+                workflow_count = len(list(workflows_dir.glob("*.json"))) if workflows_dir.is_dir() else 0
+                runs_dir = d / "runs"
+                run_count = len(list(runs_dir.iterdir())) if runs_dir.is_dir() else 0
+                result.append({
+                    "name": d.name,
+                    "title": meta.get("name", d.name),
+                    "description": meta.get("description", ""),
+                    "required_models": meta.get("required_models", []),
+                    "workflow_count": workflow_count,
+                    "run_count": run_count,
+                })
+        return jsonify({"ok": True, "suites": result})
+
+    # ------------------------------------------------------------------
+    # GET /suites/<name> — get suite details
+    # ------------------------------------------------------------------
+    @app.route("/suites/<name>", methods=["GET"])
+    def route_suites_get(name: str) -> Any:
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(name):
+            return _err(f"Invalid suite name: '{name}'")
+
+        suite_dir = _get_suites_dir() / name
+        suite_json = suite_dir / "suite.json"
+        if not suite_dir.is_dir() or not suite_json.is_file():
+            return _err(f"Suite '{name}' not found", 404)
+
+        import json as _json
+        meta = _json.loads(suite_json.read_text(encoding="utf-8"))
+
+        config = {}
+        config_path = suite_dir / "config.json"
+        if config_path.is_file():
+            config = _json.loads(config_path.read_text(encoding="utf-8"))
+
+        workflows = []
+        workflows_dir = suite_dir / "workflows"
+        if workflows_dir.is_dir():
+            for wf in sorted(workflows_dir.glob("*.json")):
+                workflows.append(wf.name)
+
+        runs = []
+        runs_dir = suite_dir / "runs"
+        if runs_dir.is_dir():
+            for rd in sorted(runs_dir.iterdir(), reverse=True):
+                if rd.is_dir():
+                    runs.append(rd.name)
+
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "suite": meta,
+            "config": config,
+            "workflows": workflows,
+            "runs": runs,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /suites/<name> — upload/update a suite (preserves runs/)
+    # ------------------------------------------------------------------
+    @app.route("/suites/<name>", methods=["POST"])
+    def route_suites_upload(name: str) -> Any:
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(name):
+            return _err(f"Invalid suite name: '{name}'")
+
+        body = request.get_json(silent=True) or {}
+        suite_meta = body.get("suite")
+        if not suite_meta or not isinstance(suite_meta, dict):
+            return _err("'suite' is required (object with suite.json contents)")
+
+        workflows = body.get("workflows")
+        if not workflows or not isinstance(workflows, dict):
+            return _err("'workflows' is required (object mapping filename → workflow JSON)")
+
+        suite_dir = _get_suites_dir() / name
+        suite_dir.mkdir(parents=True, exist_ok=True)
+
+        import json as _json
+
+        # Write suite.json
+        (suite_dir / "suite.json").write_text(
+            _json.dumps(suite_meta, indent=2), encoding="utf-8"
+        )
+
+        # Write config.json (optional)
+        config = body.get("config")
+        if config and isinstance(config, dict):
+            (suite_dir / "config.json").write_text(
+                _json.dumps(config, indent=2), encoding="utf-8"
+            )
+
+        # Write workflows — replace all workflow files
+        wf_dir = suite_dir / "workflows"
+        if wf_dir.is_dir():
+            for old_wf in wf_dir.glob("*.json"):
+                old_wf.unlink()
+        wf_dir.mkdir(exist_ok=True)
+
+        for wf_name, wf_data in workflows.items():
+            if not is_safe_path_component(wf_name):
+                return _err(f"Invalid workflow filename: '{wf_name}'")
+            (wf_dir / wf_name).write_text(
+                _json.dumps(wf_data, indent=2), encoding="utf-8"
+            )
+
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "workflows": list(workflows.keys()),
+            "message": f"Suite '{name}' uploaded ({len(workflows)} workflow(s))",
+        })
+
+    # ------------------------------------------------------------------
+    # DELETE /suites/<name> — remove a suite (preserves runs/)
+    # ------------------------------------------------------------------
+    @app.route("/suites/<name>", methods=["DELETE"])
+    def route_suites_delete(name: str) -> Any:
+        from safe_file import is_safe_path_component
+        if not is_safe_path_component(name):
+            return _err(f"Invalid suite name: '{name}'")
+
+        suite_dir = _get_suites_dir() / name
+        if not suite_dir.is_dir():
+            return _err(f"Suite '{name}' not found", 404)
+
+        force = request.args.get("force", "").lower() in ("true", "1", "yes")
+        runs_dir = suite_dir / "runs"
+        has_runs = runs_dir.is_dir() and any(runs_dir.iterdir())
+
+        if has_runs and not force:
+            run_count = len(list(runs_dir.iterdir()))
+            return _err(
+                f"Suite '{name}' has {run_count} test run(s). "
+                f"Add ?force=true to delete the suite definition and keep runs, "
+                f"or ?force=true&include_runs=true to delete everything."
+            )
+
+        include_runs = request.args.get("include_runs", "").lower() in ("true", "1", "yes")
+
+        # Remove definition files only (preserve runs/)
+        for f in ("suite.json", "config.json"):
+            p = suite_dir / f
+            if p.is_file():
+                p.unlink()
+
+        wf_dir = suite_dir / "workflows"
+        if wf_dir.is_dir():
+            import shutil
+            shutil.rmtree(wf_dir)
+
+        if include_runs and runs_dir.is_dir():
+            import shutil
+            shutil.rmtree(runs_dir)
+
+        # Remove the directory if empty
+        remaining = list(suite_dir.iterdir())
+        if not remaining:
+            suite_dir.rmdir()
+            return jsonify({"ok": True, "name": name, "action": "deleted"})
+
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "action": "definition_removed",
+            "message": f"Suite definition removed. Runs preserved in {name}/runs/",
+        })
+
+    # ==================================================================
+    # Central Orchestration — Test Execution
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # POST /tests/run — run a test suite against a single target (async)
+    # ------------------------------------------------------------------
+    @app.route("/tests/run", methods=["POST"])
+    def route_tests_run() -> Any:
+        body = request.get_json(silent=True) or {}
+        suite_name = body.get("suite", "")
+        suite_path, suite_err = _resolve_suite(suite_name)
+        if suite_err:
+            return _err(suite_err)
+
+        target_body = body.get("target")
+        if not target_body or not isinstance(target_body, dict):
+            return _err("'target' is required (object with 'kind' field)")
+
+        try:
+            target = _build_test_target(target_body)
+        except (ValueError, RuntimeError) as e:
+            return _err(str(e))
+
+        timeout = body.get("timeout", 600)
+        formats = body.get("formats", "json,html,markdown")
+
+        job_id = _jobs.create(label=f"test run {target.name}")
+        _register_test_run(job_id, {
+            "kind": "single",
+            "suite": suite_name,
+            "targets": [target_body],
+        })
+
+        def _run() -> None:
+            from comfy_runner.testing.suite import load_suite
+            out, lines = _make_collector(job_id)
+            try:
+                s = load_suite(str(suite_path))
+                run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+                out_dir = suite_path / "runs" / run_id
+
+                result = target.run(
+                    suite=s,
+                    output_dir=out_dir,
+                    timeout=timeout,
+                    send_output=out,
+                )
+
+                summary = result.to_dict()
+                _finish_test_run(job_id, {
+                    "output_dir": str(out_dir),
+                    "summary": summary,
+                })
+                _jobs.finish(job_id, {
+                    "run_id": run_id,
+                    "suite_name": s.name,
+                    "output_dir": str(out_dir),
+                    **summary,
+                }, lines)
+            except Exception as e:
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ------------------------------------------------------------------
+    # POST /tests/fleet — run a suite across multiple targets (async)
+    # ------------------------------------------------------------------
+    @app.route("/tests/fleet", methods=["POST"])
+    def route_tests_fleet() -> Any:
+        from comfy_runner.testing.fleet import run_fleet
+
+        body = request.get_json(silent=True) or {}
+        suite_name = body.get("suite", "")
+        suite_path, suite_err = _resolve_suite(suite_name)
+        if suite_err:
+            return _err(suite_err)
+
+        target_bodies = body.get("targets", [])
+        if not target_bodies or not isinstance(target_bodies, list):
+            return _err("'targets' is required (list of target objects)")
+
+        try:
+            targets = [_build_test_target(t) for t in target_bodies]
+        except (ValueError, RuntimeError) as e:
+            return _err(str(e))
+
+        timeout = body.get("timeout", 600)
+        max_workers = body.get("max_workers")
+        formats = body.get("formats", "json,html,markdown")
+
+        target_names = [t.name for t in targets]
+        job_id = _jobs.create(label=f"fleet test ({len(targets)} targets)")
+        _register_test_run(job_id, {
+            "kind": "fleet",
+            "suite": suite_name,
+            "targets": target_bodies,
+        })
+
+        def _run() -> None:
+            out, lines = _make_collector(job_id)
+            try:
+                run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+                out_dir = suite_path / "runs" / f"fleet-{run_id}"
+
+                fleet_result = run_fleet(
+                    targets=targets,
+                    suite_path=str(suite_path),
+                    output_dir=out_dir,
+                    timeout=timeout,
+                    max_workers=max_workers,
+                    send_output=out,
+                    formats=formats,
+                )
+
+                summary = fleet_result.to_dict()
+                _finish_test_run(job_id, {
+                    "output_dir": str(out_dir),
+                    "summary": summary,
+                })
+                _jobs.finish(job_id, {
+                    "run_id": run_id,
+                    "output_dir": str(out_dir),
+                    **summary,
+                }, lines)
+            except Exception as e:
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "targets": target_names})
+
+    # ------------------------------------------------------------------
+    # GET /tests — list recent/active test runs
+    # ------------------------------------------------------------------
+    @app.route("/tests", methods=["GET"])
+    def route_tests_list() -> Any:
+        limit = request.args.get("limit", 50, type=int)
+        runs = _list_test_runs(limit=limit)
+        return jsonify({"ok": True, "runs": runs})
+
+    # ------------------------------------------------------------------
+    # GET /tests/<test_id> — poll test status + metadata
+    # ------------------------------------------------------------------
+    @app.route("/tests/<test_id>", methods=["GET"])
+    def route_tests_get(test_id: str) -> Any:
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
+
+        entry = dict(run)
+        job = _jobs.get(test_id)
+        if job:
+            entry["status"] = job["status"]
+            entry["output"] = job.get("output", [])
+            if job.get("result"):
+                entry["result"] = job["result"]
+            if job.get("error"):
+                entry["error"] = job["error"]
+        elif "status" not in entry:
+            entry["status"] = "expired"
+
+        return jsonify({"ok": True, **entry})
+
+    # ------------------------------------------------------------------
+    # GET /tests/<test_id>/report — retrieve test report
+    # ------------------------------------------------------------------
+    @app.route("/tests/<test_id>/report", methods=["GET"])
+    def route_tests_report(test_id: str) -> Any:
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
+
+        output_dir = run.get("output_dir")
+        if not output_dir:
+            return _err("Test run has no output directory yet (still running?)")
+
+        out_path = Path(output_dir)
+        fmt = request.args.get("format", "json")
+
+        if run.get("kind") == "fleet":
+            # Fleet report
+            report_file = out_path / "fleet-report.json"
+        else:
+            # Single target — look for report.json in the output dir
+            report_file = out_path / "report.json"
+
+        if fmt == "json":
+            if report_file.is_file():
+                import json as _json
+                data = _json.loads(report_file.read_text(encoding="utf-8"))
+                return jsonify({"ok": True, "test_id": test_id, "report": data})
+            # Fallback: return summary from the test run metadata
+            summary = run.get("summary")
+            if summary:
+                return jsonify({"ok": True, "test_id": test_id, "report": summary})
+            return _err("Report not available yet")
+
+        # For html/markdown, look for the file
+        is_fleet = run.get("kind") == "fleet"
+        ext_map = {
+            "html": "fleet-report.html" if is_fleet else "report.html",
+            "markdown": "fleet-report.md" if is_fleet else "report.md",
+        }
+        filename = ext_map.get(fmt)
+        if not filename:
+            return _err(f"Unknown format '{fmt}'. Expected: json, html, markdown")
+
+        report_path = out_path / filename
+        if not report_path.is_file():
+            return _err(f"{filename} not found in output directory")
+
+        from flask import send_file
+        return send_file(str(report_path))
+
+    # ==================================================================
+    # Dashboard — simple HTML status page
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /dashboard — HTML page showing pods, tests, jobs
+    # ------------------------------------------------------------------
+    @app.route("/dashboard", methods=["GET"])
+    def route_dashboard() -> Any:
+        from flask import render_template_string
+
+        # Gather data
+        try:
+            provider = _get_runpod_provider()
+            from comfy_runner.hosted.config import list_pod_records
+            pods_data = []
+            records = list_pod_records("runpod")
+            live_pods = provider.list_pods()
+            live_map = {}
+            for p in live_pods:
+                live_map[p.name] = p
+                live_map[p.id] = p
+            for pname, rec in records.items():
+                live = live_map.get(pname) or live_map.get(rec.get("id", ""))
+                server_url = _get_pod_server_url(pname, raise_on_error=False) or ""
+                pods_data.append({
+                    "name": pname,
+                    "id": rec.get("id", ""),
+                    "status": live.status if live else "UNKNOWN",
+                    "gpu_type": (live.gpu_type if live else "") or rec.get("gpu_type", ""),
+                    "cost_per_hr": live.cost_per_hr if live else 0,
+                    "server_url": server_url,
+                })
+        except Exception:
+            pods_data = []
+
+        test_runs = _list_test_runs(limit=20)
+        active_jobs = _jobs.list_active()
+
+        html = _DASHBOARD_HTML
+        return render_template_string(
+            html,
+            pods=pods_data,
+            test_runs=test_runs,
+            jobs=active_jobs,
+        )
+
+    # ------------------------------------------------------------------
     # POST /self-update — git pull and restart the server process
     # ------------------------------------------------------------------
     @app.route("/self-update", methods=["POST"])
@@ -1745,14 +3405,29 @@ def create_app() -> Any:
         import sys
 
         repo_dir = Path(__file__).resolve().parent.parent
+        body = request.get_json(silent=True) or {}
+        force = body.get("force", False)
 
-        # git pull
+        # git pull (or force-reset)
         try:
-            result = subprocess.run(
-                ["git", "pull", "--ff-only"],
+            # Always fetch first
+            subprocess.run(
+                ["git", "fetch", "--all"],
                 cwd=str(repo_dir),
                 capture_output=True, text=True, timeout=30,
             )
+            if force:
+                result = subprocess.run(
+                    ["git", "reset", "--hard", "origin/main"],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=30,
+                )
+            else:
+                result = subprocess.run(
+                    ["git", "pull", "--ff-only"],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=30,
+                )
             pull_output = result.stdout.strip()
             if result.returncode != 0:
                 return _err(f"git pull failed: {result.stderr.strip()}")
@@ -1763,6 +3438,22 @@ def create_app() -> Any:
 
         if already_up_to_date:
             return jsonify({"ok": True, "updated": False, "message": pull_output})
+
+        # Install any new/changed dependencies before restarting
+        req_file = repo_dir / "requirements.txt"
+        deps_output = ""
+        if req_file.exists():
+            try:
+                pip_result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)],
+                    cwd=str(repo_dir),
+                    capture_output=True, text=True, timeout=120,
+                )
+                deps_output = pip_result.stdout.strip()
+                if pip_result.returncode != 0:
+                    log.warning("pip install failed during self-update: %s", pip_result.stderr.strip())
+            except Exception as e:
+                log.warning("pip install failed during self-update: %s", e)
 
         # Schedule restart after response is sent
         def _restart() -> None:

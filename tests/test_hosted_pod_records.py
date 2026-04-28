@@ -62,8 +62,23 @@ class TestPodRecordCRUD:
 # pod create saves record
 # ---------------------------------------------------------------------------
 
+class _MockProviderCtx:
+    """Patch RunPodProvider with sensible defaults for URL lookups.
+
+    Pods are Tailscale-only now; ``get_pod_tailscale_url`` returns
+    ``None`` by default so JSON output is serializable.
+    """
+    def __enter__(self):
+        self._patch = patch("comfy_runner.hosted.runpod_provider.RunPodProvider")
+        MockProv = self._patch.__enter__()
+        MockProv.return_value.get_pod_tailscale_url.return_value = None
+        return MockProv
+    def __exit__(self, *a):
+        return self._patch.__exit__(*a)
+
+
 def _mock_provider():
-    return patch("comfy_runner.hosted.runpod_provider.RunPodProvider")
+    return _MockProviderCtx()
 
 
 def _make_pod(**overrides) -> PodInfo:
@@ -99,11 +114,18 @@ class TestPodCreateSavesRecord:
     def test_create_json_includes_urls(self, tmp_config_dir, capsys):
         with _mock_provider() as MockProv:
             MockProv.return_value.create_pod.return_value = _make_pod()
+            # Pretend Tailscale is configured so URLs are returned.
+            MockProv.return_value.get_pod_tailscale_url.side_effect = (
+                lambda name, port=9189: f"http://comfy-{name}.example.ts.net:{port}"
+            )
             main(["--json", "hosted", "pod", "create", "--name", "test-pod"])
         out = json.loads(capsys.readouterr().out)
         assert "server_url" in out["pod"]
         assert "comfy_url" in out["pod"]
-        assert "pod_abc-9189" in out["pod"]["server_url"]
+        # Pods are Tailscale-only; URLs use the MagicDNS hostname.
+        assert "comfy-test-pod" in out["pod"]["server_url"]
+        assert ":9189" in out["pod"]["server_url"]
+        assert ":8188" in out["pod"]["comfy_url"]
 
 
 class TestPodTerminateRemovesRecord:
