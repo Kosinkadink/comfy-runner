@@ -215,6 +215,25 @@ comfy_runner.py tunnel config --rm-domain example.ngrok.io
 
 These tunnels expose individual ComfyUI instances (their `--port`), not the runner server itself. For exposing the runner server, see **Tailscale Serve** below.
 
+#### Tailscale Funnel — public-internet exposure (opt-in)
+
+Unlike ngrok and Tailscale Serve, **Tailscale Funnel exposes the instance to the public internet**, so it is **disabled by default**. To enable it, edit `~/.comfy-runner/config.json`:
+
+```json
+{
+  "tunnel": {
+    "tailscale": { "allow_funnel": true }
+  }
+}
+```
+
+Without this setting, `tunnel start --provider tailscale` fails with a clear error.
+
+**Restart safety:** funnel sessions are owned by `tailscaled` (not by comfy-runner), so they normally survive a runner restart. On every server start, comfy-runner reconciles its tunnel state files against the live funnel config:
+
+- If `allow_funnel` is `true` and a funnel is still active for a tracked port, the state file is preserved so `get_tunnel_url` keeps reporting the URL.
+- If `allow_funnel` is `false` and an active funnel is discovered, comfy-runner runs `tailscale funnel --https=443 off` to shut it down and removes the stale state. This prevents orphan public exposure when funnels were disabled but not cleanly stopped.
+
 ### Testing
 
 ```bash
