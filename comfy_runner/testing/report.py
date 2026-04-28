@@ -59,6 +59,11 @@ class SuiteReport:
     failed: int
     workflows: list[WorkflowReport] = field(default_factory=list)
     target_info: dict[str, Any] = field(default_factory=dict)
+    # Suite-level watchdog metadata. ``timed_out`` is set when the
+    # ``max_runtime_s`` budget was exceeded; ``aborted_reason`` carries
+    # a short reason string (e.g. ``"overrun"``).
+    timed_out: bool = False
+    aborted_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dict."""
@@ -125,6 +130,8 @@ def build_report(
         failed=suite_run.failed,
         workflows=workflows,
         target_info=target_info or {},
+        timed_out=getattr(suite_run, "timed_out", False),
+        aborted_reason=getattr(suite_run, "aborted_reason", None),
     )
 
 

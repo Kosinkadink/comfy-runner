@@ -114,6 +114,7 @@ class TestTarget(Protocol):
         output_dir: Path,
         timeout: int = 600,
         send_output: Callable[[str], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> TargetResult: ...
 
 
@@ -138,6 +139,7 @@ class LocalTarget:
         output_dir: Path,
         timeout: int = 600,
         send_output: Callable[[str], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> TargetResult:
         from .client import ComfyTestClient
 
@@ -147,6 +149,7 @@ class LocalTarget:
             suite_run = run_suite(
                 client, suite, output_dir,
                 timeout=timeout, send_output=send_output,
+                cancelled=cancelled,
             )
             target_info = {"name": self.name, "url": self._url, "kind": self.kind}
             report = build_report(suite_run, target_info=target_info)
@@ -212,6 +215,7 @@ class RemoteTarget:
         output_dir: Path,
         timeout: int = 600,
         send_output: Callable[[str], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> TargetResult:
         from .client import ComfyTestClient
         from comfy_runner.hosted.remote import RemoteRunner
@@ -241,6 +245,7 @@ class RemoteTarget:
             suite_run = run_suite(
                 client, suite, output_dir,
                 timeout=timeout, send_output=send_output,
+                cancelled=cancelled,
             )
             target_info = {
                 "name": self.name,
@@ -312,6 +317,7 @@ class EphemeralTarget:
         output_dir: Path,
         timeout: int = 600,
         send_output: Callable[[str], None] | None = None,
+        cancelled: threading.Event | None = None,
     ) -> TargetResult:
         from .runpod import RunPodTestConfig, run_on_runpod
 
@@ -332,7 +338,9 @@ class EphemeralTarget:
             output_dir=str(output_dir),
         )
 
-        rp_result = run_on_runpod(config, send_output=send_output)
+        rp_result = run_on_runpod(
+            config, send_output=send_output, cancelled=cancelled,
+        )
         duration = time.monotonic() - t0
 
         # Extract report from run_on_runpod result
@@ -453,6 +461,7 @@ def run_fleet(
     max_workers: int | None = None,
     send_output: Callable[[str], None] | None = None,
     formats: str = "json,html,markdown",
+    cancelled: threading.Event | None = None,
 ) -> FleetResult:
     """Execute a test suite across multiple targets in parallel.
 
@@ -503,6 +512,7 @@ def run_fleet(
             output_dir=target_dir,
             timeout=timeout,
             send_output=target_out,
+            cancelled=cancelled,
         )
         if result.error:
             target_out(f"Error: {result.error}\n")

@@ -6,9 +6,15 @@ Lives under the ``"hosted"`` key in the main comfy-runner config JSON.
 from __future__ import annotations
 
 import os
-from typing import Any
+import threading
+from typing import Any, Callable
 
 from comfy_runner.config import load_config, save_config
+
+# Global lock for read-modify-write operations on the pod registry.
+# Protects against lost updates when multiple threads (HTTP routes,
+# background workers, the idle reaper) mutate pod records concurrently.
+_pod_records_lock = threading.Lock()
 
 
 def get_hosted_config() -> dict[str, Any]:
@@ -156,32 +162,83 @@ def get_tailscale_tailnet() -> str:
 # ---------------------------------------------------------------------------
 
 def get_pod_record(provider: str, pod_name: str) -> dict[str, Any] | None:
-    """Return a named pod's record, or ``None`` if it doesn't exist."""
-    pods = get_provider_config(provider).get("pods", {})
-    return pods.get(pod_name)
+    """Return a named pod's record, or ``None`` if it doesn't exist.
+
+    Held under ``_pod_records_lock`` so it can never observe a partial
+    write performed by ``set_pod_record`` / ``update_pod_record`` /
+    ``remove_pod_record``. Returns a shallow copy so callers can mutate
+    the result without corrupting the in-memory config.
+    """
+    with _pod_records_lock:
+        pods = get_provider_config(provider).get("pods", {})
+        rec = pods.get(pod_name)
+        return dict(rec) if rec is not None else None
 
 
 def set_pod_record(provider: str, pod_name: str, data: dict[str, Any]) -> None:
-    """Create or update a named pod's record."""
-    config = load_config()
-    hosted = config.setdefault("hosted", {})
-    prov = hosted.setdefault(provider, {})
-    pods = prov.setdefault("pods", {})
-    pods[pod_name] = data
-    save_config(config)
+    """Create or update a named pod's record (atomic)."""
+    with _pod_records_lock:
+        config = load_config()
+        hosted = config.setdefault("hosted", {})
+        prov = hosted.setdefault(provider, {})
+        pods = prov.setdefault("pods", {})
+        pods[pod_name] = data
+        save_config(config)
+
+
+def update_pod_record(
+    provider: str,
+    pod_name: str,
+    updater: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """Atomically read-modify-write a pod's record.
+
+    *updater* is called with the current record (or ``None`` if it
+    doesn't exist) and must return the new record (or ``None`` to
+    delete it). The whole load-modify-save cycle is performed under
+    a global lock so concurrent updates cannot lose data.
+
+    Returns the new record (or ``None`` if it was deleted / never
+    existed).
+    """
+    with _pod_records_lock:
+        config = load_config()
+        hosted = config.setdefault("hosted", {})
+        prov = hosted.setdefault(provider, {})
+        pods = prov.setdefault("pods", {})
+        current = pods.get(pod_name)
+        # Pass a copy so the updater can't accidentally mutate stored state
+        # before we decide what to write back.
+        new_value = updater(dict(current) if current is not None else None)
+        if new_value is None:
+            if pod_name in pods:
+                del pods[pod_name]
+                save_config(config)
+            return None
+        pods[pod_name] = new_value
+        save_config(config)
+        return new_value
 
 
 def remove_pod_record(provider: str, pod_name: str) -> bool:
     """Remove a pod record. Returns ``True`` if it existed."""
-    config = load_config()
-    pods = config.get("hosted", {}).get(provider, {}).get("pods", {})
-    if pod_name in pods:
-        del pods[pod_name]
-        save_config(config)
-        return True
-    return False
+    with _pod_records_lock:
+        config = load_config()
+        pods = config.get("hosted", {}).get(provider, {}).get("pods", {})
+        if pod_name in pods:
+            del pods[pod_name]
+            save_config(config)
+            return True
+        return False
 
 
 def list_pod_records(provider: str) -> dict[str, dict[str, Any]]:
-    """Return all pod records for a provider."""
-    return get_provider_config(provider).get("pods", {})
+    """Return all pod records for a provider.
+
+    Held under ``_pod_records_lock`` so it never observes a partial
+    write. Returns a fresh dict of shallow record copies so callers
+    can iterate and mutate without corrupting the in-memory config.
+    """
+    with _pod_records_lock:
+        pods = get_provider_config(provider).get("pods", {})
+        return {name: dict(rec) for name, rec in pods.items()}

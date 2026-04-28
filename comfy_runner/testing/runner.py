@@ -7,12 +7,18 @@ collects outputs into structured directories, and produces per-run results.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .client import ComfyTestClient, OutputFile, PromptResult
+from .client import (
+    ComfyTestClient,
+    OutputFile,
+    PromptResult,
+    WatchdogAborted,
+)
 from .compare.registry import CompareResult, _guess_mimetype, compare_outputs
 from .suite import Suite
 
@@ -53,6 +59,11 @@ class SuiteRun:
     comparisons: dict[str, list[ComparisonEntry]] = field(default_factory=dict)
     started_at: float = 0.0
     finished_at: float = 0.0
+    # Set to True if the suite-level watchdog aborted the run because
+    # ``max_runtime_s`` was exceeded. ``aborted_reason`` carries the
+    # human-readable message (e.g. "overrun: budget 60s").
+    timed_out: bool = False
+    aborted_reason: str | None = None
 
     @property
     def total(self) -> int:
@@ -78,6 +89,8 @@ class SuiteRun:
             "passed": self.passed,
             "failed": self.failed,
             "duration": round(self.duration, 2),
+            "timed_out": self.timed_out,
+            "aborted_reason": self.aborted_reason,
             "results": [
                 {
                     "workflow": r.workflow_name,
@@ -132,6 +145,7 @@ def run_workflow(
     overrides: dict[str, Any] | None = None,
     timeout: int = 600,
     send_output: Callable[[str], None] | None = None,
+    cancelled: threading.Event | None = None,
 ) -> WorkflowResult:
     """Execute a single workflow and download its outputs.
 
@@ -142,6 +156,10 @@ def run_workflow(
         overrides: Optional parameter overrides (e.g. ``{"seed": 42}``).
         timeout: Max seconds to wait for completion.
         send_output: Optional progress callback.
+        cancelled: Optional watchdog cancellation event. When set, the
+            in-flight workflow's poll loop raises ``WatchdogAborted``;
+            this function catches it and returns a result with
+            ``error="overrun"``.
 
     Returns a ``WorkflowResult``.
     """
@@ -164,7 +182,16 @@ def run_workflow(
     out(f"  Running {name}...")
 
     try:
-        result = client.run_workflow(workflow, output_dir, timeout=timeout)
+        result = client.run_workflow(
+            workflow, output_dir, timeout=timeout, cancelled=cancelled,
+        )
+    except WatchdogAborted as exc:
+        out(f" ABORTED ({exc})\n")
+        return WorkflowResult(
+            workflow_name=name,
+            workflow_path=workflow_path,
+            error="overrun",
+        )
     except RuntimeError as exc:
         out(f" FAILED ({exc})\n")
         return WorkflowResult(
@@ -191,6 +218,7 @@ def run_suite(
     output_dir: Path,
     timeout: int = 600,
     send_output: Callable[[str], None] | None = None,
+    cancelled: threading.Event | None = None,
 ) -> SuiteRun:
     """Execute all workflows in a test suite.
 
@@ -202,6 +230,13 @@ def run_suite(
         output_dir: Root output directory for this run.
         timeout: Per-workflow timeout in seconds.
         send_output: Optional progress callback.
+        cancelled: Optional watchdog cancellation event. Checked between
+            workflows and threaded into ``run_workflow`` so the in-flight
+            workflow's poll loop can abort. When set, the remaining
+            workflows are skipped, ``timed_out=True`` is recorded, and a
+            synthetic ``error="overrun"`` row is appended so CI sees a
+            non-zero outcome even if every started workflow happened to
+            pass.
 
     Returns a ``SuiteRun`` with all results.
     """
@@ -217,6 +252,9 @@ def run_suite(
     out(f"Running suite: {suite.name} ({len(suite.workflows)} workflows)\n")
 
     for i, wf_path in enumerate(suite.workflows, 1):
+        if cancelled is not None and cancelled.is_set():
+            out(f"[{i}/{len(suite.workflows)}] aborted before start\n")
+            break
         wf_name = wf_path.stem
         out(f"[{i}/{len(suite.workflows)}]")
 
@@ -228,9 +266,28 @@ def run_suite(
             overrides=overrides,
             timeout=timeout,
             send_output=send_output,
+            cancelled=cancelled,
         )
         result.has_baseline = suite.has_baseline(wf_name)
         test_run.results.append(result)
+        if cancelled is not None and cancelled.is_set():
+            # The current workflow was either aborted by the watchdog
+            # (already recorded as error="overrun") or finished just
+            # before the event fired. Either way, stop here.
+            break
+
+    # If the watchdog fired, record overrun status and append a synthetic
+    # failure row when none of the existing rows already capture it (so
+    # the report's failed count is always > 0).
+    if cancelled is not None and cancelled.is_set():
+        test_run.timed_out = True
+        test_run.aborted_reason = "overrun"
+        if not any(r.error == "overrun" for r in test_run.results):
+            test_run.results.append(WorkflowResult(
+                workflow_name="__watchdog__",
+                workflow_path=Path("__watchdog__"),
+                error="overrun",
+            ))
 
     # ── Compare outputs against baselines ──────────────────────────
     for result in test_run.results:

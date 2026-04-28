@@ -1839,12 +1839,26 @@ def _test_run(args: argparse.Namespace) -> None:
     out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / _run_id()
     send_output = None if args.json else (lambda t: console.print(t, end=""))
 
+    # Suite-level watchdog: --max-runtime overrides suite.json.
+    from comfy_runner.testing.client import watchdog as _watchdog
+    budget = getattr(args, "max_runtime", None)
+    if budget is None and isinstance(suite.max_runtime_s, int):
+        budget = suite.max_runtime_s
+
+    def _on_abort() -> None:
+        try:
+            client.interrupt()
+        except Exception:
+            pass
+
     try:
-        suite_run = run_suite(
-            client, suite, out_dir,
-            timeout=args.timeout,
-            send_output=send_output,
-        )
+        with _watchdog(budget, on_abort=_on_abort) as cancelled:
+            suite_run = run_suite(
+                client, suite, out_dir,
+                timeout=args.timeout,
+                send_output=send_output,
+                cancelled=cancelled,
+            )
     except Exception as e:
         if args.json:
             print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -1866,11 +1880,20 @@ def _test_run(args: argparse.Namespace) -> None:
         for fmt, path in written.items():
             console.print(f"  [dim]{fmt}: {path}[/dim]")
 
+    # Non-zero exit when any test failed or the watchdog aborted.
+    if report.failed > 0 or report.timed_out:
+        sys.exit(1)
+
 
 def _test_run_runpod(args: argparse.Namespace) -> None:
     """Run tests on an ephemeral RunPod pod (provision → deploy → test → teardown)."""
     from comfy_runner.testing.runpod import RunPodTestConfig, run_on_runpod
 
+    on_overrun = getattr(args, "on_overrun", None)
+    # Default ``terminate`` for runpod targets — the same default the
+    # server applies for kind=="runpod".
+    if on_overrun is None:
+        on_overrun = "terminate"
     config = RunPodTestConfig(
         suite_path=args.suite,
         gpu_type=getattr(args, "gpu", None),
@@ -1885,6 +1908,8 @@ def _test_run_runpod(args: argparse.Namespace) -> None:
         formats=args.format,
         terminate=not getattr(args, "no_terminate", False),
         install_name=getattr(args, "install_name", None) or "main",
+        max_runtime_s=getattr(args, "max_runtime", None),
+        on_overrun=on_overrun,
     )
 
     send_output = None if args.json else (lambda t: console.print(t, end=""))
@@ -1898,13 +1923,18 @@ def _test_run_runpod(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
+    failed = (result.test_result or {}).get("failed", 0) if result.test_result else 0
+    nonzero = bool(result.error or result.timed_out or (failed > 0))
+
     if args.json:
         output: dict[str, object] = {
-            "ok": result.error is None,
+            "ok": not nonzero,
             "pod_id": result.pod_id,
             "pod_name": result.pod_name,
             "server_url": result.server_url,
             "terminated": result.terminated,
+            "timed_out": result.timed_out,
+            "aborted_reason": result.aborted_reason,
         }
         if result.error:
             output["error"] = result.error
@@ -1928,10 +1958,14 @@ def _test_run_runpod(args: argparse.Namespace) -> None:
                 console.print()
             if tr.get("output_dir"):
                 console.print(f"  Output: {tr['output_dir']}")
+            if result.timed_out:
+                console.print(
+                    "  [red]Aborted by watchdog (overrun).[/red]"
+                )
         if result.terminated:
             console.print(f"  [dim]Pod '{result.pod_name}' terminated[/dim]")
 
-    if result.error:
+    if nonzero:
         sys.exit(1)
 
 
@@ -2191,16 +2225,30 @@ def _test_fleet(args: argparse.Namespace) -> None:
     out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / f"fleet-{_run_id()}"
     send_output = None if args.json else (lambda t: console.print(t, end=""))
 
+    # Fleet-level watchdog: --max-runtime overrides suite.json.
+    from comfy_runner.testing.client import watchdog as _watchdog
+    from comfy_runner.testing.suite import load_suite as _load_suite_for_budget
+    budget = getattr(args, "max_runtime", None)
+    if budget is None:
+        try:
+            _suite = _load_suite_for_budget(args.suite)
+            if isinstance(_suite.max_runtime_s, int):
+                budget = _suite.max_runtime_s
+        except Exception:
+            pass
+
     try:
-        fleet_result = run_fleet(
-            targets=targets,
-            suite_path=args.suite,
-            output_dir=out_dir,
-            timeout=args.timeout,
-            max_workers=getattr(args, "max_workers", None),
-            send_output=send_output,
-            formats=args.format,
-        )
+        with _watchdog(budget) as cancelled:
+            fleet_result = run_fleet(
+                targets=targets,
+                suite_path=args.suite,
+                output_dir=out_dir,
+                timeout=args.timeout,
+                max_workers=getattr(args, "max_workers", None),
+                send_output=send_output,
+                formats=args.format,
+                cancelled=cancelled,
+            )
     except Exception as e:
         if args.json:
             print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2208,16 +2256,23 @@ def _test_fleet(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
+    timed_out = cancelled.is_set()
+
     if args.json:
-        output = {"ok": fleet_result.targets_failed == 0}
+        output = {
+            "ok": fleet_result.targets_failed == 0 and not timed_out,
+            "timed_out": timed_out,
+        }
         output.update(fleet_result.to_dict())
         print(json.dumps(output, indent=2))
     else:
         console.print()
         console.print(render_fleet_console(fleet_result))
         console.print(f"\n  [dim]Output: {out_dir}[/dim]")
+        if timed_out:
+            console.print("  [red]Aborted by watchdog (overrun).[/red]")
 
-    if fleet_result.targets_failed > 0:
+    if fleet_result.targets_failed > 0 or timed_out:
         sys.exit(1)
 
 
@@ -3319,6 +3374,75 @@ def _station_pods(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
 
+    elif pod_action == "launch-pr":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            config = _station_config(args)
+            defaults = config.get("defaults", {})
+            body: dict = {"pr": args.pr}
+            if getattr(args, "repo", None):
+                body["repo"] = args.repo
+            if getattr(args, "gpu", None):
+                body["gpu_type"] = args.gpu
+            elif defaults.get("gpu_type"):
+                body["gpu_type"] = defaults["gpu_type"]
+            if getattr(args, "datacenter", None):
+                body["datacenter"] = args.datacenter
+            elif defaults.get("datacenter"):
+                body["datacenter"] = defaults["datacenter"]
+            if getattr(args, "image", None):
+                body["image"] = args.image
+            if getattr(args, "install", None):
+                body["install"] = args.install
+            if getattr(args, "idle_timeout", None) is not None:
+                body["idle_timeout_s"] = args.idle_timeout
+            data = runner._request("POST", "/pods/launch-pr", json=body)
+            job_id = data.get("job_id")
+            pod_name = data.get("name")
+            if not args.json:
+                console.print(
+                    f"Launching PR #[cyan]{args.pr}[/cyan] on pod "
+                    f"[cyan]{pod_name}[/cyan] (job: {job_id})...",
+                )
+            result = runner.poll_job(
+                job_id, timeout=900,
+                on_output=None if args.json else _output,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ PR #[cyan]{args.pr}[/cyan] ready on pod [cyan]{pod_name}[/cyan].")
+                if result.get("server_url"):
+                    console.print(f"  Server:   {result['server_url']}")
+                if result.get("comfy_url"):
+                    console.print(f"  ComfyUI:  {result['comfy_url']}")
+                if result.get("idle_timeout_s"):
+                    console.print(f"  Idle in:  {result['idle_timeout_s']}s of inactivity")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "touch":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("POST", f"/pods/{args.pod_name}/touch")
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print(
+                    f"✓ Pod [cyan]{args.pod_name}[/cyan] touched. "
+                    f"Idle in {data.get('idle_in_s', '?')}s.",
+                )
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     elif pod_action == "cleanup":
         try:
             runner = RemoteRunner(_station_server(args))
@@ -3404,23 +3528,42 @@ def _station_tests(args: argparse.Namespace) -> None:
             body = {"suite": args.suite, "target": target}
             if getattr(args, "timeout", None):
                 body["timeout"] = args.timeout
+            if getattr(args, "max_runtime", None) is not None:
+                body["max_runtime_s"] = args.max_runtime
+            if getattr(args, "on_overrun", None) is not None:
+                body["on_overrun"] = args.on_overrun
 
             data = runner._request("POST", "/tests/run", json=body)
             job_id = data.get("job_id")
             if not args.json:
                 console.print(f"Test started (job: {job_id})...")
             result = runner.poll_job(job_id, timeout=3600, on_output=None if args.json else _output)
+            timed_out = bool(result.get("timed_out"))
+            failed = result.get("failed", 0) or 0
             if args.json:
-                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+                print(json.dumps({
+                    "ok": failed == 0 and not timed_out,
+                    "job_id": job_id,
+                    "timed_out": timed_out,
+                    "result": result,
+                }, indent=2))
             else:
                 passed = result.get("passed", 0)
-                total = result.get("total", 0) if result.get("total") else (passed + result.get("failed", 0))
-                failed = result.get("failed", 0)
-                duration = result.get("duration", 0)
-                if failed == 0:
+                total = result.get("total", 0) if result.get("total") else (passed + failed)
+                duration = result.get("duration", 0) or 0
+                if timed_out:
+                    console.print(
+                        f"\n[red]✗ Aborted by watchdog (overrun): "
+                        f"{failed}/{total} failed[/red] ({duration:.1f}s)"
+                    )
+                elif failed == 0:
                     console.print(f"\n[green]✓ All {total} tests passed[/green] ({duration:.1f}s)")
                 else:
                     console.print(f"\n[red]✗ {failed}/{total} tests failed[/red] ({duration:.1f}s)")
+            if failed > 0 or timed_out:
+                sys.exit(1)
+        except SystemExit:
+            raise
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -3443,23 +3586,42 @@ def _station_tests(args: argparse.Namespace) -> None:
                 body["timeout"] = args.timeout
             if getattr(args, "max_workers", None):
                 body["max_workers"] = args.max_workers
+            if getattr(args, "max_runtime", None) is not None:
+                body["max_runtime_s"] = args.max_runtime
+            if getattr(args, "on_overrun", None) is not None:
+                body["on_overrun"] = args.on_overrun
 
             data = runner._request("POST", "/tests/fleet", json=body)
             job_id = data.get("job_id")
             if not args.json:
                 console.print(f"Fleet test started ({len(targets)} targets, job: {job_id})...")
             result = runner.poll_job(job_id, timeout=3600, on_output=None if args.json else _output)
+            timed_out = bool(result.get("timed_out"))
+            failed = result.get("targets_failed", 0) or 0
             if args.json:
-                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+                print(json.dumps({
+                    "ok": failed == 0 and not timed_out,
+                    "job_id": job_id,
+                    "timed_out": timed_out,
+                    "result": result,
+                }, indent=2))
             else:
                 passed = result.get("targets_passed", 0)
                 total = result.get("total_targets", 0)
-                failed = result.get("targets_failed", 0)
-                duration = result.get("total_duration", 0)
-                if failed == 0:
+                duration = result.get("total_duration", 0) or 0
+                if timed_out:
+                    console.print(
+                        f"\n[red]✗ Fleet aborted by watchdog (overrun): "
+                        f"{failed}/{total} targets failed[/red] ({duration:.1f}s)"
+                    )
+                elif failed == 0:
                     console.print(f"\n[green]✓ All {total} targets passed[/green] ({duration:.1f}s)")
                 else:
                     console.print(f"\n[red]✗ {failed}/{total} targets failed[/red] ({duration:.1f}s)")
+            if failed > 0 or timed_out:
+                sys.exit(1)
+        except SystemExit:
+            raise
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -3999,6 +4161,23 @@ def main(argv: list[str] | None = None) -> None:
                             help="Keep the pod running after tests complete")
     p_test_run.add_argument("--install-name", default="main",
                             help="Installation name on the remote pod (default: main)")
+    p_test_run.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Suite-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s. The watchdog aborts the run on "
+            "overrun and (for runpod targets) tears down the pod."
+        ),
+    )
+    p_test_run.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults: terminate "
+            "for runpod targets, none otherwise (local mode)."
+        ),
+    )
 
     # test list
     p_test_list = test_sub.add_parser("list", help="Discover available test suites")
@@ -4037,6 +4216,24 @@ def main(argv: list[str] | None = None) -> None:
     fleet_deploy_group.add_argument("--pr", type=int, help="Deploy a PR before testing (ephemeral targets)")
     fleet_deploy_group.add_argument("--branch", help="Deploy a branch before testing (ephemeral targets)")
     fleet_deploy_group.add_argument("--commit", help="Deploy a commit before testing (ephemeral targets)")
+    p_test_fleet.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Fleet-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s. The watchdog aborts the run on "
+            "overrun and (for runpod/remote targets) dispatches the pod "
+            "action."
+        ),
+    )
+    p_test_fleet.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults per target "
+            "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
 
     p_test.set_defaults(func=cmd_test, _parser_test=p_test)
 
@@ -4234,6 +4431,27 @@ def main(argv: list[str] | None = None) -> None:
     p_st_pod_cleanup.add_argument("--prefix", default="test-", help="Pod name prefix to match (default: test-)")
     p_st_pod_cleanup.add_argument("--dry-run", action="store_true", help="List matching pods without terminating")
 
+    p_st_pod_launch_pr = st_pods_sub.add_parser(
+        "launch-pr",
+        help="Create-or-wake a pod for a PR and deploy the PR to it",
+    )
+    p_st_pod_launch_pr.add_argument("pr", type=int, help="GitHub PR number")
+    p_st_pod_launch_pr.add_argument("--repo", help="GitHub repo (URL or 'owner/name')")
+    p_st_pod_launch_pr.add_argument("--gpu", "-g", help="GPU type (default: from station config)")
+    p_st_pod_launch_pr.add_argument("--datacenter", help="Datacenter ID")
+    p_st_pod_launch_pr.add_argument("--image", help="Docker image")
+    p_st_pod_launch_pr.add_argument("--install", help="Installation name on the pod (default: main)")
+    p_st_pod_launch_pr.add_argument(
+        "--idle-timeout", type=int, dest="idle_timeout",
+        help="Seconds of inactivity before the pod is auto-stopped (default: 600)",
+    )
+
+    p_st_pod_touch = st_pods_sub.add_parser(
+        "touch",
+        help="Reset the idle timer on a pod (defers the auto-stop reaper)",
+    )
+    p_st_pod_touch.add_argument("pod_name", help="Pod name")
+
     p_st_pods.set_defaults(_parser_station_pods=p_st_pods)
 
     # station tests
@@ -4247,6 +4465,23 @@ def main(argv: list[str] | None = None) -> None:
     p_st_test_run.add_argument("--target", "-t", required=True,
                                help="Target: local:<url>, remote:<pod_name>, runpod:<gpu_type>")
     p_st_test_run.add_argument("--timeout", type=int, help="Per-workflow timeout (seconds)")
+    p_st_test_run.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Suite-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s. The watchdog aborts the run "
+            "on overrun and dispatches the on-overrun pod action."
+        ),
+    )
+    p_st_test_run.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults per target "
+            "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
 
     p_st_test_fleet = st_tests_sub.add_parser("fleet", help="Run a test suite across multiple targets")
     p_st_test_fleet.add_argument("suite", help="Suite name or path")
@@ -4254,6 +4489,22 @@ def main(argv: list[str] | None = None) -> None:
                                  help="Target spec (repeatable)")
     p_st_test_fleet.add_argument("--timeout", type=int, help="Per-workflow timeout (seconds)")
     p_st_test_fleet.add_argument("--max-workers", type=int, help="Max parallel workers")
+    p_st_test_fleet.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Fleet-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s."
+        ),
+    )
+    p_st_test_fleet.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults per target "
+            "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
 
     p_st_test_status = st_tests_sub.add_parser("status", help="Check test run status")
     p_st_test_status.add_argument("test_id", help="Test run ID")

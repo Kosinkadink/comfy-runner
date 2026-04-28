@@ -7,15 +7,76 @@ WebSockets to simplify proxying through the comfy-runner server.
 
 from __future__ import annotations
 
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import requests
 
 _TIMEOUT = 30
 _POLL_INTERVAL = 2
+
+
+class WatchdogAborted(RuntimeError):
+    """Raised when a watchdog ``cancelled`` Event fires mid-execution."""
+
+
+@contextmanager
+def watchdog(
+    budget: int | None,
+    on_abort: Callable[[], None] | None = None,
+) -> Iterator[threading.Event]:
+    """Arm a wall-clock watchdog and yield its ``cancelled`` Event.
+
+    If *budget* is None or non-positive, yields an Event that is never
+    set and arms no Timer.
+
+    Otherwise a daemon ``threading.Timer`` is armed for *budget* seconds.
+    When it fires, ``cancelled`` is set and *on_abort* (if given) runs
+    in the Timer thread; exceptions in *on_abort* are swallowed.
+
+    A ``completed`` flag protected by an internal lock guarantees a
+    "first one wins" handoff: when the body of the ``with`` block
+    finishes, the flag is set under the lock before the Timer is
+    cancelled. If the Timer's callback has not yet entered its critical
+    section, it returns without touching ``cancelled``; if it has, the
+    main thread will already see ``cancelled.is_set()`` after the
+    context exits. This eliminates the race where a normally-completing
+    run could be marked aborted because the Timer fired between
+    ``timer.cancel()`` being called and the callback actually running.
+    """
+    cancelled = threading.Event()
+    if not isinstance(budget, int) or budget <= 0:
+        yield cancelled
+        return
+
+    state_lock = threading.Lock()
+    completed = False
+
+    def _fire() -> None:
+        nonlocal completed
+        with state_lock:
+            if completed:
+                return
+            cancelled.set()
+        if on_abort is not None:
+            try:
+                on_abort()
+            except Exception:
+                pass
+
+    timer = threading.Timer(budget, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield cancelled
+    finally:
+        with state_lock:
+            completed = True
+        timer.cancel()
 
 
 @dataclass
@@ -104,15 +165,34 @@ class ComfyTestClient:
         self,
         prompt_id: str,
         timeout: int = 600,
+        cancelled: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Poll ``/history/{prompt_id}`` until the prompt completes.
 
         Returns the raw history entry dict.
         Raises ``RuntimeError`` on timeout or execution error.
+        Raises ``WatchdogAborted`` if *cancelled* is set during the poll
+        loop — used by the suite-level watchdog to abort an in-flight
+        workflow.
         """
         deadline = time.monotonic() + timeout
 
         while True:
+            if cancelled is not None and cancelled.is_set():
+                # Best-effort cancel of the ComfyUI side as well, so we
+                # don't leave the GPU spinning past our budget. The
+                # watchdog Timer normally calls this directly via
+                # ``client.interrupt()``, but the runner's poll loop
+                # also calls it here so callers without direct Timer
+                # access (e.g. simple unit tests) still send the
+                # interrupt.
+                try:
+                    self.interrupt()
+                except Exception:
+                    pass
+                raise WatchdogAborted(
+                    f"Prompt {prompt_id} aborted by watchdog"
+                )
             if time.monotonic() > deadline:
                 raise RuntimeError(
                     f"Prompt {prompt_id} timed out after {timeout}s"
@@ -144,6 +224,25 @@ class ComfyTestClient:
 
             # Completed (status_str == "success" or outputs are present)
             return entry
+
+    # ------------------------------------------------------------------
+    # Interrupt — abort the currently executing prompt
+    # ------------------------------------------------------------------
+
+    def interrupt(self) -> bool:
+        """Issue ``POST /interrupt`` to ComfyUI to cancel the running prompt.
+
+        Returns ``True`` if the request returned a 2xx response, ``False``
+        on any HTTP error (e.g. unreachable server). Never raises — this
+        is best-effort signalling from the watchdog.
+        """
+        try:
+            resp = requests.post(
+                f"{self.base_url}/interrupt", timeout=self.timeout,
+            )
+            return resp.ok
+        except requests.RequestException:
+            return False
 
     # ------------------------------------------------------------------
     # Output extraction
@@ -243,6 +342,7 @@ class ComfyTestClient:
         workflow: dict[str, Any],
         output_dir: Path,
         timeout: int = 600,
+        cancelled: threading.Event | None = None,
     ) -> PromptResult:
         """Queue a workflow, wait for completion, and download outputs.
 
@@ -252,7 +352,9 @@ class ComfyTestClient:
         prompt_id = self.queue_prompt(workflow)
 
         t0 = time.monotonic()
-        history = self.wait_for_completion(prompt_id, timeout=timeout)
+        history = self.wait_for_completion(
+            prompt_id, timeout=timeout, cancelled=cancelled,
+        )
         elapsed = time.monotonic() - t0
 
         outputs = self.download_all_outputs(history, output_dir)

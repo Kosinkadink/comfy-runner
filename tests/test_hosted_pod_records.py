@@ -13,6 +13,7 @@ from comfy_runner.hosted.config import (
     remove_pod_record,
     set_pod_record,
     set_provider_value,
+    update_pod_record,
 )
 from comfy_runner.hosted.provider import PodInfo, VolumeInfo
 from comfy_runner_cli.cli import main
@@ -56,6 +57,60 @@ class TestPodRecordCRUD:
     def test_pods_is_reserved_key(self, tmp_config_dir):
         with pytest.raises(ValueError, match="pods"):
             set_provider_value("runpod", "pods", "bad")
+
+
+# ---------------------------------------------------------------------------
+# update_pod_record (atomic read-modify-write)
+# ---------------------------------------------------------------------------
+
+class TestUpdatePodRecord:
+    def test_creates_when_missing_returns_new(self, tmp_config_dir):
+        result = update_pod_record(
+            "runpod", "fresh",
+            lambda r: {"id": "abc"} if r is None else r,
+        )
+        assert result == {"id": "abc"}
+        assert get_pod_record("runpod", "fresh") == {"id": "abc"}
+
+    def test_modifies_existing(self, tmp_config_dir):
+        set_pod_record("runpod", "p", {"id": "x", "n": 1})
+
+        def _bump(r):
+            r["n"] = r["n"] + 1
+            return r
+        update_pod_record("runpod", "p", _bump)
+        assert get_pod_record("runpod", "p")["n"] == 2
+
+    def test_deletes_when_updater_returns_none(self, tmp_config_dir):
+        set_pod_record("runpod", "p", {"id": "x"})
+        result = update_pod_record("runpod", "p", lambda r: None)
+        assert result is None
+        assert get_pod_record("runpod", "p") is None
+
+    def test_concurrent_updates_do_not_lose_data(self, tmp_config_dir):
+        """50 threads each increment a counter; final value must be 50.
+
+        With the old non-locking ``set_pod_record`` pattern this was
+        guaranteed to drop updates due to the read-modify-write race.
+        """
+        import threading
+
+        set_pod_record("runpod", "counter", {"id": "x", "n": 0})
+        barrier = threading.Barrier(50)
+
+        def _bump():
+            barrier.wait()
+            update_pod_record(
+                "runpod", "counter",
+                lambda r: {**r, "n": r["n"] + 1},
+            )
+
+        threads = [threading.Thread(target=_bump) for _ in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert get_pod_record("runpod", "counter")["n"] == 50
 
 
 # ---------------------------------------------------------------------------

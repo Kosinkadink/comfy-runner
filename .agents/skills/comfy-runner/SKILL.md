@@ -357,11 +357,14 @@ Supports `HF_TOKEN` and `MODELSCOPE_TOKEN` env vars for private models.
 | `test run <suite> --target <url>` | Run a test suite against a target |
 | `test run <suite> --runpod --gpu "NVIDIA L40S"` | Run on ephemeral RunPod pod |
 | `test fleet <suite> -t <spec> [-t <spec> ...]` | Fleet test (parallel) |
+| `test run/fleet ... --max-runtime <sec> --on-overrun {none,stop,terminate}` | Suite-level watchdog (overrides ``suite.json`` ``max_runtime_s``) |
 | `test list --dir ./test-suites` | List available test suites |
 | `test baseline <suite> <run_dir> --approve-all` | Approve test outputs as baselines |
 | `test report <run_dir>` | Regenerate reports from a previous run |
 
 Target specs: `local:<url>`, `remote:<server_url>`, `runpod:<gpu_type>`.
+
+Watchdog defaults per target kind: `runpod` → `terminate`, `remote` → `stop`, `local` → `none`. Non-zero CLI exit on `failed > 0` or `timed_out`.
 
 ### Hosted GPU (RunPod)
 
@@ -387,15 +390,20 @@ Requires `station.json` in the working directory or a parent (from [comfy-runner
 |---------|-------------|
 | `station info` | Show station config and server connectivity |
 | `station dashboard` | Open fleet dashboard in browser |
-| `station pods` | List fleet pods |
-| `station pods create <name> [--gpu TYPE]` | Create a pod |
+| `station pods` | List fleet pods (filter via ``GET /pods?purpose=`` server-side) |
+| `station pods create <name> [--gpu TYPE]` | Create a pod (defaults to ``purpose='persistent'``) |
 | `station pods deploy <name> --pr NUM` | Deploy to a pod |
+| `station pods launch-pr <num> --repo OWNER/NAME` | Create-or-wake + deploy a PR; tags ``purpose='pr'`` and arms idle reaper |
+| `station pods touch <name>` | Reset the idle timer on a PR pod (defers the reaper) |
 | `station pods stop/start/terminate <name>` | Pod lifecycle |
 | `station tests run <suite> -t remote:<pod>` | Run tests via central server |
+| `station tests run/fleet ... --max-runtime <sec> --on-overrun {none,stop,terminate}` | Suite watchdog (server-side enforcement) |
 | `station tests fleet <suite> -t ... -t ...` | Fleet test |
 | `station tests list` | List recent test runs |
 | `station tests status/report <id>` | Check status / get report |
 | `station jobs` | List active jobs |
+
+Pod purpose tags (`pr` / `persistent` / `test`) are recorded by the server. PR-review pods auto-stop after `idle_timeout_s` seconds (default 600) of inactivity; ephemeral test pods are tagged `purpose='test'` and their records are removed on auto-terminate.
 
 ### HTTP Server
 

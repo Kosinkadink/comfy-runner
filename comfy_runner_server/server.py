@@ -399,6 +399,198 @@ def _get_runpod_provider():
     return RunPodProvider()
 
 
+# ---------------------------------------------------------------------------
+# Pod activity tracking + idle reaper
+#
+# PR-review pods (records with ``purpose == "pr"``) are stopped after they
+# go idle for ``idle_timeout_s`` seconds (default ``DEFAULT_IDLE_TIMEOUT_S``).
+# Activity is recorded in the pod record's ``last_active_at`` (epoch
+# seconds, UTC).  Any meaningful interaction with the pod via the central
+# server should call ``_touch_pod_activity(name)``.
+# ---------------------------------------------------------------------------
+
+DEFAULT_IDLE_TIMEOUT_S = 600
+_REAPER_INTERVAL_S = 60
+
+_reaper_lock = threading.Lock()
+_reaper_started = False
+
+
+def _touch_pod_activity(name: str) -> None:
+    """Mark a pod as active by stamping ``last_active_at`` on its record.
+
+    Also clears any reaper-stamped ``status_hint`` (e.g. ``stopped_idle``,
+    ``exited``) since the pod is being interacted with again.
+    """
+    from comfy_runner.hosted.config import update_pod_record
+
+    def _apply(rec: dict[str, Any] | None) -> dict[str, Any] | None:
+        if rec is None:
+            return None
+        rec["last_active_at"] = int(time.time())
+        rec.pop("status_hint", None)
+        return rec
+
+    update_pod_record("runpod", name, _apply)
+
+
+def _idle_seconds_remaining(rec: dict[str, Any]) -> int | None:
+    """Return seconds remaining before *rec* is eligible for idle-stop, or
+    ``None`` if the pod is not subject to the idle reaper.
+    """
+    if rec.get("purpose") != "pr":
+        return None
+    timeout = int(rec.get("idle_timeout_s") or DEFAULT_IDLE_TIMEOUT_S)
+    last = rec.get("last_active_at")
+    if not last:
+        return timeout
+    return max(0, timeout - int(time.time() - int(last)))
+
+
+def _ensure_pod_running(
+    name: str,
+    send_output: Callable[[str], None] | None = None,
+    wait_ready: bool = True,
+) -> str:
+    """Start a stopped/exited pod and (optionally) wait for its server.
+
+    Updates ``last_active_at`` on the record. Returns the resolved
+    server URL. Raises ``RuntimeError`` if the pod cannot be reached.
+    """
+    from comfy_runner.hosted.config import get_pod_record
+    out = send_output or (lambda _: None)
+    rec = get_pod_record("runpod", name)
+    if not rec:
+        raise RuntimeError(f"Pod '{name}' not found in config")
+    provider = _get_runpod_provider()
+    pod_id = rec["id"]
+    pod = provider.get_pod(pod_id)
+    if not pod or pod.status in ("TERMINATED", "EXITED"):
+        if not pod:
+            raise RuntimeError(f"Pod '{name}' is gone on RunPod")
+        # EXITED pods can be started by RunPod's start API; fall through.
+    if pod and pod.status != "RUNNING":
+        out(f"Pod '{name}' is {pod.status}, starting...\n")
+        provider.start_pod(pod_id)
+    _touch_pod_activity(name)
+    if wait_ready:
+        return _wait_for_pod_server(name, send_output=send_output)
+    return _get_pod_server_url(name, raise_on_error=False) or ""
+
+
+def _idle_reaper_iteration() -> dict[str, Any]:
+    """Run a single reaper sweep. Returns a summary dict (also useful in tests).
+
+    Stops any pod whose record has ``purpose == "pr"``, status RUNNING,
+    and is past its idle timeout. Skips pods whose lock is currently
+    held (i.e. an operation is in flight).
+    """
+    from comfy_runner.hosted.config import (
+        list_pod_records,
+        update_pod_record,
+    )
+
+    summary: dict[str, Any] = {"checked": 0, "stopped": [], "skipped": []}
+
+    try:
+        provider = _get_runpod_provider()
+    except Exception as e:
+        log.debug("idle reaper: provider unavailable (%s); skipping sweep", e)
+        return summary
+
+    records = list_pod_records("runpod")
+    for name, rec in records.items():
+        if rec.get("purpose") != "pr":
+            continue
+        summary["checked"] += 1
+        remaining = _idle_seconds_remaining(rec)
+        if remaining is None or remaining > 0:
+            summary["skipped"].append({"name": name, "reason": "active",
+                                        "remaining_s": remaining})
+            continue
+        # Skip if there's an active operation on this pod.
+        lock = _get_pod_lock(name)
+        if not lock.acquire(blocking=False):
+            summary["skipped"].append({"name": name, "reason": "busy"})
+            continue
+        try:
+            pod_id = rec.get("id")
+            if not pod_id:
+                continue
+            try:
+                pod = provider.get_pod(pod_id)
+            except Exception as e:
+                log.warning("idle reaper: get_pod %s failed: %s", name, e)
+                summary["skipped"].append({"name": name, "reason": f"api: {e}"})
+                continue
+            if not pod or pod.status != "RUNNING":
+                # Already not running — sync the hint without an API call.
+                if pod:
+                    pod_status_lower = pod.status.lower()
+
+                    def _sync_hint(r: dict[str, Any] | None,
+                                   _hint: str = pod_status_lower) -> dict[str, Any] | None:
+                        if r is None:
+                            return None
+                        if r.get("status_hint") != "stopped_idle":
+                            r["status_hint"] = _hint
+                        return r
+                    update_pod_record("runpod", name, _sync_hint)
+                summary["skipped"].append({
+                    "name": name,
+                    "reason": f"not running ({pod.status if pod else 'gone'})",
+                })
+                continue
+            try:
+                provider.stop_pod(pod_id)
+            except Exception as e:
+                log.warning("idle reaper: stop_pod %s failed: %s", name, e)
+                summary["skipped"].append({"name": name, "reason": f"stop: {e}"})
+                continue
+
+            def _mark_idle(r: dict[str, Any] | None) -> dict[str, Any] | None:
+                if r is None:
+                    return None
+                r["status_hint"] = "stopped_idle"
+                r["stopped_at"] = int(time.time())
+                return r
+            update_pod_record("runpod", name, _mark_idle)
+            summary["stopped"].append({"name": name, "id": pod_id})
+            log.info("idle reaper: stopped pod '%s' (idle > %ss)",
+                     name, rec.get("idle_timeout_s") or DEFAULT_IDLE_TIMEOUT_S)
+        finally:
+            lock.release()
+    return summary
+
+
+def _idle_reaper_loop(stop_event: threading.Event) -> None:
+    """Background loop that runs ``_idle_reaper_iteration`` periodically."""
+    while not stop_event.wait(_REAPER_INTERVAL_S):
+        try:
+            _idle_reaper_iteration()
+        except Exception as e:
+            log.warning("idle reaper: iteration failed: %s", e)
+
+
+def _start_idle_reaper_once() -> None:
+    """Start the idle reaper background thread (idempotent)."""
+    global _reaper_started
+    with _reaper_lock:
+        if _reaper_started:
+            return
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=_idle_reaper_loop,
+            args=(stop_event,),
+            name="comfy-runner-idle-reaper",
+            daemon=True,
+        )
+        t.start()
+        _reaper_started = True
+        log.info("Idle reaper started (interval=%ss, default timeout=%ss)",
+                 _REAPER_INTERVAL_S, DEFAULT_IDLE_TIMEOUT_S)
+
+
 # Cache the Tailscale device list to avoid hammering the API when
 # resolving many pod URLs in a single dashboard / list request.
 _TS_DEVICES_CACHE: dict[str, Any] = {"at": 0.0, "devices": []}
@@ -621,6 +813,194 @@ def _wait_for_pod_server(
     )
 
 
+_VALID_ON_OVERRUN = ("none", "stop", "terminate")
+_VALID_PURPOSES = ("pr", "persistent", "test")
+
+
+def _comfy_url_for_target(target_body: dict[str, Any]) -> str | None:
+    """Resolve the ComfyUI HTTP URL for a target body (best-effort).
+
+    Used by the watchdog's abort callback to send POST /interrupt to
+    the live ComfyUI prompt. Returns ``None`` when the URL cannot be
+    determined (e.g. ephemeral runpod targets that own their own
+    interrupt path inside ``run_on_runpod``).
+    """
+    kind = target_body.get("kind")
+    if kind == "remote":
+        pn = target_body.get("pod_name")
+        if pn:
+            surl = _get_pod_server_url(pn, raise_on_error=False)
+            if surl:
+                return surl.rsplit(":", 1)[0] + ":8188"
+            return None
+        if target_body.get("server_url"):
+            surl = target_body["server_url"]
+            return surl.rsplit(":", 1)[0] + ":8188"
+    elif kind == "local":
+        url = target_body.get("url", "")
+        if url:
+            if "://" not in url:
+                url = f"http://{url}"
+            return url
+    return None
+
+
+def _interrupt_comfy(comfy_url: str) -> None:
+    """Best-effort POST /interrupt to a ComfyUI URL — never raises."""
+    try:
+        from comfy_runner.testing.client import ComfyTestClient
+        ComfyTestClient(comfy_url).interrupt()
+    except Exception:
+        pass
+
+
+def _default_on_overrun_for_kind(kind: str) -> str:
+    """Default ``on_overrun`` per target kind.
+
+    - ``runpod`` (ephemeral) → ``terminate``
+    - ``remote`` (PR-pod or persistent) → ``stop``
+    - ``local`` → ``none``
+    """
+    if kind == "runpod":
+        return "terminate"
+    if kind == "remote":
+        return "stop"
+    return "none"
+
+
+def _resolve_on_overrun(
+    target_body: dict[str, Any],
+    explicit: str | None,
+) -> str:
+    """Pick the effective on_overrun for one target."""
+    if explicit:
+        return explicit
+    return _default_on_overrun_for_kind(target_body.get("kind", ""))
+
+
+def _dispatch_on_overrun(
+    target_body: dict[str, Any],
+    on_overrun: str,
+    send_output: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Apply the on_overrun pod action after a watchdog abort.
+
+    Returns a dict describing what happened (``action``, ``skipped``,
+    ``pod_name``, etc.) for inclusion in the test-run summary.
+    """
+    out = send_output or (lambda _: None)
+    pod_name = target_body.get("pod_name")
+    summary: dict[str, Any] = {
+        "on_overrun": on_overrun,
+        "pod_name": pod_name,
+    }
+    if on_overrun == "none" or not pod_name:
+        summary["action"] = "none"
+        return summary
+
+    name_err = _validate_pod_name(pod_name)
+    if name_err:
+        summary["action"] = "skipped"
+        summary["reason"] = name_err
+        return summary
+
+    from comfy_runner.hosted.config import (
+        get_pod_record, remove_pod_record, update_pod_record,
+    )
+
+    try:
+        provider = _get_runpod_provider()
+    except Exception as e:
+        summary["action"] = "skipped"
+        summary["reason"] = f"provider unavailable: {e}"
+        return summary
+
+    rec = get_pod_record("runpod", pod_name)
+
+    if on_overrun == "stop":
+        if not rec:
+            # Untracked pod → fall back to terminate.
+            out(f"on_overrun=stop: '{pod_name}' is untracked, falling back to terminate\n")
+            on_overrun = "terminate"
+        else:
+            lock = _get_pod_lock(pod_name)
+            if not lock.acquire(timeout=10):
+                out(f"on_overrun=stop: pod '{pod_name}' busy, skipping stop\n")
+                summary["action"] = "skipped"
+                summary["reason"] = "pod_busy"
+                return summary
+            try:
+                pod_id = rec.get("id")
+                if not pod_id:
+                    summary["action"] = "skipped"
+                    summary["reason"] = "no_pod_id"
+                    return summary
+                try:
+                    pod = provider.get_pod(pod_id)
+                except Exception as e:
+                    summary["action"] = "skipped"
+                    summary["reason"] = f"get_pod_failed: {e}"
+                    return summary
+                if not pod or pod.status != "RUNNING":
+                    out(
+                        f"on_overrun=stop: pod '{pod_name}' is "
+                        f"{pod.status if pod else 'gone'}, skipping stop\n"
+                    )
+                    summary["action"] = "skipped"
+                    summary["reason"] = (
+                        f"not_running:{pod.status if pod else 'gone'}"
+                    )
+                    return summary
+                try:
+                    provider.stop_pod(pod_id)
+                except Exception as e:
+                    summary["action"] = "skipped"
+                    summary["reason"] = f"stop_failed: {e}"
+                    return summary
+
+                def _mark_overrun(
+                    r: dict[str, Any] | None,
+                ) -> dict[str, Any] | None:
+                    if r is None:
+                        return None
+                    r["status_hint"] = "stopped_overrun"
+                    r["stopped_at"] = int(time.time())
+                    return r
+
+                update_pod_record("runpod", pod_name, _mark_overrun)
+                out(f"on_overrun=stop: pod '{pod_name}' stopped\n")
+                summary["action"] = "stopped"
+                return summary
+            finally:
+                lock.release()
+
+    if on_overrun == "terminate":
+        if rec and rec.get("id"):
+            try:
+                provider.terminate_pod(rec["id"])
+            except Exception as e:
+                out(f"on_overrun=terminate: terminate_pod failed: {e}\n")
+            try:
+                remove_pod_record("runpod", pod_name)
+            except Exception:
+                pass
+            out(f"on_overrun=terminate: pod '{pod_name}' terminated\n")
+            summary["action"] = "terminated"
+            return summary
+        # No record (or no id) — nothing to do.
+        out(
+            f"on_overrun=terminate: pod '{pod_name}' has no tracked "
+            f"record, skipping\n"
+        )
+        summary["action"] = "skipped"
+        summary["reason"] = "no_record"
+        return summary
+
+    summary["action"] = "skipped"
+    summary["reason"] = f"unknown_on_overrun:{on_overrun}"
+    return summary
+
+
 def _build_test_target(target_body: dict[str, Any]):
     """Build a fleet TestTarget from a request body target dict."""
     from comfy_runner.testing.fleet import LocalTarget, RemoteTarget, EphemeralTarget
@@ -642,6 +1022,8 @@ def _build_test_target(target_body: dict[str, Any]):
             server_url = _get_pod_server_url(pod_name)
         if not server_url:
             raise ValueError("remote target requires 'pod_name' or 'server_url'")
+        if pod_name:
+            _touch_pod_activity(pod_name)
         return RemoteTarget(
             server_url=server_url,
             install_name=target_body.get("install", "main"),
@@ -2553,6 +2935,12 @@ def create_app() -> Any:
         except RuntimeError as e:
             return _err(str(e))
 
+        # Optional ?purpose=<value> filter — case-sensitive string match
+        # against the record field. Records without an explicit purpose
+        # are treated as "persistent" for filtering only (matching the
+        # POST /pods/create default).
+        purpose_filter = request.args.get("purpose")
+
         try:
             live_pods = provider.list_pods()
             live_map = {p.name: p for p in live_pods}
@@ -2563,6 +2951,10 @@ def create_app() -> Any:
             # Merge config records with live pod data
             seen_names = set()
             for name, rec in records.items():
+                if purpose_filter is not None:
+                    rec_purpose = rec.get("purpose", "persistent")
+                    if rec_purpose != purpose_filter:
+                        continue
                 seen_names.add(name)
                 pod_id = rec.get("id", "")
                 live = live_map.get(name)
@@ -2585,6 +2977,20 @@ def create_app() -> Any:
                     entry["gpu_type"] = live.gpu_type or entry["gpu_type"]
                 else:
                     entry["status"] = "UNKNOWN"
+                # Activity / idle-reaper metadata
+                if rec.get("purpose"):
+                    entry["purpose"] = rec["purpose"]
+                if rec.get("pr_number") is not None:
+                    entry["pr_number"] = rec["pr_number"]
+                if rec.get("last_active_at"):
+                    entry["last_active_at"] = rec["last_active_at"]
+                if rec.get("idle_timeout_s"):
+                    entry["idle_timeout_s"] = rec["idle_timeout_s"]
+                if rec.get("status_hint"):
+                    entry["status_hint"] = rec["status_hint"]
+                idle_remaining = _idle_seconds_remaining(rec)
+                if idle_remaining is not None and entry["status"] == "RUNNING":
+                    entry["idle_in_s"] = idle_remaining
                 # Add URLs (handles Tailscale hostname drift)
                 server_url = _get_pod_server_url(name, raise_on_error=False)
                 if server_url:
@@ -2617,6 +3023,13 @@ def create_app() -> Any:
         gpu_count = body.get("gpu_count", 1)
         env = body.get("env")
         wait_ready = body.get("wait_ready", True)
+        # ``persistent`` by default; let the body override (e.g. ``test``,
+        # though test pods normally come from the test runner path).
+        purpose = body.get("purpose", "persistent")
+        if purpose not in _VALID_PURPOSES:
+            return _err(
+                "'purpose' must be one of: " + ", ".join(_VALID_PURPOSES)
+            )
 
         job_id = _jobs.create(label=f"pod create {name}")
 
@@ -2650,6 +3063,7 @@ def create_app() -> Any:
                             server_url = _get_pod_server_url(
                                 name, raise_on_error=False,
                             ) or ""
+                        _touch_pod_activity(name)
                         _jobs.finish(job_id, {
                             "name": name,
                             "id": rec["id"],
@@ -2676,6 +3090,7 @@ def create_app() -> Any:
                     "gpu_type": pod.gpu_type,
                     "datacenter": pod.datacenter,
                     "image": pod.image,
+                    "purpose": purpose,
                 })
                 out(f"Pod created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
 
@@ -2686,6 +3101,7 @@ def create_app() -> Any:
                         name, raise_on_error=False,
                     ) or ""
 
+                _touch_pod_activity(name)
                 _jobs.finish(job_id, {
                     "name": name,
                     "id": pod.id,
@@ -2756,6 +3172,7 @@ def create_app() -> Any:
                     out(f"Pod is {pod.status}, starting...\n")
                     provider.start_pod(pod_id)
 
+                _touch_pod_activity(name)
                 server_url = _get_pod_server_url(name)
                 out(f"Connecting to {server_url}...\n")
                 _wait_for_remote_server(server_url, send_output=out)
@@ -2886,6 +3303,7 @@ def create_app() -> Any:
                         name, raise_on_error=False,
                     ) or ""
 
+                _touch_pod_activity(name)
                 _jobs.finish(job_id, {
                     "name": name,
                     "id": rec["id"],
@@ -2933,10 +3351,233 @@ def create_app() -> Any:
             _remove_pod_lock(name)
 
     # ------------------------------------------------------------------
+    # POST /pods/<name>/touch — reset the idle timer
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/touch", methods=["POST"])
+    def route_pods_touch(name: str) -> Any:
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        _touch_pod_activity(name)
+        rec = get_pod_record("runpod", name) or {}
+        return jsonify({
+            "ok": True,
+            "name": name,
+            "last_active_at": rec.get("last_active_at"),
+            "idle_in_s": _idle_seconds_remaining(rec),
+        })
+
+    # ------------------------------------------------------------------
+    # POST /pods/launch-pr — atomic create-or-wake + deploy a PR
+    # ------------------------------------------------------------------
+    @app.route("/pods/launch-pr", methods=["POST"])
+    def route_pods_launch_pr() -> Any:
+        from safe_file import is_safe_path_component
+
+        body = request.get_json(silent=True) or {}
+        pr = body.get("pr")
+        if pr is None or not isinstance(pr, int):
+            return _err("'pr' is required (integer PR number)")
+
+        repo = body.get("repo") or ""
+        # Derive a stable, sanitized pod name. ``pr-<repo>-<num>`` if a
+        # repo is provided, else ``pr-<num>``. The repo segment maps
+        # ``/`` to ``-`` (separating owner from name) and ``.`` to ``_``
+        # so distinct repos like ``owner/my-repo`` and ``owner/my.repo``
+        # produce distinct slugs (``owner-my-repo`` vs ``owner-my_repo``).
+        repo_slug = ""
+        if repo:
+            # Strip protocol and trailing ``.git``, take last ``owner/name``.
+            r = repo
+            if "://" in r:
+                r = r.split("://", 1)[1]
+            if r.endswith(".git"):
+                r = r[: -len(".git")]
+            tail = r.rsplit("/", 2)[-2:]
+            normalized = "/".join(tail).lower()
+            # Map ``/`` → ``-`` and ``.`` → ``_``; everything else
+            # outside ``[a-z0-9-_]`` collapses to ``-``.
+            chars = []
+            for c in normalized:
+                if c == "/":
+                    chars.append("-")
+                elif c == ".":
+                    chars.append("_")
+                elif c.isalnum() or c in "-_":
+                    chars.append(c)
+                else:
+                    chars.append("-")
+            repo_slug = "".join(chars).strip("-_")
+        name = f"pr-{repo_slug}-{pr}" if repo_slug else f"pr-{pr}"
+        if not is_safe_path_component(name):
+            return _err(f"Derived pod name '{name}' is not a safe identifier")
+
+        gpu_type = body.get("gpu_type")
+        image = body.get("image")
+        volume_id = body.get("volume_id")
+        volume_size_gb = body.get("volume_size_gb")
+        datacenter = body.get("datacenter")
+        cloud_type = body.get("cloud_type")
+        gpu_count = body.get("gpu_count", 1)
+        env = body.get("env")
+        install_name = body.get("install", "main")
+        raw_timeout = body.get("idle_timeout_s")
+        if raw_timeout is None:
+            idle_timeout_s = DEFAULT_IDLE_TIMEOUT_S
+        else:
+            try:
+                idle_timeout_s = int(raw_timeout)
+            except (TypeError, ValueError):
+                return _err("'idle_timeout_s' must be an integer")
+            if idle_timeout_s <= 0:
+                return _err("'idle_timeout_s' must be > 0")
+
+        job_id = _jobs.create(label=f"launch PR #{pr} ({name})")
+
+        # Acquire the pod lock with enough headroom that an in-flight
+        # reaper sweep (which makes a remote ``stop_pod`` call) does not
+        # cause a spurious "Pod is busy" failure here.
+        _LAUNCH_LOCK_TIMEOUT_S = 60
+
+        def _run() -> None:
+            from comfy_runner.hosted.config import (
+                get_pod_record, set_pod_record, update_pod_record,
+            )
+            from comfy_runner.hosted.remote import RemoteRunner
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=_LAUNCH_LOCK_TIMEOUT_S):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                rec = get_pod_record("runpod", name)
+
+                # ── Decide create / wake / reuse ────────────────────
+                pod = None
+                created_new = False
+                if rec:
+                    try:
+                        pod = provider.get_pod(rec["id"])
+                    except Exception:
+                        pod = None
+                    if not pod or pod.status == "TERMINATED":
+                        out(f"Pod '{name}' record exists but pod is gone; recreating...\n")
+                        rec = None
+
+                if not rec:
+                    out(f"Creating pod '{name}' for PR #{pr}...\n")
+                    pod = provider.create_pod(
+                        name=name,
+                        gpu_type=gpu_type,
+                        image=image,
+                        volume_id=volume_id,
+                        volume_size_gb=volume_size_gb,
+                        datacenter=datacenter,
+                        cloud_type=cloud_type,
+                        gpu_count=gpu_count,
+                        env=env,
+                    )
+                    created_new = True
+                    set_pod_record("runpod", name, {
+                        "id": pod.id,
+                        "gpu_type": pod.gpu_type,
+                        "datacenter": pod.datacenter,
+                        "image": pod.image,
+                        "purpose": "pr",
+                        "pr_number": pr,
+                        "repo": repo,
+                        "idle_timeout_s": idle_timeout_s,
+                        # Stamp activity now so a subsequent failure
+                        # before deploy still leaves the reaper able to
+                        # see the pod as eligible to clean up.
+                        "last_active_at": int(time.time()),
+                    })
+                    out(f"Pod created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
+                else:
+                    # Wake existing pod if needed; ensure metadata is set.
+                    def _refresh_meta(r: dict[str, Any] | None) -> dict[str, Any] | None:
+                        if r is None:
+                            return None
+                        r.setdefault("purpose", "pr")
+                        r["pr_number"] = pr
+                        if repo:
+                            r["repo"] = repo
+                        r["idle_timeout_s"] = idle_timeout_s
+                        r["last_active_at"] = int(time.time())
+                        r.pop("status_hint", None)
+                        return r
+                    update_pod_record("runpod", name, _refresh_meta)
+                    if pod and pod.status != "RUNNING":
+                        out(f"Pod '{name}' is {pod.status}, starting...\n")
+                        provider.start_pod(rec["id"])
+                    else:
+                        out(f"Pod '{name}' is already RUNNING.\n")
+
+                # ── Wait for the comfy-runner server ────────────────
+                server_url = _wait_for_pod_server(name, send_output=out)
+
+                # ── Deploy the PR ──────────────────────────────────
+                runner = RemoteRunner(server_url)
+                deploy_body: dict[str, Any] = {
+                    "pr": pr,
+                    "start": True,
+                }
+                if repo:
+                    deploy_body["repo"] = repo
+                if body.get("title"):
+                    deploy_body["title"] = body["title"]
+                if body.get("launch_args"):
+                    deploy_body["launch_args"] = body["launch_args"]
+
+                out(f"Deploying PR #{pr} to '{install_name}'...\n")
+                data = runner._request(
+                    "POST", f"/{install_name}/deploy", json=deploy_body,
+                )
+                remote_job_id = data.get("job_id")
+                deploy_result: Any
+                if remote_job_id:
+                    deploy_result = runner.poll_job(
+                        remote_job_id, timeout=900, on_output=out,
+                    )
+                else:
+                    deploy_result = data
+
+                _touch_pod_activity(name)
+                _jobs.finish(job_id, {
+                    "name": name,
+                    "pr": pr,
+                    "created": created_new,
+                    "server_url": server_url,
+                    "comfy_url": server_url.rsplit(":", 1)[0] + ":8188",
+                    "idle_timeout_s": idle_timeout_s,
+                    "deploy_result": deploy_result,
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({
+            "ok": True, "job_id": job_id, "async": True,
+            "name": name, "pr": pr,
+        })
+
+    # ------------------------------------------------------------------
     # POST /pods/cleanup — terminate orphaned test pods
     # ------------------------------------------------------------------
     @app.route("/pods/cleanup", methods=["POST"])
     def route_pods_cleanup() -> Any:
+        from comfy_runner.hosted.config import remove_pod_record
+
         body = request.get_json(silent=True) or {}
         prefix = body.get("prefix", "test-")
         dry_run = body.get("dry_run", False)
@@ -2956,6 +3597,7 @@ def create_app() -> Any:
 
             terminated = []
             skipped = []
+            removed_records: list[str] = []
             for pod in candidates:
                 if dry_run:
                     skipped.append({"name": pod.name, "id": pod.id, "status": pod.status})
@@ -2963,6 +3605,13 @@ def create_app() -> Any:
                     try:
                         provider.terminate_pod(pod.id)
                         terminated.append({"name": pod.name, "id": pod.id})
+                        # Mirror DELETE /pods/<name>: drop the registry
+                        # entry so cleanup leaves no dangling record.
+                        try:
+                            if remove_pod_record("runpod", pod.name):
+                                removed_records.append(pod.name)
+                        except Exception:
+                            pass
                     except Exception as e:
                         skipped.append({"name": pod.name, "id": pod.id, "error": str(e)})
 
@@ -2972,6 +3621,7 @@ def create_app() -> Any:
                 "dry_run": dry_run,
                 "terminated": terminated,
                 "skipped": skipped,
+                "removed_records": removed_records,
                 "total_found": len(candidates),
                 "total_terminated": len(terminated),
             })
@@ -3192,6 +3842,16 @@ def create_app() -> Any:
 
         timeout = body.get("timeout", 600)
         formats = body.get("formats", "json,html,markdown")
+        body_max_runtime = body.get("max_runtime_s")
+        if body_max_runtime is not None:
+            if not isinstance(body_max_runtime, int) or body_max_runtime <= 0:
+                return _err("'max_runtime_s' must be a positive integer")
+        body_on_overrun = body.get("on_overrun")
+        if body_on_overrun is not None and body_on_overrun not in _VALID_ON_OVERRUN:
+            return _err(
+                "'on_overrun' must be one of: "
+                f"{', '.join(_VALID_ON_OVERRUN)}"
+            )
 
         job_id = _jobs.create(label=f"test run {target.name}")
         _register_test_run(job_id, {
@@ -3208,18 +3868,59 @@ def create_app() -> Any:
                 run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
                 out_dir = suite_path / "runs" / run_id
 
-                result = target.run(
-                    suite=s,
-                    output_dir=out_dir,
-                    timeout=timeout,
-                    send_output=out,
-                )
+                # Resolve effective budget: body override beats suite.
+                budget = body_max_runtime
+                if budget is None and isinstance(s.max_runtime_s, int):
+                    budget = s.max_runtime_s
+
+                from comfy_runner.testing.client import watchdog as _watchdog
+
+                def _on_abort() -> None:
+                    out(
+                        f"Watchdog: max_runtime_s={budget} exceeded "
+                        f"— aborting test run\n",
+                    )
+                    comfy_url = _comfy_url_for_target(target_body)
+                    if comfy_url:
+                        _interrupt_comfy(comfy_url)
+
+                with _watchdog(budget, on_abort=_on_abort) as cancelled:
+                    result = target.run(
+                        suite=s,
+                        output_dir=out_dir,
+                        timeout=timeout,
+                        send_output=out,
+                        cancelled=cancelled,
+                    )
 
                 summary = result.to_dict()
+                aborted = bool(
+                    cancelled.is_set()
+                    or (
+                        result.report is not None
+                        and getattr(result.report, "timed_out", False)
+                    )
+                )
+                summary["timed_out"] = aborted
+                if aborted:
+                    summary["aborted_reason"] = "overrun"
+
+                # Dispatch on_overrun pod action if applicable.
+                if aborted:
+                    on_overrun = _resolve_on_overrun(
+                        target_body, body_on_overrun,
+                    )
+                    pod_action = _dispatch_on_overrun(
+                        target_body, on_overrun, send_output=out,
+                    )
+                    summary["on_overrun_action"] = pod_action
+
+                run_status = "timed_out" if aborted else "done"
                 _finish_test_run(job_id, {
                     "output_dir": str(out_dir),
                     "summary": summary,
-                })
+                    "timed_out": aborted,
+                }, status=run_status)
                 _jobs.finish(job_id, {
                     "run_id": run_id,
                     "suite_name": s.name,
@@ -3258,6 +3959,16 @@ def create_app() -> Any:
         timeout = body.get("timeout", 600)
         max_workers = body.get("max_workers")
         formats = body.get("formats", "json,html,markdown")
+        body_max_runtime = body.get("max_runtime_s")
+        if body_max_runtime is not None:
+            if not isinstance(body_max_runtime, int) or body_max_runtime <= 0:
+                return _err("'max_runtime_s' must be a positive integer")
+        body_on_overrun = body.get("on_overrun")
+        if body_on_overrun is not None and body_on_overrun not in _VALID_ON_OVERRUN:
+            return _err(
+                "'on_overrun' must be one of: "
+                f"{', '.join(_VALID_ON_OVERRUN)}"
+            )
 
         target_names = [t.name for t in targets]
         job_id = _jobs.create(label=f"fleet test ({len(targets)} targets)")
@@ -3268,26 +3979,57 @@ def create_app() -> Any:
         })
 
         def _run() -> None:
+            from comfy_runner.testing.suite import load_suite
             out, lines = _make_collector(job_id)
             try:
                 run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
                 out_dir = suite_path / "runs" / f"fleet-{run_id}"
 
-                fleet_result = run_fleet(
-                    targets=targets,
-                    suite_path=str(suite_path),
-                    output_dir=out_dir,
-                    timeout=timeout,
-                    max_workers=max_workers,
-                    send_output=out,
-                    formats=formats,
-                )
+                # Resolve effective budget: body override beats suite.
+                s = load_suite(str(suite_path))
+                budget = body_max_runtime
+                if budget is None and isinstance(s.max_runtime_s, int):
+                    budget = s.max_runtime_s
+
+                from comfy_runner.testing.client import watchdog as _watchdog
+
+                def _on_abort() -> None:
+                    out(
+                        f"Watchdog: max_runtime_s={budget} exceeded "
+                        f"— aborting fleet run\n",
+                    )
+
+                with _watchdog(budget, on_abort=_on_abort) as cancelled:
+                    fleet_result = run_fleet(
+                        targets=targets,
+                        suite_path=str(suite_path),
+                        output_dir=out_dir,
+                        timeout=timeout,
+                        max_workers=max_workers,
+                        send_output=out,
+                        formats=formats,
+                        cancelled=cancelled,
+                    )
 
                 summary = fleet_result.to_dict()
+                aborted = cancelled.is_set()
+                summary["timed_out"] = aborted
+                if aborted:
+                    summary["aborted_reason"] = "overrun"
+                    actions = []
+                    for tb in target_bodies:
+                        on_overrun = _resolve_on_overrun(tb, body_on_overrun)
+                        actions.append(_dispatch_on_overrun(
+                            tb, on_overrun, send_output=out,
+                        ))
+                    summary["on_overrun_actions"] = actions
+
+                run_status = "timed_out" if aborted else "done"
                 _finish_test_run(job_id, {
                     "output_dir": str(out_dir),
                     "summary": summary,
-                })
+                    "timed_out": aborted,
+                }, status=run_status)
                 _jobs.finish(job_id, {
                     "run_id": run_id,
                     "output_dir": str(out_dir),
@@ -3535,6 +4277,7 @@ def run_server(
         log.propagate = False  # Prevent duplicate output via root logger
 
     app = create_app()
+    _start_idle_reaper_once()
     log.info("Starting comfy-runner control server on %s:%d", host, port)
     print(f"comfy-runner server listening on http://{host}:{port}")
     serve(app, host=host, port=port, threads=8)

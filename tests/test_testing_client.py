@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from comfy_runner.testing.client import ComfyTestClient, OutputFile, PromptResult
+from comfy_runner.testing.client import (
+    ComfyTestClient,
+    OutputFile,
+    PromptResult,
+    watchdog,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +278,79 @@ class TestRunWorkflow:
         assert result.prompt_id == "p1"
         assert result.status == "success"
         assert result.execution_time is not None
+
+
+# ---------------------------------------------------------------------------
+# watchdog context manager
+# ---------------------------------------------------------------------------
+
+class TestWatchdog:
+    def test_no_budget_yields_unset_event(self):
+        """``budget=None`` (or <= 0) is a no-op: the event is never set."""
+        import threading
+        for budget in (None, 0, -5):
+            with watchdog(budget) as cancelled:
+                assert isinstance(cancelled, threading.Event)
+                assert not cancelled.is_set()
+            assert not cancelled.is_set()
+
+    def test_fires_when_budget_exceeded(self):
+        """When the body sleeps past the budget, ``cancelled`` is set
+        and ``on_abort`` runs in the timer thread."""
+        import threading
+        import time
+        called = threading.Event()
+        with watchdog(1, on_abort=called.set) as cancelled:
+            # Wait long enough for the timer to fire.
+            assert cancelled.wait(timeout=5.0), "watchdog never fired"
+        # ``on_abort`` ran.
+        assert called.is_set()
+        # ``cancelled`` stays set after exit.
+        assert cancelled.is_set()
+
+    def test_does_not_fire_when_body_completes_first(self):
+        """A normally-completing body must NOT see ``cancelled`` set."""
+        import threading
+        called = threading.Event()
+        with watchdog(60, on_abort=called.set) as cancelled:
+            pass  # finish immediately
+        assert not cancelled.is_set()
+        assert not called.is_set()
+
+    def test_completed_flag_blocks_late_timer_fire(self):
+        """A Timer callback that begins executing AFTER the body exits
+        must NOT set ``cancelled`` — the ``completed`` flag is checked
+        under the same lock that the context-manager finalizer takes.
+
+        This test does not race the real Timer; it inspects the
+        post-exit state and asserts that the Event stays unset even
+        when we artificially stall before reading it.
+        """
+        import time
+        with watchdog(60) as cancelled:
+            pass
+        # Even after a long pause, the never-fired Timer must remain
+        # quiescent (timer.cancel() was called, completed=True).
+        time.sleep(0.05)
+        assert not cancelled.is_set()
+
+    def test_non_int_budget_is_no_op(self):
+        """``budget`` must be an int; floats / strings are treated as None."""
+        with watchdog(0.5) as cancelled:  # type: ignore[arg-type]
+            pass
+        assert not cancelled.is_set()
+        with watchdog("60") as cancelled:  # type: ignore[arg-type]
+            pass
+        assert not cancelled.is_set()
+
+    def test_on_abort_exception_is_swallowed(self):
+        """Exceptions raised in ``on_abort`` must not escape the timer thread."""
+        def _boom() -> None:
+            raise RuntimeError("boom")
+        # If the exception escaped, the timer thread would crash but
+        # the test would still pass; instead we verify ``cancelled``
+        # is set (proving the lock-protected branch ran) and the
+        # context manager exits cleanly.
+        with watchdog(1, on_abort=_boom) as cancelled:
+            assert cancelled.wait(timeout=5.0), "watchdog never fired"
+        assert cancelled.is_set()
