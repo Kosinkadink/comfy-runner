@@ -247,6 +247,33 @@ def _allocate_ngrok_domain(domains: list[str], port: int) -> str:
 # TailscaleTunnel
 # ---------------------------------------------------------------------------
 
+def _stop_tailscale_funnel() -> None:
+    """Best-effort: turn off the tailscale funnel on the default :443 endpoint.
+
+    Funnel only supports a small set of ports; comfy-runner always uses 443,
+    so the off command is the same regardless of which port the state file
+    recorded. Errors are swallowed because callers run this during cleanup
+    paths where partial failure should not propagate.
+    """
+    try:
+        _run_tailscale(["funnel", "--https=443", "off"])
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _funnel_allowed() -> bool:
+    """Return True if tailscale funnel (public exposure) is enabled in config.
+
+    Funnel exposes the instance to the public internet, so it is opt-in.
+    Set ``tunnel.tailscale.allow_funnel = true`` in
+    ``~/.comfy-runner/config.json`` to enable.
+    """
+    from .config import get_tunnel_config
+
+    cfg = get_tunnel_config("tailscale")
+    return bool(cfg.get("allow_funnel", False))
+
+
 class TailscaleTunnel:
     """Tunnel provider using tailscale funnel."""
 
@@ -259,6 +286,14 @@ class TailscaleTunnel:
     def start(self, port: int) -> str:
         if not _find_tailscale():
             raise RuntimeError("tailscale binary not found on PATH.")
+
+        if not _funnel_allowed():
+            raise RuntimeError(
+                "Tailscale funnel exposes this instance to the public "
+                "internet and is disabled by default. Set "
+                "tunnel.tailscale.allow_funnel = true in "
+                "~/.comfy-runner/config.json to enable."
+            )
 
         self._port = port
 
@@ -288,12 +323,7 @@ class TailscaleTunnel:
         return url
 
     def stop(self) -> None:
-        # Funnel uses default port 443 — turn it off via config
-        try:
-            _run_tailscale(["funnel", "--https=443", "off"])
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
+        _stop_tailscale_funnel()
         if self._port is not None:
             _remove_tunnel_state(self._port)
 
@@ -517,14 +547,55 @@ def cleanup_stale_serves(
         _save_serve_registry(set())
 
     # Remove stale tunnel state files (ngrok processes that died, tailscale
-    # funnel sessions from previous runs with pid=0, etc.)
+    # funnel sessions whose recorded state is no longer accurate).
+    #
+    # For tailscale funnel we cannot rely on a child PID (funnel is managed by
+    # tailscaled), so the state is written with pid=0. Naively wiping pid=0
+    # state would silently lose track of funnels that are still publicly
+    # exposed (issue #20). Instead, query funnel liveness and apply policy
+    # based on whether the operator has opted in to funnels via
+    # tunnel.tailscale.allow_funnel.
+    funnel_allowed = _funnel_allowed()
     for state in _all_tunnel_states():
         port = state.get("port")
         if not port:
             continue
         pid = state.get("pid", 0)
+        provider = state.get("provider", "")
+
         if pid and is_process_alive(pid):
-            continue  # still running
+            continue  # ngrok-style provider with a live child process
+
+        if provider == "tailscale" and pid == 0:
+            # active: True = funnel running, False = definitely not running,
+            # None = could not determine.
+            active = _tailscale_funnel_active(port)
+
+            # When funnels are allowed AND the funnel is (or might be) live,
+            # preserve the state so get_tunnel_url keeps reporting the URL.
+            if funnel_allowed and active is not False:
+                if active is None and send_output:
+                    send_output(
+                        f"  Could not verify tailscale funnel for port {port}; "
+                        f"preserving state file.\n"
+                    )
+                continue
+
+            # Otherwise: if a funnel is (or might be) live, shut it down so
+            # the runner's view and the actual public exposure stay in sync.
+            if active is True and send_output:
+                send_output(
+                    f"  Found active tailscale funnel on port {port} but "
+                    f"tunnel.tailscale.allow_funnel is false; shutting it down.\n"
+                )
+            elif active is None and send_output:
+                send_output(
+                    f"  Could not verify tailscale funnel for port {port}; "
+                    f"attempting best-effort shutdown.\n"
+                )
+            if active is not False:
+                _stop_tailscale_funnel()
+
         _remove_tunnel_state(port)
         if send_output:
             send_output(f"  Removed stale tunnel state for port {port}\n")
@@ -581,6 +652,40 @@ def stop_tailscale_serve_port(
     unregister_served_port(port)
     if send_output:
         send_output(f"✓ Tailscale serve for port {port} stopped.\n")
+
+
+def _tailscale_funnel_active(port: int) -> bool | None:
+    """Check whether tailscale funnel is currently serving ``port``.
+
+    Returns:
+        True  — funnel is configured AND public-internet exposure is on for ``port``.
+        False — tailscale is reachable but no funnel is active for ``port``.
+        None  — the status could not be determined (binary missing, parse error,
+                timeout). Callers should treat None as "unknown" and decide policy.
+    """
+    if not _find_tailscale():
+        return None
+    try:
+        result = _run_tailscale(["serve", "status", "--json"])
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        # `serve status` returns non-zero when no config exists at all,
+        # which means no funnel is active either.
+        return False
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    # tailscale's serve config schema: AllowFunnel maps "<host>:<port>" -> bool.
+    # The hostport key uses the machine's MagicDNS name.
+    allow_funnel = data.get("AllowFunnel") or {}
+    suffix = f":{port}"
+    for hostport, enabled in allow_funnel.items():
+        if isinstance(hostport, str) and hostport.endswith(suffix) and enabled:
+            return True
+    return False
 
 
 def get_tailscale_serve_status() -> dict[str, Any]:
