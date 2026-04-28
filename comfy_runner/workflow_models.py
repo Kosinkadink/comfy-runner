@@ -269,8 +269,10 @@ def download_models(
             chunk_count = 0
             cancelled = False
 
-            # Write to staging file, then move to final destination
-            staging_name = f"{model['directory']}--{model['name']}.part"
+            # Write to staging file, then move to final destination.
+            # Flatten both / and \ since the staging dir is flat (no subdirs).
+            sanitized_dir = model['directory'].replace('/', '_').replace('\\', '_')
+            staging_name = f"{sanitized_dir}--{model['name']}.part"
             tmp_path = staging_dir / staging_name
             try:
                 with open(tmp_path, "wb") as f:
