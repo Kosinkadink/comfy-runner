@@ -548,6 +548,48 @@ Operations like `POST /<name>/deploy` accept a `launch_args` field that **replac
 
 For example, if an instance currently has `--enable-manager --cuda-device 0` and you deploy with `{"latest": true, "launch_args": "--enable-manager"}`, the `--cuda-device 0` flag is lost. Always read first, then include all desired flags in the new value.
 
+### Deploy Auto-Init: Prebuilt vs Ad-Hoc Build
+
+`POST /{name}/deploy` auto-creates the installation if it doesn't exist yet. Two flows are possible:
+
+| Flow | When | What happens |
+|------|------|--------------|
+| **Prebuilt** (default) | No build-specific params, or `build: false` | Downloads a pre-built `standalone-env` (Python + torch + site-packages) from GitHub Releases, then clones ComfyUI and creates the project venv by copying `standalone-env`'s site-packages. Fast (no compilation). The Python version is fixed by the release. |
+| **Ad-hoc build** | `build: true` is set, OR any build-specific param is set | Builds `standalone-env` locally via `python-build-standalone` + uv + pip. Lets you choose Python version, torch build, GPU preset, etc. Slower but flexible. |
+
+**Build-specific params** (any one of these implicitly enables `build: true` during auto-init):
+
+| Param | Purpose |
+|-------|---------|
+| `python_version` | e.g. `"3.12"` or `"3.13.12"` |
+| `pbs_release` | python-build-standalone release tag, e.g. `"20260211"` |
+| `gpu` | `"nvidia"`, `"nvidia-cu128"`, `"amd"`, `"intel"`, `"cpu"`, `"mps"` |
+| `cuda_tag` | torch CUDA tag, e.g. `"cu130"` |
+| `torch_version` | e.g. `"2.10.0"` |
+| `torch_spec` | full pip spec list, overrides the previous two |
+| `torch_index_url` | override torch wheel index |
+
+**Examples:**
+
+```bash
+# Prebuilt: fast path, fixed Python from release
+curl -X POST localhost:9189/main/deploy -d '{"latest": true}'
+
+# Ad-hoc build: implicit, just specify python_version
+curl -X POST localhost:9189/custom/deploy -d '{"latest": true, "python_version": "3.12"}'
+
+# Ad-hoc build: explicit, with multiple params
+curl -X POST localhost:9189/custom/deploy -d '{"latest": true, "build": true, "python_version": "3.12", "gpu": "nvidia-cu128"}'
+
+# Force prebuilt even with build params present (defensive)
+curl -X POST localhost:9189/main/deploy -d '{"latest": true, "build": false, "python_version": "3.12"}'
+# → python_version is silently dropped because explicit `build: false` wins
+```
+
+**Why the implicit trigger?** The prebuilt flow ships fixed-version wheels in `standalone-env/`. Asking it to honor a different `python_version` would copy ABI-mismatched wheels into the new venv (compiled extensions like torch fail to import). The ad-hoc build flow is the only one that can actually deliver a non-default Python version, so passing `python_version` alone routes there automatically.
+
+`comfyui_ref` is **not** a build trigger — it's honored in both flows and only affects which ComfyUI commit gets cloned.
+
 ### OpenAPI Spec
 
 The server auto-serves an OpenAPI 3.0.3 spec at `GET /openapi.json`. The spec is generated at runtime from route metadata in `comfy_runner_server/openapi.py` — no manual YAML to maintain. When routes change, update the `_ROUTES` list in that file and the spec updates automatically.
