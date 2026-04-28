@@ -131,6 +131,37 @@ $body = @{ latest = $true } | ConvertTo-Json
 Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/myinstall/deploy" -Method Post -Body $body -ContentType "application/json"
 ```
 
+#### Prebuilt vs ad-hoc build flow
+
+Auto-init picks one of two flows:
+
+| Flow | When | Result |
+|------|------|--------|
+| **Prebuilt** (default) | No build-specific params, or `build: false` | Downloads a pre-built `standalone-env` from GitHub Releases. Fast. Python version is fixed by the release. |
+| **Ad-hoc build** | `build: true` set, OR any of `python_version`, `pbs_release`, `gpu`, `cuda_tag`, `torch_version`, `torch_spec`, `torch_index_url` is set | Builds `standalone-env` locally via python-build-standalone + uv + pip. Slower but lets you choose Python/torch/GPU. |
+
+Any build-specific param **implicitly enables `build: true`**. Sending `{"latest": true, "python_version": "3.12"}` alone routes to the ad-hoc build flow at Python 3.12 — no need to also set `build: true`.
+
+An explicit `build: false` always wins (suppresses the implicit trigger). Use this when you want to force the prebuilt path even though build-related params happen to be in the body.
+
+`comfyui_ref` is **not** a build trigger — it's honored in both flows and only affects which ComfyUI commit is cloned during init.
+
+**Why the implicit trigger?** The prebuilt flow ships fixed-version compiled wheels in `standalone-env/`. Asking it to honor a different `python_version` would copy ABI-mismatched wheels into the project venv (compiled extensions like torch fail to import). The ad-hoc build is the only flow that can deliver a non-default Python version with working wheels.
+
+```powershell
+# Prebuilt (fast path)
+$body = @{ latest = $true } | ConvertTo-Json
+Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/main/deploy" -Method Post -Body $body -ContentType "application/json"
+
+# Ad-hoc build (implicit — just specify python_version)
+$body = @{ latest = $true; python_version = "3.12" } | ConvertTo-Json
+Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/custom/deploy" -Method Post -Body $body -ContentType "application/json"
+
+# Force prebuilt even if build params are present (defensive)
+$body = @{ latest = $true; build = $false; python_version = "3.12" } | ConvertTo-Json
+# → python_version is silently dropped because explicit build:false wins
+```
+
 ### Remote deploy workflow
 
 1. **Resolve the server URL** (see Tailscale Resolution above).
@@ -162,7 +193,7 @@ Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/myinstall/deploy" -Met
      -H "Content-Type: application/json" -d '{"pr": 1234}'
    ```
 
-   The deploy body accepts: `pr`, `branch`, `tag`, `commit`, `latest` (bool), `pull` (bool), `reset` (bool), `launch_args`, `github_token`.
+   The deploy body accepts: `pr`, `branch`, `tag`, `commit`, `latest` (bool), `pull` (bool), `reset` (bool), `launch_args`, `github_token`. For auto-init: `cuda_compat` (bool), `variant`, `comfyui_ref`, `build` (bool), and the build-trigger params `python_version`, `pbs_release`, `gpu`, `cuda_tag`, `torch_version`, `torch_spec`, `torch_index_url` (any of the build-trigger params implicitly sets `build: true` — see "Prebuilt vs ad-hoc build flow" above).
 
 4. **Poll the job until complete:**
 
@@ -402,7 +433,7 @@ Always update `comfy_runner_server/openapi.py` — add or update the `_ROUTES` l
 
 6. **OpenAPI spec.** When unsure about API parameters, fetch `/openapi.json` from the running server.
 
-7. **Deploy auto-inits.** Remote `POST /{name}/deploy` auto-creates missing installations — no separate `init` call needed.
+7. **Deploy auto-inits.** Remote `POST /{name}/deploy` auto-creates missing installations — no separate `init` call needed. Any of `python_version`, `pbs_release`, `gpu`, `cuda_tag`, `torch_version`, `torch_spec`, `torch_index_url` implicitly enables `build: true` (ad-hoc build flow). An explicit `build: false` suppresses this. `comfyui_ref` is not a trigger and works in both flows.
 
 8. **`releases` is platform-filtered.** The CLI only shows variants for the current OS. Use the GitHub API to see cross-platform variants.
 
