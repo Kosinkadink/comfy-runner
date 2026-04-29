@@ -1961,6 +1961,15 @@ _ROUTES: list[dict[str, Any]] = [
             "tailnet_configured": {"type": "boolean"},
             "device_count": {"type": "integer"},
             "online_count": {"type": "integer"},
+            "error": {
+                "type": "string",
+                "nullable": True,
+                "description": (
+                    "Set when the most recent Tailscale device-list "
+                    "fetch failed (HTTP non-2xx or transport error). "
+                    "Null on success."
+                ),
+            },
         }),
     },
 

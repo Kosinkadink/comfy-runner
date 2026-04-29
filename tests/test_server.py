@@ -1159,9 +1159,10 @@ class TestTailnetRunners:
         assert "discovery disabled" in body
 
     def test_dashboard_renders_discovery_failure(self, client, tmp_config_dir):
-        # Discovery raises (Tailscale API down): dashboard must render
-        # 200 with an explicit error message, NOT silently claim the
-        # tailnet is "not configured".
+        # Discovery raises (last-resort fallback path inside the
+        # dashboard route): the dashboard must render 200 with an
+        # explicit error message, NOT silently claim the tailnet is
+        # "not configured".
         from unittest.mock import patch
         with patch(
             "comfy_runner.hosted.tailnet.discover_comfy_runners",
@@ -1173,6 +1174,29 @@ class TestTailnetRunners:
         assert "Comfy-Runners (Tailnet)" in body
         assert "Tailnet discovery failed" in body
         assert "api down" in body
+        assert "discovery disabled" not in body
+
+    def test_dashboard_renders_real_tailscale_api_failure(self, client, tmp_config_dir):
+        # End-to-end: simulate an actual Tailscale REST API failure by
+        # making requests.get raise a transport error. This exercises
+        # the full chain (list_devices → discover_comfy_runners → route
+        # → template) and proves the error path is reachable in
+        # production, not just when the outer wrapper is mocked.
+        from unittest.mock import patch
+        from comfy_runner.hosted import tailnet as tn
+
+        tn._clear_devices_cache()
+        try:
+            with patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+                 patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+                 patch("requests.get", side_effect=ConnectionError("nope")):
+                resp = client.get("/dashboard")
+        finally:
+            tn._clear_devices_cache()
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert "Tailnet discovery failed" in body
+        assert "nope" in body
         assert "discovery disabled" not in body
 
     def test_dashboard_renders_runner_rows(self, client, tmp_config_dir):

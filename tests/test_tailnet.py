@@ -93,6 +93,47 @@ class TestListDevices:
             tn.list_devices(force=True)
         assert get.call_count == 2
 
+    def test_negative_caches_http_failure(self):
+        # An HTTP failure must update the cache TTL so queued callers
+        # don't all serially time out against the same broken endpoint.
+        bad = MagicMock()
+        bad.ok = False
+        bad.status_code = 503
+        with patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+             patch("requests.get", return_value=bad) as get:
+            tn.list_devices()
+            tn.list_devices()
+            tn.list_devices()
+        assert get.call_count == 1
+        assert tn.get_last_devices_error() == "HTTP 503"
+
+    def test_negative_caches_transport_exception(self):
+        with patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+             patch("requests.get", side_effect=ConnectionError("boom")) as get:
+            tn.list_devices()
+            tn.list_devices()
+        assert get.call_count == 1
+        err = tn.get_last_devices_error()
+        assert err is not None
+        assert "boom" in err
+
+    def test_last_error_cleared_on_success(self):
+        # After a failure, a subsequent successful refresh must clear
+        # the recorded error so callers don't see a stale failure flag.
+        bad = MagicMock()
+        bad.ok = False
+        bad.status_code = 500
+        good = _ok_response({"devices": [{"hostname": "h1"}]})
+        with patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+             patch("requests.get", side_effect=[bad, good]):
+            tn.list_devices()
+            assert tn.get_last_devices_error() == "HTTP 500"
+            tn.list_devices(force=True)
+            assert tn.get_last_devices_error() is None
+
 
 # ---------------------------------------------------------------------------
 # Hostname / online helpers
@@ -453,3 +494,46 @@ class TestDiscoverComfyRunners:
              patch.object(tn, "get_tailscale_tailnet", return_value="ex"):
             tn.discover_comfy_runners(force_refresh=True)
         ld.assert_called_once_with(force=True)
+
+    def test_error_propagated_into_payload_no_devices(self):
+        # When list_devices fails, the cached error must surface in the
+        # discovery payload's ``error`` field, and ``ok`` flips to False.
+        with patch.object(tn, "list_devices", return_value=[]), \
+             patch.object(tn, "get_last_devices_error", return_value="HTTP 503"), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"):
+            result = tn.discover_comfy_runners()
+        assert result["ok"] is False
+        assert result["error"] == "HTTP 503"
+        assert result["runners"] == []
+        assert result["tailnet_configured"] is True
+
+    def test_error_field_none_on_success(self):
+        # On a clean run, ``error`` is None (not missing) and ``ok``
+        # stays True.
+        with self._patches():
+            result = tn.discover_comfy_runners()
+        assert "error" in result
+        assert result["error"] is None
+        assert result["ok"] is True
+
+    def test_error_propagated_with_partial_devices(self):
+        # If list_devices returns something but the cached error is
+        # still set (e.g. a transient failure during a forced refresh),
+        # the payload's ``ok`` is False but the runners we *do* know
+        # about are still surfaced.
+        devices = [self._DEVICES[0]]  # Just the responsive runpod box.
+        with patch.object(tn, "list_devices", return_value=devices), \
+             patch.object(tn, "get_last_devices_error", return_value="boom"), \
+             patch.object(tn, "list_pod_records", return_value=dict(self._POD_RECORDS)), \
+             patch.object(
+                tn, "probe_system_info",
+                side_effect=lambda host, *a, **kw: self._DEFAULT_PROBES.get(host),
+             ), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"):
+            result = tn.discover_comfy_runners()
+        assert result["ok"] is False
+        assert result["error"] == "boom"
+        assert len(result["runners"]) == 1

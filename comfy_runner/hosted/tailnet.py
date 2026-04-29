@@ -42,7 +42,9 @@ log = logging.getLogger(__name__)
 # Tailscale device listing — cached
 # ---------------------------------------------------------------------------
 
-_DEVICES_CACHE: dict[str, Any] = {"at": 0.0, "devices": []}
+_DEVICES_CACHE: dict[str, Any] = {
+    "at": 0.0, "devices": [], "last_error": None,
+}
 _DEVICES_TTL = 30.0
 _DEVICES_LOCK = threading.Lock()
 
@@ -53,6 +55,14 @@ def list_devices(force: bool = False) -> list[dict[str, Any]]:
     Returns ``[]`` if the API key / tailnet are not configured or the
     HTTP call fails. Cached for ``_DEVICES_TTL`` seconds (30 by default)
     so dashboards / discovery loops don't hammer the API.
+
+    On failure (HTTP non-2xx or transport exception) we **negative-cache**
+    for the same TTL — the cache timestamp is updated even though the
+    device list isn't, so a Tailscale-API outage doesn't make every
+    queued caller pay the full 10 s timeout serially. The error message
+    is recorded under ``_DEVICES_CACHE["last_error"]`` and surfaced via
+    :func:`get_last_devices_error` so callers (and the dashboard) can
+    distinguish a real failure from "0 devices online".
     """
     api_key = get_tailscale_api_key()
     tailnet = get_tailscale_tailnet()
@@ -61,8 +71,8 @@ def list_devices(force: bool = False) -> list[dict[str, Any]]:
 
     # Fetch under the lock so concurrent callers don't stampede the
     # Tailscale REST API when the cache goes stale. The fetch is bounded
-    # by a 10 s timeout, so worst-case wait for a queued caller is the
-    # same 10 s; subsequent callers see the just-refreshed cache.
+    # by a 10 s timeout; subsequent queued callers see the just-cached
+    # result (success or failure) and return immediately.
     with _DEVICES_LOCK:
         now = time.monotonic()
         if not force and now - _DEVICES_CACHE["at"] < _DEVICES_TTL:
@@ -76,18 +86,33 @@ def list_devices(force: bool = False) -> list[dict[str, Any]]:
                 timeout=10,
             )
             if not resp.ok:
-                log.warning(
-                    "Tailscale device list failed: HTTP %s", resp.status_code,
-                )
-                return []
+                msg = f"HTTP {resp.status_code}"
+                log.warning("Tailscale device list failed: %s", msg)
+                _DEVICES_CACHE["at"] = now
+                _DEVICES_CACHE["last_error"] = msg
+                # Keep the previously-cached devices (may be []) so the
+                # dashboard can still render anything we last knew about.
+                return list(_DEVICES_CACHE["devices"])
             devices = resp.json().get("devices", []) or []
         except Exception as e:
             log.warning("Tailscale device list failed: %s", e)
-            return []
+            _DEVICES_CACHE["at"] = now
+            _DEVICES_CACHE["last_error"] = str(e)
+            return list(_DEVICES_CACHE["devices"])
 
         _DEVICES_CACHE["at"] = now
         _DEVICES_CACHE["devices"] = devices
+        _DEVICES_CACHE["last_error"] = None
         return list(devices)
+
+
+def get_last_devices_error() -> str | None:
+    """Return the error message from the most recent ``list_devices``
+    fetch attempt, or ``None`` if the last attempt succeeded (or none
+    has happened yet).
+    """
+    with _DEVICES_LOCK:
+        return _DEVICES_CACHE.get("last_error")
 
 
 def _clear_devices_cache() -> None:
@@ -95,6 +120,7 @@ def _clear_devices_cache() -> None:
     with _DEVICES_LOCK:
         _DEVICES_CACHE["at"] = 0.0
         _DEVICES_CACHE["devices"] = []
+        _DEVICES_CACHE["last_error"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +306,7 @@ def discover_comfy_runners(
     cue is the ``device_count`` vs ``len(runners)`` gap).
     """
     devices = list_devices(force=force_refresh)
+    error = get_last_devices_error()
     api_key = get_tailscale_api_key()
     tailnet = get_tailscale_tailnet()
     tailnet_configured = bool(api_key and tailnet)
@@ -291,11 +318,12 @@ def discover_comfy_runners(
     runners: list[dict[str, Any]] = []
     if not online:
         return {
-            "ok": True,
+            "ok": error is None,
             "runners": runners,
             "tailnet_configured": tailnet_configured,
             "device_count": len(devices),
             "online_count": 0,
+            "error": error,
         }
 
     # Parallel probe — 2s default per device, capped concurrency.
@@ -363,9 +391,10 @@ def discover_comfy_runners(
     runners.sort(key=lambda r: (r["provider"], r["hostname"]))
 
     return {
-        "ok": True,
+        "ok": error is None,
         "runners": runners,
         "tailnet_configured": tailnet_configured,
         "device_count": len(devices),
         "online_count": len(online),
+        "error": error,
     }
