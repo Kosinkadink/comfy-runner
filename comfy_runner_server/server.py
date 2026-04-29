@@ -3587,90 +3587,35 @@ def create_app() -> Any:
 
                 runner = RemoteRunner(server_url)
 
-                # ── 1) Deploy the PR via the sidecar ───────────────────
-                # Skipped when ``skip_deploy=True`` — the runpod target
-                # uses POST /pods/launch-pr first, which already deploys,
-                # so this proxy just runs the review prep step.
-                #
-                # Otherwise — unless ``force_deploy=True`` — check whether
-                # the pod's installation already has this PR deployed and
-                # skip the deploy step. Reviewing the same PR twice in a
-                # row should be a no-op for the deploy phase.
-                if skip_deploy:
-                    out(
-                        "Skipping deploy step (skip_deploy=true).\n"
-                    )
-                    deploy_result = None
-                elif not force_deploy and _pod_already_at_pr(
-                    runner, install_name, pr, owner, repo, send_output=out,
-                ):
-                    out(
-                        f"PR #{pr} ({owner}/{repo}) is already deployed "
-                        f"on '{install_name}'. Skipping deploy "
-                        f"(use force_deploy=true to override).\n"
-                    )
-                    deploy_result = {
-                        "skipped": True,
-                        "reason": "PR already deployed",
-                    }
-                else:
-                    deploy_body: dict[str, Any] = {
-                        "pr": int(pr),
-                        "repo": f"https://github.com/{owner}/{repo}",
-                        "start": True,
-                    }
-                    if body.get("title"):
-                        deploy_body["title"] = body["title"]
-                    if body.get("launch_args"):
-                        deploy_body["launch_args"] = body["launch_args"]
-                    if body.get("cuda_compat"):
-                        deploy_body["cuda_compat"] = True
+                # ── Deploy + review-prep via the sidecar ──────────────
+                # Shared with the direct-server CLI path
+                # (prepare_server_review); see _run_review_via_runner
+                # for the deploy-step semantics. ``skip_deploy=True`` is
+                # used by the runpod target after POST /pods/launch-pr
+                # has already deployed.
+                from comfy_runner.review import _run_review_via_runner
 
-                    out(
-                        f"Deploying PR #{pr} ({owner}/{repo}) "
-                        f"to '{install_name}'...\n"
-                    )
-                    deploy_resp = runner._request(
-                        "POST", f"/{install_name}/deploy", json=deploy_body,
-                    )
-                    deploy_remote_job = deploy_resp.get("job_id")
-                    if not deploy_remote_job:
-                        _jobs.fail(
-                            job_id, "Deploy did not return a job_id", lines,
-                        )
-                        return
-                    deploy_result = runner.poll_job(
-                        deploy_remote_job, timeout=900, on_output=out,
-                    )
-
-                # ── 2) Prepare review via the sidecar ──────────────────
-                review_body: dict[str, Any] = {
-                    "install": install_name,
-                    "owner": owner,
-                    "repo": repo,
-                    "pr": int(pr),
-                }
-                for k in (
-                    "github_token", "download_token", "extra_models",
-                    "extra_workflows", "allow_arbitrary_urls",
-                    "skip_provisioning",
-                ):
-                    if k in body:
-                        review_body[k] = body[k]
-
-                out("\nPreparing review (manifest + workflows + models)...\n")
-                review_resp = runner._request(
-                    "POST", "/reviews/local", json=review_body,
-                )
-                review_remote_job = review_resp.get("job_id")
-                if not review_remote_job:
-                    _jobs.fail(
-                        job_id, "Review prepare did not return a job_id",
-                        lines,
-                    )
-                    return
-                review_result = runner.poll_job(
-                    review_remote_job, timeout=900, on_output=out,
+                deploy_result, review_result = _run_review_via_runner(
+                    runner, install_name, owner, repo, int(pr),
+                    github_token=body.get("github_token"),
+                    download_token=body.get("download_token", "") or "",
+                    extra_models=body.get("extra_models") or None,
+                    extra_workflows=body.get("extra_workflows") or None,
+                    allow_arbitrary_urls=bool(
+                        body.get("allow_arbitrary_urls", False)
+                    ),
+                    skip_provisioning=bool(
+                        body.get("skip_provisioning", False)
+                    ),
+                    skip_deploy=skip_deploy,
+                    force_deploy=force_deploy,
+                    deploy_extras={
+                        "title": body.get("title"),
+                        "launch_args": body.get("launch_args"),
+                        "cuda_compat": body.get("cuda_compat"),
+                    },
+                    send_output=out,
+                    poll_timeout=900,
                 )
 
                 # ── 3) Optional idle timeout override ───────────────────

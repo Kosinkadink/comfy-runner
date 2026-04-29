@@ -634,16 +634,46 @@ def _parse_review_target(spec: str | None) -> dict:
         gpu = spec[len("runpod:") :].strip()
         return {"kind": "runpod", "gpu_type": gpu or None}
     if spec.startswith("server:"):
-        url = spec[len("server:") :].strip()
-        if not url:
+        raw = spec[len("server:") :].strip()
+        if not raw:
             raise ValueError("server: target requires a URL")
-        if not (url.startswith("http://") or url.startswith("https://")):
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(raw)
+        except ValueError as e:
+            raise ValueError(f"server: target URL is malformed: {e}")
+        if parts.scheme not in ("http", "https"):
             raise ValueError(
-                f"server: target URL must include scheme (got {url!r}). "
-                "On Tailscale, use the full MagicDNS FQDN, e.g. "
-                "server:https://mybox.tailnet.ts.net:9189."
+                f"server: target URL must use http or https scheme "
+                f"(got {raw!r}). On Tailscale, use the full MagicDNS "
+                f"FQDN, e.g. server:https://mybox.tailnet.ts.net:9189."
             )
-        return {"kind": "server", "server_url": url.rstrip("/")}
+        if not parts.netloc:
+            raise ValueError(
+                f"server: target URL must include a hostname "
+                f"(got {raw!r})."
+            )
+        if parts.username or parts.password:
+            raise ValueError(
+                "server: target URL must not embed userinfo "
+                "(user:password@host); pass auth via a config file."
+            )
+        if parts.query:
+            raise ValueError(
+                "server: target URL must not include a query string."
+            )
+        if parts.fragment:
+            raise ValueError(
+                "server: target URL must not include a fragment."
+            )
+        if parts.path not in ("", "/"):
+            raise ValueError(
+                f"server: target URL must be a bare origin "
+                f"(got path {parts.path!r}). Reverse-proxy subpaths "
+                f"are not supported."
+            )
+        canonical = f"{parts.scheme}://{parts.netloc}"
+        return {"kind": "server", "server_url": canonical}
     raise ValueError(
         f"Unknown target spec: {spec!r}. Use local, local:<install>, "
         "remote:<pod>, runpod[:<gpu>], or server:<url>."

@@ -111,6 +111,34 @@ class TestParseReviewTarget:
         with pytest.raises(ValueError, match="scheme"):
             _parse_review_target("server:localhost")
 
+    def test_server_query_string_rejected(self):
+        with pytest.raises(ValueError, match="query"):
+            _parse_review_target("server:https://h.ts.net:9189?x=1")
+
+    def test_server_fragment_rejected(self):
+        with pytest.raises(ValueError, match="fragment"):
+            _parse_review_target("server:https://h.ts.net:9189#frag")
+
+    def test_server_userinfo_rejected(self):
+        with pytest.raises(ValueError, match="userinfo"):
+            _parse_review_target("server:https://user:pass@h.ts.net:9189")
+
+    def test_server_subpath_rejected(self):
+        with pytest.raises(ValueError, match="bare origin"):
+            _parse_review_target("server:https://h.ts.net:9189/proxy")
+
+    def test_server_unsupported_scheme_rejected(self):
+        with pytest.raises(ValueError, match="scheme"):
+            _parse_review_target("server:ftp://h.ts.net:9189")
+
+    def test_server_canonicalizes_url(self):
+        # urlsplit lower-cases the scheme and drops the trailing slash;
+        # the netloc keeps its original casing (per RFC 3986 hostnames
+        # are case-insensitive but Tailscale tooling preserves casing).
+        assert _parse_review_target(
+            "server:HTTP://Host.Tailnet.ts.net:9189/"
+        )["server_url"] == "http://Host.Tailnet.ts.net:9189"
+
 
 # ---------------------------------------------------------------------------
 # _parse_repo

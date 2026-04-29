@@ -565,10 +565,20 @@ class TestPodsReview:
         assert deploy_body["pr"] == 99
         assert deploy_body["repo"] == "https://github.com/comfy-org/ComfyUI"
         review_body = calls[2].kwargs["json"]
-        assert review_body == {
-            "install": "main", "owner": "comfy-org",
-            "repo": "ComfyUI", "pr": 99,
-        }
+        # Required identity fields:
+        assert review_body["install"] == "main"
+        assert review_body["owner"] == "comfy-org"
+        assert review_body["repo"] == "ComfyUI"
+        assert review_body["pr"] == 99
+        # Defaults are always sent through (the shared
+        # _run_review_via_runner helper bool-wraps them); the sidecar
+        # treats missing and explicit False identically.
+        assert review_body["allow_arbitrary_urls"] is False
+        assert review_body["skip_provisioning"] is False
+        # Optional fields not set in this test should not appear.
+        assert "github_token" not in review_body
+        assert "extra_models" not in review_body
+        assert "extra_workflows" not in review_body
 
     def test_auto_wakes_stopped_pod(self, client, tmp_config_dir, monkeypatch):
         provider = self._setup_pod(monkeypatch, status="STOPPED")

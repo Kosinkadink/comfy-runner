@@ -22,7 +22,10 @@ from comfy_runner.manifest import (  # noqa: E402
 )
 from comfy_runner.review import (  # noqa: E402
     ReviewResult,
+    _EMPTY_REVIEW_RESULT,
     _normalize_repo_url,
+    _normalize_review_result,
+    _run_review_via_runner,
     cleanup_runpod_review,
     fetch_and_resolve_manifest,
     prepare_local_review,
@@ -1301,3 +1304,190 @@ class TestPrepareServerReview:
         # The wrapper printed at least the deploy/review banners.
         assert any("Deploying PR" in t for t in sink)
         assert any("Preparing review" in t for t in sink)
+
+
+# ---------------------------------------------------------------------------
+# _normalize_review_result
+# ---------------------------------------------------------------------------
+
+class TestNormalizeReviewResult:
+    def test_none_input_returns_full_template(self):
+        out = _normalize_review_result(None)
+        for key in _EMPTY_REVIEW_RESULT:
+            assert key in out
+
+    def test_empty_dict_input_returns_full_template(self):
+        out = _normalize_review_result({})
+        for key in _EMPTY_REVIEW_RESULT:
+            assert key in out
+        assert out["downloaded"] == []
+        assert out["failures"] == []
+        assert out["manifest"] is None
+
+    def test_sparse_input_filled_in(self):
+        # /reviews/local on an older sidecar might omit some keys.
+        sparse = {"workflows": ["/x/wf.json"], "downloaded": ["m.safetensors"]}
+        out = _normalize_review_result(sparse)
+        assert out["workflows"] == ["/x/wf.json"]
+        assert out["downloaded"] == ["m.safetensors"]
+        # All other keys are still present from the template.
+        assert out["failures"] == []
+        assert out["failed"] == []
+        assert out["errors"] == []
+        assert out["skipped"] == []
+        assert out["manifest"] is None
+        assert out["resolved"] is None
+        assert out["workflows_dir"] is None
+
+    def test_template_lists_are_independent(self):
+        # Mutating one result's list must not pollute the template or
+        # other results.
+        a = _normalize_review_result(None)
+        b = _normalize_review_result(None)
+        a["downloaded"].append("x")
+        assert b["downloaded"] == []
+        assert _EMPTY_REVIEW_RESULT["downloaded"] == []
+
+    def test_input_overrides_template(self):
+        # Caller-supplied non-default values win over the template.
+        out = _normalize_review_result({"failures": [{"url": "u", "error": "e"}]})
+        assert out["failures"] == [{"url": "u", "error": "e"}]
+
+
+# ---------------------------------------------------------------------------
+# prepare_server_review — sparse remote response, full keys returned
+# ---------------------------------------------------------------------------
+
+class TestPrepareServerReviewSparseRemote:
+    """Remote /reviews/local could return a partial result; the library
+    must still return the full prepare_local_review shape so JSON
+    consumers and renderers don't blow up on missing keys."""
+
+    def test_sparse_review_result_is_normalized(self):
+        runner = MagicMock()
+        runner._request = MagicMock(side_effect=[
+            {},  # info — not at PR
+            {"ok": True, "job_id": "deploy-job"},
+            {"ok": True, "job_id": "review-job"},
+        ])
+        # Remote returns only a couple of keys.
+        runner.poll_job = MagicMock(side_effect=[
+            {"restarted": True},
+            {"workflows": ["/wf.json"]},
+        ])
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            result = prepare_server_review(
+                "https://h.ts.net:9189", "main", "o", "r", 1,
+            )
+        # All template keys are present.
+        for key in _EMPTY_REVIEW_RESULT:
+            assert key in result, f"missing key {key!r}"
+        # Remote-supplied value wins.
+        assert result["workflows"] == ["/wf.json"]
+        # Other keys are template defaults.
+        assert result["failures"] == []
+        assert result["downloaded"] == []
+        # Augmented metadata from the wrapper.
+        assert result["server_url"] == "https://h.ts.net:9189"
+        assert result["deploy_result"] == {"restarted": True}
+
+
+# ---------------------------------------------------------------------------
+# _run_review_via_runner — shared helper used by prepare_server_review
+# AND comfy_runner_server.server.route_pods_review.
+# ---------------------------------------------------------------------------
+
+class TestRunReviewViaRunner:
+    def _runner(self):
+        runner = MagicMock()
+        runner._request = MagicMock(side_effect=[
+            {},  # info
+            {"ok": True, "job_id": "deploy-job"},
+            {"ok": True, "job_id": "review-job"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            {"restarted": True},
+            {"workflows": []},
+        ])
+        return runner
+
+    def test_skip_deploy_skips_idempotency_and_deploy(self):
+        runner = MagicMock()
+        # Only the review POST happens.
+        runner._request = MagicMock(side_effect=[
+            {"ok": True, "job_id": "review-job"},
+        ])
+        runner.poll_job = MagicMock(return_value={"workflows": []})
+        deploy_result, _ = _run_review_via_runner(
+            runner, "main", "o", "r", 1, skip_deploy=True,
+        )
+        assert deploy_result is None
+        # No GET /info, no /deploy.
+        assert runner._request.call_count == 1
+        assert runner._request.call_args.args == ("POST", "/reviews/local")
+
+    def test_deploy_extras_merged_into_deploy_body(self):
+        runner = self._runner()
+        _run_review_via_runner(
+            runner, "main", "o", "r", 1,
+            deploy_extras={
+                "title": "WIP fix", "launch_args": "--foo",
+                "cuda_compat": True,
+            },
+        )
+        deploy_body = runner._request.call_args_list[1].kwargs["json"]
+        assert deploy_body["title"] == "WIP fix"
+        assert deploy_body["launch_args"] == "--foo"
+        assert deploy_body["cuda_compat"] is True
+
+    def test_deploy_extras_none_keys_are_dropped(self):
+        runner = self._runner()
+        _run_review_via_runner(
+            runner, "main", "o", "r", 1,
+            deploy_extras={
+                "title": None, "launch_args": "", "cuda_compat": False,
+            },
+        )
+        deploy_body = runner._request.call_args_list[1].kwargs["json"]
+        # Falsy / None values are not forwarded.
+        assert "title" not in deploy_body
+        assert "launch_args" not in deploy_body
+        assert "cuda_compat" not in deploy_body
+
+    def test_extra_models_accepts_dicts_and_model_entries(self):
+        # Dict entries (already-serialised, the shape the station
+        # receives over JSON) pass through as-is.
+        runner = self._runner()
+        dicts = [
+            {"name": "a", "url": "https://h/a", "directory": "checkpoints"},
+        ]
+        _run_review_via_runner(
+            runner, "main", "o", "r", 1, extra_models=dicts,
+        )
+        body = runner._request.call_args_list[2].kwargs["json"]
+        assert body["extra_models"] == dicts
+
+        # ModelEntry objects (the shape the CLI passes) are converted via
+        # .to_dict().
+        runner2 = self._runner()
+        entries = [ModelEntry("a", "https://h/a", "checkpoints")]
+        _run_review_via_runner(
+            runner2, "main", "o", "r", 1, extra_models=entries,
+        )
+        body2 = runner2._request.call_args_list[2].kwargs["json"]
+        assert body2["extra_models"] == [
+            {"name": "a", "url": "https://h/a", "directory": "checkpoints"},
+        ]
+
+    def test_returns_tuple_of_deploy_result_and_review_result(self):
+        runner = self._runner()
+        deploy_result, review_result = _run_review_via_runner(
+            runner, "main", "o", "r", 1,
+        )
+        # Deploy is whatever poll_job returned for the deploy step.
+        assert deploy_result == {"restarted": True}
+        # Review is whatever poll_job returned for the review step.
+        assert review_result == {"workflows": []}

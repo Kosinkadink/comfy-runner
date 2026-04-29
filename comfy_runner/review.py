@@ -307,6 +307,39 @@ def _normalize_repo_url(value: str) -> str:
     return s.strip("/")
 
 
+# Empty review_result template: every key prepare_local_review populates.
+# Used by :func:`_normalize_review_result` to keep the result shape stable
+# across local / server / remote / runpod target paths.
+_EMPTY_REVIEW_RESULT: dict[str, Any] = {
+    "manifest": None,
+    "resolved": None,
+    "downloaded": [],
+    "skipped": [],
+    "failed": [],
+    "errors": [],
+    "workflows": [],
+    "workflows_dir": None,
+    "failures": [],
+}
+
+
+def _normalize_review_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    """Ensure a review_result has every key prepare_local_review returns.
+
+    Defensive: a sparse remote response (older sidecar, partial /reviews/local
+    job result, etc.) shouldn't surprise the renderer or downstream JSON
+    consumers. Lists in the template are deep-copied so callers can mutate
+    freely without aliasing the template.
+    """
+    out: dict[str, Any] = {
+        k: list(v) if isinstance(v, list) else v
+        for k, v in _EMPTY_REVIEW_RESULT.items()
+    }
+    if result:
+        out.update(result)
+    return out
+
+
 def remote_install_at_pr(
     runner: Any,
     install_name: str,
@@ -424,7 +457,7 @@ def prepare_remote_review(
         job_id, timeout=poll_timeout, on_output=send_output,
     )
 
-    review_result = dict(final.get("review_result") or {})
+    review_result = _normalize_review_result(final.get("review_result"))
     review_result["pod_name"] = final.get("pod_name", pod_name)
     review_result["pod_purpose"] = final.get("pod_purpose")
     review_result["server_url"] = final.get("server_url", "")
@@ -432,6 +465,136 @@ def prepare_remote_review(
     if final.get("idle_timeout_s") is not None:
         review_result["idle_timeout_s"] = final.get("idle_timeout_s")
     return review_result
+
+
+# ---------------------------------------------------------------------------
+# Shared inner orchestration: deploy → review-prep against an existing
+# RemoteRunner. Reused by prepare_server_review (CLI -> direct) and the
+# station's POST /pods/{name}/review handler. Outer concerns (auto-wake,
+# pod lock, purpose gating, idle-timeout override, station job wrapper)
+# stay in their respective contexts.
+# ---------------------------------------------------------------------------
+
+def _run_review_via_runner(
+    runner: Any,
+    install_name: str,
+    owner: str,
+    repo: str,
+    pr: int,
+    *,
+    github_token: str | None = None,
+    download_token: str = "",
+    extra_models: list[Any] | None = None,
+    extra_workflows: list[str] | None = None,
+    allow_arbitrary_urls: bool = False,
+    skip_provisioning: bool = False,
+    skip_deploy: bool = False,
+    force_deploy: bool = False,
+    deploy_extras: dict[str, Any] | None = None,
+    send_output: Callable[[str], None] | None = None,
+    poll_timeout: int = 1800,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Run the deploy → review-prep choreography against *runner*.
+
+    Returns ``(deploy_result, review_result)``.
+
+    Deploy step semantics:
+
+    * ``skip_deploy=True``     → no deploy, no idempotency check;
+      ``deploy_result`` is ``None``.
+    * ``force_deploy=True``    → always POST ``/<install>/deploy`` and
+      poll its job; skips the idempotency check.
+    * default                  → GET ``/<install>/info``; if the install
+      is already at the requested PR/repo, ``deploy_result`` is
+      ``{"skipped": True, "reason": "PR already deployed"}``. Otherwise
+      deploy and poll.
+
+    *extra_models* may be a list of :class:`comfy_runner.manifest.ModelEntry`
+    objects (which are converted via ``.to_dict()``) **or** a list of
+    pre-serialized ``dict`` entries — whichever the caller already has.
+
+    *deploy_extras* is merged into the deploy body (keys ``title``,
+    ``launch_args``, ``cuda_compat``) when present. Used by the station's
+    pod-review handler to pass through pod-specific deploy options.
+
+    Raises ``RuntimeError`` on missing job IDs from either step. Job
+    poll failures propagate as RuntimeError from ``poll_job``.
+    """
+    out = send_output or (lambda _t: None)
+
+    # ── 1) Deploy step ─────────────────────────────────────────────────
+    deploy_result: dict[str, Any] | None
+    if skip_deploy:
+        out("Skipping deploy step (skip_deploy=true).\n")
+        deploy_result = None
+    elif not force_deploy and remote_install_at_pr(
+        runner, install_name, pr, owner, repo, send_output=out,
+    ):
+        out(
+            f"PR #{pr} ({owner}/{repo}) is already deployed on "
+            f"'{install_name}'. Skipping deploy "
+            f"(use force_deploy=true to override).\n"
+        )
+        deploy_result = {"skipped": True, "reason": "PR already deployed"}
+    else:
+        deploy_body: dict[str, Any] = {
+            "pr": int(pr),
+            "repo": f"https://github.com/{owner}/{repo}",
+            "start": True,
+        }
+        if deploy_extras:
+            if deploy_extras.get("title"):
+                deploy_body["title"] = deploy_extras["title"]
+            if deploy_extras.get("launch_args"):
+                deploy_body["launch_args"] = deploy_extras["launch_args"]
+            if deploy_extras.get("cuda_compat"):
+                deploy_body["cuda_compat"] = True
+        out(
+            f"Deploying PR #{pr} ({owner}/{repo}) to '{install_name}'...\n"
+        )
+        deploy_resp = runner._request(
+            "POST", f"/{install_name}/deploy", json=deploy_body,
+        )
+        deploy_job_id = deploy_resp.get("job_id")
+        if not deploy_job_id:
+            raise RuntimeError(
+                "Server did not return a job_id for deploy"
+            )
+        deploy_result = runner.poll_job(
+            deploy_job_id, timeout=poll_timeout, on_output=out,
+        )
+
+    # ── 2) Review-prep step ────────────────────────────────────────────
+    review_body: dict[str, Any] = {
+        "install": install_name,
+        "owner": owner,
+        "repo": repo,
+        "pr": int(pr),
+        "allow_arbitrary_urls": bool(allow_arbitrary_urls),
+        "skip_provisioning": bool(skip_provisioning),
+    }
+    if github_token:
+        review_body["github_token"] = github_token
+    if download_token:
+        review_body["download_token"] = download_token
+    if extra_models:
+        # Accept ModelEntry instances or already-serialised dicts.
+        review_body["extra_models"] = [
+            m.to_dict() if hasattr(m, "to_dict") else m
+            for m in extra_models
+        ]
+    if extra_workflows:
+        review_body["extra_workflows"] = list(extra_workflows)
+
+    out("\nPreparing review (manifest + workflows + models)...\n")
+    review_resp = runner._request("POST", "/reviews/local", json=review_body)
+    review_job_id = review_resp.get("job_id")
+    if not review_job_id:
+        raise RuntimeError("Server did not return a job_id for review")
+    review_result = runner.poll_job(
+        review_job_id, timeout=poll_timeout, on_output=out,
+    )
+    return deploy_result, review_result
 
 
 # ---------------------------------------------------------------------------
@@ -480,69 +643,21 @@ def prepare_server_review(
     """
     from .hosted.remote import RemoteRunner
 
-    out = send_output or (lambda _t: None)
     runner = RemoteRunner(server_url)
-
-    # ── 1) Deploy (idempotent unless force_deploy). ────────────────────
-    deploy_result: dict[str, Any] | None
-    if not force_deploy and remote_install_at_pr(
-        runner, install_name, pr, owner, repo, send_output=out,
-    ):
-        out(
-            f"PR #{pr} ({owner}/{repo}) is already deployed on "
-            f"'{install_name}'. Skipping deploy "
-            f"(use --force-deploy to override).\n"
-        )
-        deploy_result = {"skipped": True, "reason": "PR already deployed"}
-    else:
-        deploy_body = {
-            "pr": int(pr),
-            "repo": f"https://github.com/{owner}/{repo}",
-            "start": True,
-        }
-        out(
-            f"Deploying PR #{pr} ({owner}/{repo}) to '{install_name}'...\n"
-        )
-        deploy_resp = runner._request(
-            "POST", f"/{install_name}/deploy", json=deploy_body,
-        )
-        deploy_job_id = deploy_resp.get("job_id")
-        if not deploy_job_id:
-            raise RuntimeError("Server did not return a job_id for deploy")
-        deploy_result = runner.poll_job(
-            deploy_job_id, timeout=poll_timeout, on_output=out,
-        )
-
-    # ── 2) Prepare review (manifest + workflows + models). ─────────────
-    review_body: dict[str, Any] = {
-        "install": install_name,
-        "owner": owner,
-        "repo": repo,
-        "pr": int(pr),
-        "allow_arbitrary_urls": bool(allow_arbitrary_urls),
-        "skip_provisioning": bool(skip_provisioning),
-    }
-    if github_token:
-        review_body["github_token"] = github_token
-    if download_token:
-        review_body["download_token"] = download_token
-    if extra_models:
-        review_body["extra_models"] = [m.to_dict() for m in extra_models]
-    if extra_workflows:
-        review_body["extra_workflows"] = list(extra_workflows)
-
-    out("\nPreparing review (manifest + workflows + models)...\n")
-    review_resp = runner._request(
-        "POST", "/reviews/local", json=review_body,
-    )
-    review_job_id = review_resp.get("job_id")
-    if not review_job_id:
-        raise RuntimeError("Server did not return a job_id for review")
-    inner = runner.poll_job(
-        review_job_id, timeout=poll_timeout, on_output=out,
+    deploy_result, review_result = _run_review_via_runner(
+        runner, install_name, owner, repo, pr,
+        github_token=github_token,
+        download_token=download_token,
+        extra_models=extra_models,
+        extra_workflows=extra_workflows,
+        allow_arbitrary_urls=allow_arbitrary_urls,
+        skip_provisioning=skip_provisioning,
+        force_deploy=force_deploy,
+        send_output=send_output,
+        poll_timeout=poll_timeout,
     )
 
-    result = dict(inner or {})
+    result = _normalize_review_result(review_result)
     result["server_url"] = server_url
     result["deploy_result"] = deploy_result
     return result
@@ -664,7 +779,7 @@ def prepare_runpod_review(
         review_job_id, timeout=poll_timeout, on_output=send_output,
     )
 
-    review_result = dict(final.get("review_result") or {})
+    review_result = _normalize_review_result(final.get("review_result"))
     review_result["pod_name"] = final.get("pod_name", pod_name)
     review_result["pod_purpose"] = final.get("pod_purpose")
     review_result["server_url"] = (
