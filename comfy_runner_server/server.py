@@ -1010,6 +1010,66 @@ def _validate_pod_name(name: str) -> str | None:
     return None
 
 
+def _normalize_repo_url(value: str) -> str:
+    """Reduce a repo URL or ``owner/name`` slug to a canonical form.
+
+    Strips scheme, ``github.com/`` prefix, ``.git`` suffix, leading/
+    trailing slashes, and lower-cases. So ``https://github.com/Comfy-Org/ComfyUI.git``
+    and ``Comfy-Org/ComfyUI`` both reduce to ``comfy-org/comfyui``.
+    """
+    if not value:
+        return ""
+    s = value.strip().lower()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if s.startswith("github.com/"):
+        s = s[len("github.com/"):]
+    if s.endswith(".git"):
+        s = s[: -len(".git")]
+    return s.strip("/")
+
+
+def _pod_already_at_pr(
+    runner: Any,
+    install_name: str,
+    pr: int,
+    owner: str,
+    repo: str,
+    *,
+    send_output: Callable[[str], None] | None = None,
+) -> bool:
+    """Best-effort check: is *install_name* on the pod already at this PR?
+
+    Used to make ``POST /pods/{name}/review`` idempotent: re-reviewing a
+    PR that's already deployed should be a no-op for the deploy step.
+    Returns False on any error so the caller falls back to a real deploy
+    rather than skipping incorrectly.
+    """
+    out = send_output or (lambda _t: None)
+    try:
+        info = runner._request("GET", f"/{install_name}/info")
+    except Exception as e:
+        out(f"  (skipping idempotency check: {e})\n")
+        return False
+
+    deployed_pr = info.get("deployed_pr")
+    if deployed_pr is None:
+        return False
+    try:
+        if int(deployed_pr) != int(pr):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    deployed_repo = info.get("deployed_repo") or ""
+    requested_repo = f"{owner}/{repo}"
+    if _normalize_repo_url(deployed_repo) != _normalize_repo_url(
+        requested_repo
+    ):
+        return False
+    return True
+
+
 _SUITES_DIR = Path("test-suites")
 
 
@@ -3435,6 +3495,25 @@ def create_app() -> Any:
         # flow) and only wants the review-prep step to run.
         skip_deploy = bool(body.get("skip_deploy", False))
 
+        # Default behavior is idempotent: if the pod's installation
+        # already has the requested PR deployed, skip the deploy step.
+        # ``force_deploy=true`` overrides and always deploys.
+        force_deploy = bool(body.get("force_deploy", False))
+
+        # Optional per-review idle timeout override. When set, the pod
+        # record's ``idle_timeout_s`` is updated after the review-prep
+        # call so the idle reaper uses the new value.
+        idle_timeout_override = body.get("idle_timeout_s")
+        if idle_timeout_override is not None:
+            if (
+                isinstance(idle_timeout_override, bool)
+                or not isinstance(idle_timeout_override, int)
+                or idle_timeout_override <= 0
+            ):
+                return _err(
+                    "'idle_timeout_s' must be a positive integer"
+                )
+
         # ── Purpose gating ───────────────────────────────────────────────
         # Reviews mutate install state on the pod. Match the pod's
         # ``purpose`` tag against what's safe:
@@ -3510,11 +3589,28 @@ def create_app() -> Any:
                 # Skipped when ``skip_deploy=True`` — the runpod target
                 # uses POST /pods/launch-pr first, which already deploys,
                 # so this proxy just runs the review prep step.
+                #
+                # Otherwise — unless ``force_deploy=True`` — check whether
+                # the pod's installation already has this PR deployed and
+                # skip the deploy step. Reviewing the same PR twice in a
+                # row should be a no-op for the deploy phase.
                 if skip_deploy:
                     out(
                         "Skipping deploy step (skip_deploy=true).\n"
                     )
                     deploy_result = None
+                elif not force_deploy and _pod_already_at_pr(
+                    runner, install_name, pr, owner, repo, send_output=out,
+                ):
+                    out(
+                        f"PR #{pr} ({owner}/{repo}) is already deployed "
+                        f"on '{install_name}'. Skipping deploy "
+                        f"(use force_deploy=true to override).\n"
+                    )
+                    deploy_result = {
+                        "skipped": True,
+                        "reason": "PR already deployed",
+                    }
                 else:
                     deploy_body: dict[str, Any] = {
                         "pr": int(pr),
@@ -3575,12 +3671,33 @@ def create_app() -> Any:
                     review_remote_job, timeout=900, on_output=out,
                 )
 
+                # ── 3) Optional idle timeout override ───────────────────
+                # Update the pod record so the idle reaper picks up the
+                # new value on its next sweep. ``purpose='pr'`` only —
+                # the reaper ignores other purposes anyway.
+                idle_timeout_applied: int | None = None
+                if idle_timeout_override is not None:
+                    from comfy_runner.hosted.config import update_pod_record
+
+                    def _set_idle(r: dict | None) -> dict | None:
+                        if r is None:
+                            return None
+                        r["idle_timeout_s"] = int(idle_timeout_override)
+                        return r
+                    update_pod_record("runpod", name, _set_idle)
+                    idle_timeout_applied = int(idle_timeout_override)
+                    out(
+                        f"Pod idle timeout updated to "
+                        f"{idle_timeout_applied}s.\n"
+                    )
+
                 _jobs.finish(job_id, {
                     "pod_name": name,
                     "pod_purpose": pod_purpose,
                     "server_url": server_url,
                     "deploy_result": deploy_result,
                     "review_result": review_result,
+                    "idle_timeout_s": idle_timeout_applied,
                 }, lines)
 
             except Exception as e:

@@ -190,6 +190,8 @@ def _review_args(**overrides) -> argparse.Namespace:
         "install": "main",
         "force_purpose": False,
         "cleanup": False,
+        "force_deploy": False,
+        "idle_stop_after": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -579,6 +581,43 @@ class TestCmdReviewRemote:
             cmd_review(args)
         assert mock_prep.call_args.kwargs["force_purpose"] is True
 
+    def test_force_deploy_flag_threaded(self, tmp_config_dir):
+        args = _review_args(
+            target="remote:pod-a", server="https://station.example",
+            force_deploy=True, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_remote_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        assert mock_prep.call_args.kwargs["force_deploy"] is True
+
+    def test_idle_stop_after_flag_threaded(self, tmp_config_dir):
+        args = _review_args(
+            target="remote:pod-a", server="https://station.example",
+            idle_stop_after=600, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_remote_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        assert mock_prep.call_args.kwargs["idle_timeout_s"] == 600
+
+    def test_force_deploy_default_false(self, tmp_config_dir):
+        args = _review_args(
+            target="remote:pod-a", server="https://station.example",
+            json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_remote_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        assert mock_prep.call_args.kwargs["force_deploy"] is False
+        assert mock_prep.call_args.kwargs["idle_timeout_s"] is None
+
 
 # ---------------------------------------------------------------------------
 # cmd_review — runpod target (item 3)
@@ -690,6 +729,20 @@ class TestCmdReviewRunpod:
         mock_prep.assert_not_called()
         payload = json.loads(capsys.readouterr().out)
         assert "station.json" in payload["error"]
+
+    def test_idle_stop_after_flag_threaded(self, tmp_config_dir):
+        args = _review_args(
+            target="runpod:RTX_4090",
+            server="https://station.example",
+            idle_stop_after=900, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_runpod_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        # idle_timeout_s is plumbed to launch-pr's body via prepare_runpod_review.
+        assert mock_prep.call_args.kwargs["idle_timeout_s"] == 900
 
 
 # ---------------------------------------------------------------------------

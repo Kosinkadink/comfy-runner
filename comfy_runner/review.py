@@ -301,6 +301,8 @@ def prepare_remote_review(
     allow_arbitrary_urls: bool = False,
     skip_provisioning: bool = False,
     force_purpose: bool = False,
+    force_deploy: bool = False,
+    idle_timeout_s: int | None = None,
     send_output: Callable[[str], None] | None = None,
     poll_timeout: int = 1800,
 ) -> dict[str, Any]:
@@ -336,6 +338,10 @@ def prepare_remote_review(
         body["extra_workflows"] = list(extra_workflows)
     if force_purpose:
         body["force_purpose"] = True
+    if force_deploy:
+        body["force_deploy"] = True
+    if idle_timeout_s is not None:
+        body["idle_timeout_s"] = int(idle_timeout_s)
 
     runner = RemoteRunner(server_url)
     data = runner._request(
@@ -354,6 +360,8 @@ def prepare_remote_review(
     review_result["pod_purpose"] = final.get("pod_purpose")
     review_result["server_url"] = final.get("server_url", "")
     review_result["deploy_result"] = final.get("deploy_result")
+    if final.get("idle_timeout_s") is not None:
+        review_result["idle_timeout_s"] = final.get("idle_timeout_s")
     return review_result
 
 

@@ -1399,6 +1399,8 @@ _ROUTES: list[dict[str, Any]] = [
                             "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility for deploy step"},
                             "force_purpose": {"type": "boolean", "description": "Override the refusal to review against pods tagged purpose='test' (e2e test pods)"},
                             "skip_deploy": {"type": "boolean", "description": "Skip the deploy step (use when the caller has already deployed, e.g. via POST /pods/launch-pr)"},
+                            "force_deploy": {"type": "boolean", "description": "Always deploy even if the pod's installation already has this PR deployed (default is idempotent: skip deploy when current)"},
+                            "idle_timeout_s": {"type": "integer", "description": "Per-review override for the pod's idle timeout (seconds). After review-prep finishes, the pod record is updated so the idle reaper uses the new value."},
                         },
                     }
                 }

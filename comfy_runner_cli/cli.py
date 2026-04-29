@@ -849,6 +849,8 @@ def _cmd_review_remote(
             allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
             skip_provisioning=getattr(args, "no_provision_models", False),
             force_purpose=getattr(args, "force_purpose", False),
+            force_deploy=getattr(args, "force_deploy", False),
+            idle_timeout_s=getattr(args, "idle_stop_after", None),
             send_output=out,
         )
     except RuntimeError as e:
@@ -914,6 +916,7 @@ def _cmd_review_runpod(
             server, owner, repo_name, pr,
             install_name=install_name,
             gpu_type=gpu_type,
+            idle_timeout_s=getattr(args, "idle_stop_after", None),
             github_token=getattr(args, "github_token", None),
             download_token=getattr(args, "token", "") or "",
             extra_models=extra_model_entries,
@@ -4688,6 +4691,19 @@ def main(argv: list[str] | None = None) -> None:
         help="For runpod target only: terminate the ephemeral PR pod "
              "after review-prep finishes. Use 'review-cleanup' instead "
              "if you want to clean up an existing pod later.",
+    )
+    p_review.add_argument(
+        "--force-deploy", dest="force_deploy", action="store_true",
+        help="For remote target: always deploy even if the pod already "
+             "has this PR deployed. Default is idempotent (skip deploy "
+             "if already current). No effect on local/runpod targets.",
+    )
+    p_review.add_argument(
+        "--idle-stop-after", dest="idle_stop_after", type=int, default=None,
+        metavar="SECONDS",
+        help="For remote/runpod targets: update the pod's idle timeout "
+             "to this many seconds. The central station's idle reaper "
+             "auto-stops purpose='pr' pods that have been idle this long.",
     )
     p_review.set_defaults(func=cmd_review)
 

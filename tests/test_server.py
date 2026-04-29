@@ -486,11 +486,26 @@ class TestPodsReview:
 
     def _setup_runner(self, monkeypatch, *,
                        deploy_result=None, review_result=None,
-                       deploy_job=True, review_job=True):
+                       deploy_job=True, review_job=True,
+                       deployed_pr_on_pod=None,
+                       deployed_repo_on_pod="",
+                       ):
         runner = MagicMock()
 
-        # First call → deploy job, second call → review job.
-        responses = []
+        # Idempotency-check call: GET /<install>/info. By default we
+        # return an info dict with no ``deployed_pr`` so the check
+        # returns False and the worker proceeds to deploy. Tests can
+        # override deployed_pr_on_pod to simulate a pod that already
+        # has the PR deployed.
+        info_resp: dict = {"ok": True, "name": "main"}
+        if deployed_pr_on_pod is not None:
+            info_resp["deployed_pr"] = deployed_pr_on_pod
+            info_resp["deployed_repo"] = deployed_repo_on_pod
+
+        # First call → info (idempotency check)
+        # Second call → deploy job
+        # Third call → review job
+        responses: list = [info_resp]
         if deploy_job:
             responses.append({"ok": True, "job_id": "deploy-1"})
         else:
@@ -541,14 +556,15 @@ class TestPodsReview:
         # Running pod is NOT auto-started.
         provider.start_pod.assert_not_called()
 
-        # Two HTTP calls: deploy then review.
+        # Three HTTP calls: idempotency-check info, deploy, review.
         calls = runner._request.call_args_list
-        assert calls[0].args == ("POST", "/main/deploy")
-        assert calls[1].args == ("POST", "/reviews/local")
-        deploy_body = calls[0].kwargs["json"]
+        assert calls[0].args == ("GET", "/main/info")
+        assert calls[1].args == ("POST", "/main/deploy")
+        assert calls[2].args == ("POST", "/reviews/local")
+        deploy_body = calls[1].kwargs["json"]
         assert deploy_body["pr"] == 99
         assert deploy_body["repo"] == "https://github.com/comfy-org/ComfyUI"
-        review_body = calls[1].kwargs["json"]
+        review_body = calls[2].kwargs["json"]
         assert review_body == {
             "install": "main", "owner": "comfy-org",
             "repo": "ComfyUI", "pr": 99,
@@ -613,7 +629,8 @@ class TestPodsReview:
         job_id = resp.get_json()["job_id"]
         _wait_job(client, job_id, timeout=5)
 
-        review_body = runner._request.call_args_list[1].kwargs["json"]
+        # Index [2] now: [0]=info (idempotency), [1]=deploy, [2]=review.
+        review_body = runner._request.call_args_list[2].kwargs["json"]
         assert review_body["github_token"] == "ghp"
         assert review_body["download_token"] == "hf"
         assert review_body["allow_arbitrary_urls"] is True
@@ -699,6 +716,198 @@ class TestPodsReview:
         final = _wait_job(client, job_id, timeout=5)
         assert final["status"] == "done"
         assert final["result"]["pod_purpose"] == "persistent"
+
+    # ── Idempotent re-deploy (item 4) ──────────────────────────────────
+
+    def test_idempotent_skip_when_pr_already_deployed(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        # Pod's installation already reports deployed_pr=99; default
+        # behavior must skip the deploy step.
+        self._setup_pod(monkeypatch, purpose="pr")
+        runner = self._setup_runner(
+            monkeypatch,
+            deployed_pr_on_pod=99,
+            deployed_repo_on_pod="https://github.com/comfy-org/ComfyUI",
+        )
+        # Override side_effect: only info + review (no deploy resp).
+        runner._request = MagicMock(side_effect=[
+            {
+                "ok": True, "name": "main",
+                "deployed_pr": 99,
+                "deployed_repo": "https://github.com/comfy-org/ComfyUI",
+            },
+            {"ok": True, "job_id": "review-1"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            # No deploy poll — only review poll.
+            {
+                "manifest": None, "resolved": None,
+                "downloaded": [], "skipped": [], "failed": [], "errors": [],
+                "workflows": [], "workflows_dir": "/x", "failures": [],
+            },
+        ])
+
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done", final
+
+        # Two HTTP calls: info, then review (deploy was skipped).
+        calls = runner._request.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args == ("GET", "/main/info")
+        assert calls[1].args == ("POST", "/reviews/local")
+
+        # Deploy result reflects the skip.
+        assert final["result"]["deploy_result"] == {
+            "skipped": True, "reason": "PR already deployed",
+        }
+        # Visible in output.
+        assert any(
+            "already deployed" in line for line in final.get("output", [])
+        )
+
+    def test_idempotent_repo_normalization(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        # ``Comfy-Org/ComfyUI`` and ``comfy-org/comfyui`` normalize to
+        # the same value; the idempotency check should treat them as a
+        # match.
+        self._setup_pod(monkeypatch, purpose="pr")
+        runner = self._setup_runner(
+            monkeypatch,
+            deployed_pr_on_pod=99,
+            deployed_repo_on_pod="github.com/Comfy-Org/ComfyUI.git",
+        )
+        runner._request = MagicMock(side_effect=[
+            {
+                "ok": True,
+                "deployed_pr": 99,
+                "deployed_repo": "github.com/Comfy-Org/ComfyUI.git",
+            },
+            {"ok": True, "job_id": "review-1"},
+        ])
+        runner.poll_job = MagicMock(return_value={
+            "manifest": None, "resolved": None,
+            "downloaded": [], "skipped": [], "failed": [], "errors": [],
+            "workflows": [], "workflows_dir": "/x", "failures": [],
+        })
+        resp = client.post(
+            "/pods/pod-a/review",
+            json=self._body(owner="comfy-org", repo="comfyui"),
+        )
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        # Deploy was skipped despite case/.git differences.
+        assert final["result"]["deploy_result"]["skipped"] is True
+
+    def test_force_deploy_overrides_idempotency(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="pr")
+        runner = self._setup_runner(
+            monkeypatch,
+            deployed_pr_on_pod=99,
+            deployed_repo_on_pod="https://github.com/comfy-org/ComfyUI",
+        )
+        # With force_deploy, the worker should NOT consult /info — it
+        # goes straight to deploy. So only 2 calls expected: deploy, review.
+        runner._request = MagicMock(side_effect=[
+            {"ok": True, "job_id": "deploy-1"},
+            {"ok": True, "job_id": "review-1"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            {"restarted": True},
+            {
+                "manifest": None, "resolved": None,
+                "downloaded": [], "skipped": [], "failed": [], "errors": [],
+                "workflows": [], "workflows_dir": "/x", "failures": [],
+            },
+        ])
+
+        resp = client.post(
+            "/pods/pod-a/review",
+            json=self._body(force_deploy=True),
+        )
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        # No GET /info call — went straight to deploy.
+        calls = runner._request.call_args_list
+        assert calls[0].args == ("POST", "/main/deploy")
+        # Real deploy result, not skip marker.
+        assert final["result"]["deploy_result"] == {"restarted": True}
+
+    def test_idempotency_falls_back_on_info_error(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        # If GET /<install>/info fails for any reason, fall back to a
+        # full deploy rather than skipping incorrectly.
+        self._setup_pod(monkeypatch, purpose="pr")
+        runner = self._setup_runner(monkeypatch)
+        runner._request = MagicMock(side_effect=[
+            RuntimeError("info call failed"),  # GET /main/info
+            {"ok": True, "job_id": "deploy-1"},
+            {"ok": True, "job_id": "review-1"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            {"restarted": True},
+            {
+                "manifest": None, "resolved": None,
+                "downloaded": [], "skipped": [], "failed": [], "errors": [],
+                "workflows": [], "workflows_dir": "/x", "failures": [],
+            },
+        ])
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        # Deploy was performed normally.
+        assert final["result"]["deploy_result"] == {"restarted": True}
+
+    # ── idle_timeout_s override (item 4) ───────────────────────────────
+
+    def test_idle_timeout_override_updates_pod_record(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="pr")
+        self._setup_runner(monkeypatch)
+
+        updated: dict = {}
+
+        def fake_update(provider, name, fn):
+            rec = {"id": "id", "purpose": "pr", "idle_timeout_s": 1800}
+            new_rec = fn(rec)
+            updated.update(new_rec)
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.update_pod_record", fake_update,
+        )
+
+        resp = client.post(
+            "/pods/pod-a/review",
+            json=self._body(idle_timeout_s=900),
+        )
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        assert final["result"]["idle_timeout_s"] == 900
+        assert updated["idle_timeout_s"] == 900
+        # Visible in output.
+        assert any(
+            "idle timeout updated" in line.lower()
+            for line in final.get("output", [])
+        )
+
+    def test_idle_timeout_validation(self, client, tmp_config_dir, monkeypatch):
+        self._setup_pod(monkeypatch, purpose="pr")
+        for bad in (-1, 0, "x", True):
+            resp = client.post(
+                "/pods/pod-a/review",
+                json=self._body(idle_timeout_s=bad),
+            )
+            assert resp.status_code == 400, bad
 
     # ── skip_deploy (item 3 — runpod target uses launch-pr first) ─────
 

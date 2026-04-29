@@ -607,6 +607,71 @@ class TestPrepareRemoteReview:
             )
         assert result["pod_purpose"] == "pr"
 
+    def test_force_deploy_passed_through(self):
+        runner = self._make_runner(poll_resp={
+            "pod_name": "p", "server_url": "", "review_result": {},
+            "deploy_result": None,
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_remote_review(
+                "https://x", "p", "main", "o", "r", 1,
+                force_deploy=True,
+            )
+        body = runner._request.call_args.kwargs["json"]
+        assert body["force_deploy"] is True
+
+    def test_force_deploy_omitted_by_default(self):
+        runner = self._make_runner(poll_resp={
+            "pod_name": "p", "server_url": "", "review_result": {},
+            "deploy_result": None,
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_remote_review(
+                "https://x", "p", "main", "o", "r", 1,
+            )
+        body = runner._request.call_args.kwargs["json"]
+        assert "force_deploy" not in body
+
+    def test_idle_timeout_passed_through(self):
+        runner = self._make_runner(poll_resp={
+            "pod_name": "p", "server_url": "", "review_result": {},
+            "deploy_result": None,
+            "idle_timeout_s": 600,
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            result = prepare_remote_review(
+                "https://x", "p", "main", "o", "r", 1,
+                idle_timeout_s=600,
+            )
+        body = runner._request.call_args.kwargs["json"]
+        assert body["idle_timeout_s"] == 600
+        # And it surfaces back in the merged result.
+        assert result["idle_timeout_s"] == 600
+
+    def test_idle_timeout_omitted_by_default(self):
+        runner = self._make_runner(poll_resp={
+            "pod_name": "p", "server_url": "", "review_result": {},
+            "deploy_result": None,
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_remote_review(
+                "https://x", "p", "main", "o", "r", 1,
+            )
+        body = runner._request.call_args.kwargs["json"]
+        assert "idle_timeout_s" not in body
+
     def test_missing_job_id_raises(self):
         runner = self._make_runner(request_resp={"ok": True})  # no job_id
         with patch(
