@@ -271,6 +271,42 @@ All ComfyUI API endpoints are accessible via the `/{name}/comfyui/{path}` proxy 
 
 Deploy auto-stops the instance, installs changed requirements, restarts if it was running, and captures a snapshot.
 
+### PR Review
+
+End-to-end PR review prep: deploy the PR, parse a fenced ` ```comfyrunner ` block from the PR description (manifest spec: [`docs/manifest-spec.md`](../../../docs/manifest-spec.md)), fetch declared workflow URLs into `user/default/workflows/`, and download missing models.
+
+| Command | Description |
+|---------|-------------|
+| `review <pr> --repo owner/name` | Local review on the default install |
+| `review <pr> --repo owner/name --target local:<install>` | Local review on a named install |
+| `review <pr> --repo owner/name --target remote:<pod-name>` | Review on an existing fleet pod (auto-wakes if stopped) |
+| `review <pr> --repo owner/name --target runpod[:<gpu>]` | Spawn an ephemeral RunPod pod tagged ``purpose='pr'``, ``pr_number=<pr>`` |
+| `review ... --workflow <url>` (repeatable) | Add an extra workflow URL (CLI wins over PR-body manifest) |
+| `review ... --model "name=url=directory"` (repeatable) | Add an extra model entry |
+| `review ... --force-purpose` | Allow review against ``purpose='test'`` pods (refused by default) |
+| `review ... --force-deploy` | Skip the idempotent "PR already deployed" check on remote targets |
+| `review ... --idle-stop-after <seconds>` | Update the pod's idle-reaper timeout per-review |
+| `review ... --cleanup` | (runpod target) Terminate the ephemeral pod after review prep |
+| `review ... --allow-arbitrary-urls` | Permit non-allowlisted hosts for workflow / model URLs |
+| `review-cleanup <pr>` | Bulk-terminate ``purpose='pr'`` pods matching ``pr_number=<pr>`` |
+| `review-cleanup <pr> --dry-run` | List matching pods without terminating |
+
+Purpose gating on `remote:` / `runpod:` targets:
+- `purpose='pr'` → silent allow.
+- `purpose='persistent'` (default for `pods create`) → allow with a warning that the dev install state will be deployed-over.
+- `purpose='test'` → refused (HTTP 409) unless `--force-purpose`.
+
+Idempotency: a second `review` of the same PR on a remote pod skips the deploy step (the orchestrator GETs `/<install>/info` and compares the deployed PR + repo). Override with `--force-deploy`.
+
+#### Manifest authoring (pure-local, no station)
+
+| Command | Description |
+|---------|-------------|
+| `review-init <workflow.json> [--workflow-url <url>]` | Read a workflow on disk, pull `node.properties.models`, emit a fenced ``comfyrunner`` block to paste into a PR description |
+| `review-validate <source>` | Lint a manifest. *source* is a file path (`.md` / `.json`), an ``owner/repo#pr`` shorthand, or a GitHub PR URL. Exit 0 on a valid manifest, 1 on any error finding |
+
+`review-validate` checks: HTTPS-only URLs, default URL allowlist (warn-level for non-allowlisted hosts), path-traversal-safe model `name` and `directory`, required fields, and oversized PR bodies.
+
 ### Custom Nodes
 
 | Command | Description |
