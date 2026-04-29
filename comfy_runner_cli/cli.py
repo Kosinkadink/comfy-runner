@@ -1044,6 +1044,113 @@ def cmd_review_cleanup(args: argparse.Namespace) -> None:
             )
 
 
+def cmd_review_init(args: argparse.Namespace) -> None:
+    """Generate a ``comfyrunner`` block from a workflow JSON file.
+
+    Reads ``args.workflow`` (a path on disk), pulls model declarations
+    out of each node's ``properties.models``, and emits a fenced block
+    suitable for pasting into a PR description.
+    """
+    from comfy_runner.review_authoring import generate_block
+
+    workflow_path = Path(args.workflow)
+    workflow_url = getattr(args, "workflow_url", None)
+    try:
+        block = generate_block(workflow_path, workflow_url=workflow_url)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "manifest": block.manifest_dict,
+            "block": block.text,
+            "warnings": list(block.warnings),
+        }, indent=2))
+        return
+
+    n_models = len(block.manifest_dict.get("models", []))
+    console.print(
+        f"[green]✓ Generated comfyrunner block "
+        f"({n_models} model{'s' if n_models != 1 else ''}, "
+        f"{len(block.manifest_dict.get('workflows', []))} workflow URL).[/green]"
+    )
+    console.print(
+        "[dim]Paste the block below into your PR description "
+        "between any two blank lines.[/dim]\n"
+    )
+    print(block.text)
+    if block.warnings:
+        console.print()
+        for w in block.warnings:
+            console.print(f"[yellow]⚠ {w}[/yellow]")
+
+
+def cmd_review_validate(args: argparse.Namespace) -> None:
+    """Lint a manifest source: file path, ``owner/repo#pr``, or PR URL.
+
+    Exit code is 0 if the manifest parsed cleanly with no error
+    findings, 1 otherwise.
+    """
+    from comfy_runner.review_authoring import lint_manifest_source
+
+    github_token = getattr(args, "github_token", None)
+    result = lint_manifest_source(args.source, github_token=github_token)
+
+    if args.json:
+        print(json.dumps({
+            "ok": result.ok,
+            "source": result.source,
+            "found_block": result.found_block,
+            "manifest": (
+                {
+                    "models": [m.to_dict() for m in result.manifest.models],
+                    "workflows": list(result.manifest.workflows),
+                }
+                if result.manifest is not None
+                else None
+            ),
+            "findings": [
+                {
+                    "severity": f.severity,
+                    "message": f.message,
+                    "path": f.path,
+                }
+                for f in result.findings
+            ],
+        }, indent=2))
+        sys.exit(0 if result.ok else 1)
+
+    console.print(f"[bold]Source:[/bold] {result.source}")
+    if result.found_block:
+        if result.manifest is not None:
+            console.print(
+                f"[green]✓ Found comfyrunner block "
+                f"({len(result.manifest.models)} models, "
+                f"{len(result.manifest.workflows)} workflows).[/green]"
+            )
+        else:
+            console.print("[red]✗ Found comfyrunner block but it failed validation.[/red]")
+    else:
+        console.print("[yellow]⚠ No comfyrunner block found.[/yellow]")
+
+    for f in result.findings:
+        if f.severity == "error":
+            tag = "[red]✗[/red]"
+        elif f.severity == "warn":
+            tag = "[yellow]⚠[/yellow]"
+        else:
+            tag = "[dim]ℹ[/dim]"
+        loc = f" [dim]({f.path})[/dim]" if f.path else ""
+        console.print(f"  {tag} {f.message}{loc}")
+
+    sys.exit(0 if result.ok else 1)
+
+
 def _render_review_result(
     review_result: dict, target_label: str, pr: int,
 ) -> None:
@@ -4722,6 +4829,41 @@ def main(argv: list[str] | None = None) -> None:
         help="List matching pods without terminating them.",
     )
     p_review_cleanup.set_defaults(func=cmd_review_cleanup)
+
+    # review-init (generate a comfyrunner block from a workflow JSON)
+    p_review_init = sub.add_parser(
+        "review-init",
+        help="Generate a comfyrunner manifest block from a workflow JSON.",
+    )
+    p_review_init.add_argument(
+        "workflow",
+        help="Path to a workflow JSON file on disk.",
+    )
+    p_review_init.add_argument(
+        "--workflow-url", dest="workflow_url",
+        help="Public HTTPS URL the workflow file will be served from "
+             "(typically a raw.githubusercontent.com URL on the PR's "
+             "branch). If omitted, a placeholder is emitted.",
+    )
+    p_review_init.set_defaults(func=cmd_review_init)
+
+    # review-validate (lint a manifest file or PR)
+    p_review_validate = sub.add_parser(
+        "review-validate",
+        help="Lint a comfyrunner manifest from a file, PR shorthand, or PR URL.",
+    )
+    p_review_validate.add_argument(
+        "source",
+        help="Path to a file (markdown with comfyrunner block, or raw "
+             "manifest JSON), an 'owner/repo#pr' shorthand, or a "
+             "GitHub PR URL.",
+    )
+    p_review_validate.add_argument(
+        "--github-token", dest="github_token",
+        help="GitHub token for fetching PR bodies. Defaults to "
+             "$GITHUB_TOKEN; not required for public repos.",
+    )
+    p_review_validate.set_defaults(func=cmd_review_validate)
 
     # download-model
     p_dlm = sub.add_parser("download-model", help="Download a model by URL to a specific directory")
