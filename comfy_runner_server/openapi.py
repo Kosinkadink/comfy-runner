@@ -1282,8 +1282,20 @@ _ROUTES: list[dict[str, Any]] = [
         "summary": "List all pods",
         "description": (
             "Returns all RunPod pods from config, merged with live status from the RunPod API. "
-            "Includes Tailscale server URLs for pods on the tailnet."
+            "Includes Tailscale server URLs for pods on the tailnet. "
+            "Use the optional ``?purpose=`` query parameter to filter by record purpose "
+            "(``pr``, ``persistent``, or ``test``); records with no explicit purpose are "
+            "treated as ``persistent`` for filtering."
         ),
+        "parameters": [
+            {
+                "name": "purpose",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "string", "enum": ["pr", "persistent", "test"]},
+                "description": "Filter to pods whose record matches this purpose (case-sensitive).",
+            },
+        ],
         "responses": _ok_response("Pod list", {
             "pods": {
                 "type": "array",
@@ -1299,6 +1311,12 @@ _ROUTES: list[dict[str, Any]] = [
                         "cost_per_hr": {"type": "number"},
                         "server_url": {"type": "string"},
                         "comfy_url": {"type": "string"},
+                        "purpose": {"type": "string", "enum": ["pr", "persistent", "test"], "description": "Pod purpose (PR-review pods are subject to the idle reaper)"},
+                        "pr_number": {"type": "integer"},
+                        "last_active_at": {"type": "integer", "description": "Epoch seconds of last activity"},
+                        "idle_timeout_s": {"type": "integer"},
+                        "idle_in_s": {"type": "integer", "description": "Seconds remaining before the idle reaper stops this pod (PR pods only)"},
+                        "status_hint": {"type": "string", "description": "Server-side hint, e.g. 'stopped_idle' when the reaper paused this pod"},
                     },
                 },
             },
@@ -1332,6 +1350,17 @@ _ROUTES: list[dict[str, Any]] = [
                             "gpu_count": {"type": "integer", "default": 1},
                             "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables"},
                             "wait_ready": {"type": "boolean", "default": True, "description": "Wait for the pod's comfy-runner server to be reachable"},
+                            "purpose": {
+                                "type": "string",
+                                "enum": ["pr", "persistent", "test"],
+                                "default": "persistent",
+                                "description": (
+                                    "Recorded purpose tag for the pod. Defaults to ``persistent``. "
+                                    "Use ``pr`` for review pods (also stamped automatically by /pods/launch-pr) "
+                                    "or ``test`` for ephemeral test-runner pods (stamped automatically by the test runner). "
+                                    "Any other value is rejected with HTTP 400."
+                                ),
+                            },
                         },
                     }
                 }
@@ -1377,6 +1406,157 @@ _ROUTES: list[dict[str, Any]] = [
             },
         },
         "responses": _async_response("Deploy started"),
+    },
+    {
+        "path": "/pods/{name}/review",
+        "method": "post",
+        "tags": ["Pods", "Review"],
+        "summary": "Prepare a PR for review on a pod (async)",
+        "description": (
+            "End-to-end PR review preparation on an existing pod. Auto-wakes "
+            "the pod if it is stopped, deploys the requested PR via the pod's "
+            "sidecar, and runs prepare_local_review (manifest + workflows + "
+            "model downloads) server-side. The single returned job_id covers "
+            "the entire flow; its result carries both deploy_result and "
+            "review_result plus pod metadata."
+        ),
+        "parameters": [_POD_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["owner", "repo", "pr"],
+                        "properties": {
+                            "owner": {"type": "string", "description": "GitHub repo owner"},
+                            "repo": {"type": "string", "description": "GitHub repo name"},
+                            "pr": {"type": "integer", "description": "PR number"},
+                            "install": {"type": "string", "default": "main", "description": "Installation name on the pod"},
+                            "github_token": {"type": "string", "description": "GitHub token for fetching PR body (defaults to pod's $GITHUB_TOKEN)"},
+                            "download_token": {"type": "string", "description": "Bearer token for authenticated model downloads"},
+                            "extra_models": {
+                                "type": "array",
+                                "description": "Extra ModelEntry objects to merge into the manifest",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "url": {"type": "string"},
+                                        "directory": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "extra_workflows": {
+                                "type": "array",
+                                "description": "Extra workflow URLs to fetch",
+                                "items": {"type": "string"},
+                            },
+                            "allow_arbitrary_urls": {"type": "boolean", "description": "Allow non-allowlisted workflow URL hosts"},
+                            "skip_provisioning": {"type": "boolean", "description": "Skip model downloads (manifest + workflows only)"},
+                            "title": {"type": "string", "description": "PR title for display in deploy step"},
+                            "launch_args": {"type": "string", "description": "ComfyUI launch arguments for deploy step"},
+                            "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility for deploy step"},
+                            "force_purpose": {"type": "boolean", "description": "Override the refusal to review against pods tagged purpose='test' (e2e test pods)"},
+                            "skip_deploy": {"type": "boolean", "description": "Skip the deploy step (use when the caller has already deployed, e.g. via POST /pods/launch-pr)"},
+                            "force_deploy": {"type": "boolean", "description": "Always deploy even if the pod's installation already has this PR deployed (default is idempotent: skip deploy when current)"},
+                            "idle_timeout_s": {"type": "integer", "description": "Per-review override for the pod's idle timeout (seconds). After review-prep finishes, the pod record is updated so the idle reaper uses the new value."},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Review preparation started"),
+    },
+    {
+        "path": "/reviews/local",
+        "method": "post",
+        "tags": ["Review"],
+        "summary": "Prepare a PR for review on this installation (async)",
+        "description": (
+            "Sidecar-side endpoint that runs prepare_local_review against a "
+            "named installation: fetches the PR's comfyrunner manifest block "
+            "from GitHub, downloads any declared workflow URLs into "
+            "user/default/workflows/, and downloads missing models. The "
+            "deploy step is *not* run here — callers are expected to deploy "
+            "first via POST /<install>/deploy. Returns a job_id; its result "
+            "is the same dict shape as comfy_runner.review.prepare_local_review."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["install", "owner", "repo", "pr"],
+                        "properties": {
+                            "install": {"type": "string", "description": "Installation name (must be a safe identifier)"},
+                            "owner": {"type": "string", "description": "GitHub repo owner"},
+                            "repo": {"type": "string", "description": "GitHub repo name"},
+                            "pr": {"type": "integer", "description": "PR number"},
+                            "github_token": {"type": "string", "description": "GitHub token for fetching PR body"},
+                            "download_token": {"type": "string", "description": "Bearer token for authenticated model downloads"},
+                            "extra_models": {
+                                "type": "array",
+                                "description": "Extra ModelEntry objects to merge into the manifest",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "url": {"type": "string"},
+                                        "directory": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "extra_workflows": {
+                                "type": "array",
+                                "description": "Extra workflow URLs to fetch",
+                                "items": {"type": "string"},
+                            },
+                            "allow_arbitrary_urls": {"type": "boolean", "description": "Allow non-allowlisted workflow URL hosts"},
+                            "skip_provisioning": {"type": "boolean", "description": "Skip model downloads (manifest + workflows only)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Review preparation started"),
+    },
+    {
+        "path": "/reviews/cleanup",
+        "method": "post",
+        "tags": ["Review", "Pods"],
+        "summary": "Terminate ephemeral PR pods for a given PR",
+        "description": (
+            "Walks all pod records and terminates any whose record has "
+            "``purpose == 'pr'`` AND ``pr_number == <pr>``. ``persistent`` "
+            "and ``test`` pods are never touched. Synchronous: returns "
+            "the per-pod termination outcome immediately."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["pr"],
+                        "properties": {
+                            "pr": {"type": "integer", "description": "PR number to clean up"},
+                            "dry_run": {"type": "boolean", "description": "List matches without terminating"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Cleanup complete", {
+            "pr": {"type": "integer"},
+            "dry_run": {"type": "boolean"},
+            "terminated": {"type": "array", "items": {"type": "object"}},
+            "skipped": {"type": "array", "items": {"type": "object"}},
+            "removed_records": {"type": "array", "items": {"type": "string"}},
+            "total_found": {"type": "integer"},
+            "total_terminated": {"type": "integer"},
+        }),
     },
     {
         "path": "/pods/{name}/stop",
@@ -1428,6 +1608,66 @@ _ROUTES: list[dict[str, Any]] = [
     },
 
     {
+        "path": "/pods/launch-pr",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Launch a pod for a PR (async)",
+        "description": (
+            "Atomically create-or-wake a pod for reviewing a GitHub PR and deploy the PR to it. "
+            "The pod is named ``pr-<repo-slug>-<num>`` (or ``pr-<num>`` if no repo is given). "
+            "If a record already exists, an EXITED/STOPPED pod is started; a RUNNING pod is reused; "
+            "a missing pod is recreated. The record is tagged ``purpose='pr'`` and is subject to "
+            "the idle reaper, which stops the pod after ``idle_timeout_s`` seconds (default 600) "
+            "of inactivity. Wake by calling this endpoint, /pods/{name}/start, /pods/{name}/touch, "
+            "or any /pods/{name}/* operation. Returns a job_id."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["pr"],
+                        "properties": {
+                            "pr": {"type": "integer", "description": "GitHub PR number"},
+                            "repo": {"type": "string", "description": "GitHub repo (URL or 'owner/name'), used both to slug the pod name and to pass to deploy"},
+                            "gpu_type": {"type": "string"},
+                            "image": {"type": "string"},
+                            "volume_id": {"type": "string"},
+                            "volume_size_gb": {"type": "integer"},
+                            "datacenter": {"type": "string"},
+                            "cloud_type": {"type": "string", "enum": ["SECURE", "COMMUNITY", "ALL"]},
+                            "gpu_count": {"type": "integer", "default": 1},
+                            "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "install": {"type": "string", "default": "main"},
+                            "title": {"type": "string", "description": "PR title for display"},
+                            "launch_args": {"type": "string"},
+                            "idle_timeout_s": {"type": "integer", "default": 600, "description": "Seconds of inactivity before the idle reaper stops this pod"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("PR launch started"),
+    },
+    {
+        "path": "/pods/{name}/touch",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Reset the idle timer on a pod",
+        "description": (
+            "Mark a pod as active by stamping ``last_active_at = now`` on its record. "
+            "This defers the idle reaper. Use whenever a client expects to keep using "
+            "the pod but does not call any other tracked endpoint."
+        ),
+        "parameters": [_POD_NAME_PARAM],
+        "responses": _ok_response("Activity recorded", {
+            "name": {"type": "string"},
+            "last_active_at": {"type": "integer"},
+            "idle_in_s": {"type": "integer", "nullable": True},
+        }),
+    },
+    {
         "path": "/pods/cleanup",
         "method": "post",
         "tags": ["Pods"],
@@ -1457,6 +1697,11 @@ _ROUTES: list[dict[str, Any]] = [
             "total_terminated": {"type": "integer"},
             "terminated": {"type": "array", "items": {"type": "object"}},
             "skipped": {"type": "array", "items": {"type": "object"}},
+            "removed_records": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Pod names whose registry records were also removed.",
+            },
         }),
     },
 
@@ -1494,6 +1739,25 @@ _ROUTES: list[dict[str, Any]] = [
                             },
                             "timeout": {"type": "integer", "default": 600, "description": "Per-workflow timeout (seconds)"},
                             "formats": {"type": "string", "default": "json,html,markdown"},
+                            "max_runtime_s": {
+                                "type": "integer",
+                                "description": (
+                                    "Suite-level wall-clock budget. Overrides the suite.json value "
+                                    "for this run. When exceeded the watchdog aborts the run, calls "
+                                    "ComfyUI's POST /interrupt, writes a synthetic ``overrun`` "
+                                    "failure row, and dispatches ``on_overrun``."
+                                ),
+                            },
+                            "on_overrun": {
+                                "type": "string",
+                                "enum": ["none", "stop", "terminate"],
+                                "description": (
+                                    "Pod action to take when the watchdog aborts the run. "
+                                    "Defaults to ``terminate`` for runpod targets, ``stop`` for "
+                                    "remote targets, and ``none`` for local targets. "
+                                    "``stop`` falls back to ``terminate`` for untracked pods."
+                                ),
+                            },
                         },
                     }
                 }
@@ -1539,6 +1803,24 @@ _ROUTES: list[dict[str, Any]] = [
                             "timeout": {"type": "integer", "default": 600},
                             "max_workers": {"type": "integer", "description": "Max parallel workers (default: min(targets, 4))"},
                             "formats": {"type": "string", "default": "json,html,markdown"},
+                            "max_runtime_s": {
+                                "type": "integer",
+                                "description": (
+                                    "Fleet-level wall-clock budget (seconds). Overrides the "
+                                    "suite.json value. When exceeded, the watchdog cancels the "
+                                    "fleet, dispatches ``on_overrun`` per target, and the run is "
+                                    "marked ``timed_out``."
+                                ),
+                            },
+                            "on_overrun": {
+                                "type": "string",
+                                "enum": ["none", "stop", "terminate"],
+                                "description": (
+                                    "Pod action to take per target when the fleet watchdog aborts. "
+                                    "Defaults per target kind: ``terminate`` for runpod, ``stop`` "
+                                    "for remote, ``none`` for local."
+                                ),
+                            },
                         },
                     }
                 }
@@ -1588,11 +1870,27 @@ _ROUTES: list[dict[str, Any]] = [
             "id": {"type": "string"},
             "kind": {"type": "string"},
             "suite": {"type": "string"},
-            "status": {"type": "string"},
+            "status": {
+                "type": "string",
+                "description": (
+                    "Run state. ``timed_out`` indicates the watchdog aborted the run "
+                    "because ``max_runtime_s`` was exceeded."
+                ),
+            },
             "targets": {"type": "array", "items": {"type": "object"}},
             "output": {"type": "array", "items": {"type": "string"}},
             "result": {"type": "object", "nullable": True},
-            "summary": {"type": "object", "nullable": True},
+            "summary": {
+                "type": "object",
+                "nullable": True,
+                "description": (
+                    "Aggregate run summary. Includes ``timed_out`` (bool) and "
+                    "``aborted_reason`` (e.g. ``\"overrun\"``) when the watchdog fired, "
+                    "plus ``on_overrun_action(s)`` describing the pod cleanup that "
+                    "followed."
+                ),
+            },
+            "timed_out": {"type": "boolean"},
         }),
     },
     {

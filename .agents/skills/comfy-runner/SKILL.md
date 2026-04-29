@@ -302,6 +302,42 @@ All ComfyUI API endpoints are accessible via the `/{name}/comfyui/{path}` proxy 
 
 Deploy auto-stops the instance, installs changed requirements, restarts if it was running, and captures a snapshot.
 
+### PR Review
+
+End-to-end PR review prep: deploy the PR, parse a fenced ` ```comfyrunner ` block from the PR description (manifest spec: [`docs/manifest-spec.md`](../../../docs/manifest-spec.md)), fetch declared workflow URLs into `user/default/workflows/`, and download missing models.
+
+| Command | Description |
+|---------|-------------|
+| `review <pr> --repo owner/name` | Local review on the default install |
+| `review <pr> --repo owner/name --target local:<install>` | Local review on a named install |
+| `review <pr> --repo owner/name --target remote:<pod-name>` | Review on an existing fleet pod (auto-wakes if stopped) |
+| `review <pr> --repo owner/name --target runpod[:<gpu>]` | Spawn an ephemeral RunPod pod tagged ``purpose='pr'``, ``pr_number=<pr>`` |
+| `review ... --workflow <url>` (repeatable) | Add an extra workflow URL (CLI wins over PR-body manifest) |
+| `review ... --model "name=url=directory"` (repeatable) | Add an extra model entry |
+| `review ... --force-purpose` | Allow review against ``purpose='test'`` pods (refused by default) |
+| `review ... --force-deploy` | Skip the idempotent "PR already deployed" check on remote targets |
+| `review ... --idle-stop-after <seconds>` | Update the pod's idle-reaper timeout per-review |
+| `review ... --cleanup` | (runpod target) Terminate the ephemeral pod after review prep |
+| `review ... --allow-arbitrary-urls` | Permit non-allowlisted hosts for workflow / model URLs |
+| `review-cleanup <pr>` | Bulk-terminate ``purpose='pr'`` pods matching ``pr_number=<pr>`` |
+| `review-cleanup <pr> --dry-run` | List matching pods without terminating |
+
+Purpose gating on `remote:` / `runpod:` targets:
+- `purpose='pr'` → silent allow.
+- `purpose='persistent'` (default for `pods create`) → allow with a warning that the dev install state will be deployed-over.
+- `purpose='test'` → refused (HTTP 409) unless `--force-purpose`.
+
+Idempotency: a second `review` of the same PR on a remote pod skips the deploy step (the orchestrator GETs `/<install>/info` and compares the deployed PR + repo). Override with `--force-deploy`.
+
+#### Manifest authoring (pure-local, no station)
+
+| Command | Description |
+|---------|-------------|
+| `review-init <workflow.json> [--workflow-url <url>]` | Read a workflow on disk, pull `node.properties.models`, emit a fenced ``comfyrunner`` block to paste into a PR description |
+| `review-validate <source>` | Lint a manifest. *source* is a file path (`.md` / `.json`), an ``owner/repo#pr`` shorthand, or a GitHub PR URL. Exit 0 on a valid manifest, 1 on any error finding |
+
+`review-validate` checks: HTTPS-only URLs, default URL allowlist (warn-level for non-allowlisted hosts), path-traversal-safe model `name` and `directory`, required fields, and oversized PR bodies.
+
 ### Custom Nodes
 
 | Command | Description |
@@ -357,11 +393,14 @@ Supports `HF_TOKEN` and `MODELSCOPE_TOKEN` env vars for private models.
 | `test run <suite> --target <url>` | Run a test suite against a target |
 | `test run <suite> --runpod --gpu "NVIDIA L40S"` | Run on ephemeral RunPod pod |
 | `test fleet <suite> -t <spec> [-t <spec> ...]` | Fleet test (parallel) |
+| `test run/fleet ... --max-runtime <sec> --on-overrun {none,stop,terminate}` | Suite-level watchdog (overrides ``suite.json`` ``max_runtime_s``) |
 | `test list --dir ./test-suites` | List available test suites |
 | `test baseline <suite> <run_dir> --approve-all` | Approve test outputs as baselines |
 | `test report <run_dir>` | Regenerate reports from a previous run |
 
 Target specs: `local:<url>`, `remote:<server_url>`, `runpod:<gpu_type>`.
+
+Watchdog defaults per target kind: `runpod` → `terminate`, `remote` → `stop`, `local` → `none`. Non-zero CLI exit on `failed > 0` or `timed_out`.
 
 ### Hosted GPU (RunPod)
 
@@ -387,15 +426,20 @@ Requires `station.json` in the working directory or a parent (from [comfy-runner
 |---------|-------------|
 | `station info` | Show station config and server connectivity |
 | `station dashboard` | Open fleet dashboard in browser |
-| `station pods` | List fleet pods |
-| `station pods create <name> [--gpu TYPE]` | Create a pod |
+| `station pods` | List fleet pods (filter via ``GET /pods?purpose=`` server-side) |
+| `station pods create <name> [--gpu TYPE]` | Create a pod (defaults to ``purpose='persistent'``) |
 | `station pods deploy <name> --pr NUM` | Deploy to a pod |
+| `station pods launch-pr <num> --repo OWNER/NAME` | Create-or-wake + deploy a PR; tags ``purpose='pr'`` and arms idle reaper |
+| `station pods touch <name>` | Reset the idle timer on a PR pod (defers the reaper) |
 | `station pods stop/start/terminate <name>` | Pod lifecycle |
 | `station tests run <suite> -t remote:<pod>` | Run tests via central server |
+| `station tests run/fleet ... --max-runtime <sec> --on-overrun {none,stop,terminate}` | Suite watchdog (server-side enforcement) |
 | `station tests fleet <suite> -t ... -t ...` | Fleet test |
 | `station tests list` | List recent test runs |
 | `station tests status/report <id>` | Check status / get report |
 | `station jobs` | List active jobs |
+
+Pod purpose tags (`pr` / `persistent` / `test`) are recorded by the server. PR-review pods auto-stop after `idle_timeout_s` seconds (default 600) of inactivity; ephemeral test pods are tagged `purpose='test'` and their records are removed on auto-terminate.
 
 ### HTTP Server
 

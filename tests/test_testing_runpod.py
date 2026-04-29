@@ -104,13 +104,15 @@ class TestRunOnRunpod:
     @patch("comfy_runner.testing.runpod._wait_for_server")
     @patch("comfy_runner.testing.runpod.get_pod_record", return_value=None)
     @patch("comfy_runner.testing.runpod.set_pod_record")
+    @patch("comfy_runner.testing.runpod.remove_pod_record")
     @patch("comfy_runner.testing.runpod.run_suite")
     @patch("comfy_runner.testing.runpod.build_report")
     @patch("comfy_runner.testing.runpod.write_report", return_value={})
     @patch("comfy_runner.testing.runpod.load_suite")
     def test_full_lifecycle(
         self, mock_load, mock_write, mock_build, mock_run,
-        mock_set_rec, mock_get_rec, mock_wait, mock_runner_cls, mock_prov_cls,
+        mock_remove_rec, mock_set_rec, mock_get_rec, mock_wait,
+        mock_runner_cls, mock_prov_cls,
         tmp_path,
     ):
         from comfy_runner.testing.runpod import run_on_runpod
@@ -145,6 +147,18 @@ class TestRunOnRunpod:
         assert result.test_result["total"] == 2
         assert result.terminated is True
         mock_prov.terminate_pod.assert_called_once_with("pod123")
+        # Test pod records must be tagged purpose="test" so /pods filtering
+        # can distinguish them from persistent and PR pods.
+        record_args = mock_set_rec.call_args
+        assert record_args is not None
+        recorded = record_args.args[2]
+        assert recorded["purpose"] == "test"
+        # ... and the record must be removed on auto-terminate so the
+        # registry doesn't keep stale test-pod entries forever.
+        mock_remove_rec.assert_called_once()
+        rm_args = mock_remove_rec.call_args.args
+        assert rm_args[0] == "runpod"
+        assert rm_args[1] == record_args.args[1]
 
     @patch("comfy_runner.testing.runpod.RunPodProvider")
     @patch("comfy_runner.testing.runpod.RemoteRunner")

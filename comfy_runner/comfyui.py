@@ -69,9 +69,44 @@ def _comfyui_dir(install_path: str | Path) -> Path:
     return d
 
 
+def _check_clean_tree(
+    repo: str,
+    send_output: Callable[[str], None] | None = None,
+) -> None:
+    """Raise a helpful error if the working tree has uncommitted changes.
+
+    Without this check, ``git checkout`` aborts with a wall of "would be
+    overwritten" output. We catch that earlier and tell the user exactly
+    what to do.
+    """
+    import subprocess as _sp
+    from .git_utils import _NO_WINDOW
+    try:
+        result = _sp.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo, capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW,
+        )
+    except Exception:
+        return  # if status itself fails, fall through to the real checkout error
+    dirty = (result.stdout or "").strip()
+    if not dirty:
+        return
+    files = [line[3:] for line in dirty.splitlines() if line[3:]]
+    preview = "\n  ".join(files[:8])
+    extra = "" if len(files) <= 8 else f"\n  ... and {len(files) - 8} more"
+    raise RuntimeError(
+        "Refusing to deploy: working tree has uncommitted changes:\n  "
+        + preview + extra + "\n\n"
+        + "Commit them, stash them with 'git stash', or restore the files "
+        + "before re-running deploy."
+    )
+
+
 def deploy_pr(
     install_path: str | Path,
     pr_number: int,
+    repo_url: str | None = None,
     send_output: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Fetch and checkout a GitHub PR.
@@ -79,20 +114,60 @@ def deploy_pr(
     Fetches into FETCH_HEAD then creates/updates the local branch with -B
     to avoid "refusing to fetch into checked-out branch" errors on re-deploy.
 
+    If *repo_url* is provided and differs from the clone's ``origin``,
+    a temporary ``deploy-pr`` remote is added and the PR is fetched from
+    there. This lets review work for PRs opened on a fork without
+    permanently changing the install's origin.
+
     Returns dict with: ref, previous_head, new_head, changed_files.
     """
     repo = str(_comfyui_dir(install_path))
     ref = f"pr-{pr_number}"
     previous_head = read_git_head(repo)
 
+    _check_clean_tree(repo, send_output)
+
+    remote = "origin"
+    if repo_url:
+        # Normalise for comparison (strip .git suffix, lowercase, trailing slash)
+        import subprocess as _sp
+        from .git_utils import _NO_WINDOW
+        try:
+            origin_result = _sp.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=repo, capture_output=True, text=True, timeout=10,
+                creationflags=_NO_WINDOW,
+            )
+            origin_url = origin_result.stdout.strip()
+        except Exception:
+            origin_url = ""
+
+        def _norm(u: str) -> str:
+            return u.rstrip("/").removesuffix(".git").lower()
+
+        if _norm(repo_url) != _norm(origin_url):
+            remote = "deploy-pr"
+            if send_output:
+                send_output(f"Adding remote '{remote}' -> {repo_url}\n")
+            _sp.run(["git", "remote", "remove", remote], cwd=repo,
+                    capture_output=True, creationflags=_NO_WINDOW)  # ignore if absent
+            _sp.run(["git", "remote", "add", remote, repo_url], cwd=repo,
+                    capture_output=True, creationflags=_NO_WINDOW)
+
     if send_output:
-        send_output(f"Fetching PR #{pr_number}...\n")
+        send_output(
+            f"Fetching PR #{pr_number}"
+            + (f" from {remote}" if remote != "origin" else "")
+            + "...\n"
+        )
 
     # Fetch to FETCH_HEAD (not a named branch) to avoid conflicts with
     # the currently checked-out branch on re-deploys of the same PR.
-    rc = git_fetch(repo, ["origin", f"pull/{pr_number}/head"], send_output)
+    rc = git_fetch(repo, [remote, f"pull/{pr_number}/head"], send_output)
     if rc != 0:
-        raise RuntimeError(f"Failed to fetch PR #{pr_number} (exit code {rc})")
+        raise RuntimeError(
+            f"Failed to fetch PR #{pr_number} from {remote} (exit code {rc})"
+        )
 
     if send_output:
         send_output(f"Checking out {ref}...\n")
@@ -133,6 +208,8 @@ def deploy_ref(
     """
     repo = str(_comfyui_dir(install_path))
     previous_head = read_git_head(repo)
+
+    _check_clean_tree(repo, send_output)
 
     remote = "origin"
     if repo_url and fetch_first:

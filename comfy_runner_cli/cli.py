@@ -478,6 +478,21 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     name = args.name
     out = None if args.json else _output
 
+    # Normalize --repo into a full HTTPS URL. Accepts owner/name shorthand
+    # or any of the URL forms _parse_repo handles.
+    repo_url = getattr(args, "repo_url", None)
+    if repo_url and "://" not in repo_url:
+        try:
+            owner, repo_name = _parse_repo(repo_url)
+            repo_url = f"https://github.com/{owner}/{repo_name}"
+            args.repo_url = repo_url
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     try:
         record = get_installation(name)
         if not record:
@@ -506,6 +521,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             reset=getattr(args, "reset", False),
             latest=getattr(args, "latest", False),
             pull=getattr(args, "pull", False),
+            repo_url=getattr(args, "repo_url", None),
             send_output=out,
         )
 
@@ -576,6 +592,611 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             sys.exit(1)
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Review (PR-review preparation)
+# ---------------------------------------------------------------------------
+
+def _parse_review_target(spec: str | None) -> dict:
+    """Parse a review target spec into ``{"kind": ..., ...}``.
+
+    Formats (review-specific — distinct from station-test target specs):
+
+    * ``local``                  — local installation named ``main``
+    * ``local:<install-name>``   — named local installation
+    * ``remote:<pod-name>``      — existing pod via the central server
+    * ``runpod`` / ``runpod:<gpu>`` — fresh PR pod via the central server
+
+    ``None`` and the empty string both default to ``local``.
+    """
+    if spec is None or spec == "":
+        return {"kind": "local", "install_name": "main"}
+    if spec == "local":
+        return {"kind": "local", "install_name": "main"}
+    if spec.startswith("local:"):
+        name = spec[len("local:") :].strip()
+        if not name:
+            raise ValueError("local: target requires an installation name")
+        return {"kind": "local", "install_name": name}
+    if spec.startswith("remote:"):
+        pod = spec[len("remote:") :].strip()
+        if not pod:
+            raise ValueError("remote: target requires a pod name")
+        return {"kind": "remote", "pod_name": pod}
+    if spec == "runpod":
+        return {"kind": "runpod", "gpu_type": None}
+    if spec.startswith("runpod:"):
+        gpu = spec[len("runpod:") :].strip()
+        return {"kind": "runpod", "gpu_type": gpu or None}
+    raise ValueError(
+        f"Unknown target spec: {spec!r}. "
+        "Use local, local:<install>, remote:<pod>, or runpod[:<gpu>]."
+    )
+
+
+def _parse_repo(repo: str) -> tuple[str, str]:
+    """Parse ``owner/name`` or full GitHub URL into ``(owner, name)``."""
+    if not repo:
+        raise ValueError("--repo is required (e.g. comfy-org/ComfyUI)")
+    r = repo.strip()
+    if "://" in r:
+        r = r.split("://", 1)[1]
+    if r.endswith(".git"):
+        r = r[: -len(".git")]
+    if r.startswith("github.com/"):
+        r = r[len("github.com/") :]
+    parts = [p for p in r.split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(
+            f"Could not parse --repo {repo!r}; expected 'owner/name' "
+            "or a full GitHub URL"
+        )
+    return parts[-2], parts[-1]
+
+
+def _parse_model_flag(spec: str) -> dict[str, str]:
+    """Parse a ``--model NAME=URL=DIRECTORY`` CLI flag.
+
+    Splits the *first* ``=`` for name and the *last* ``=`` for directory
+    so URLs containing ``=`` (HuggingFace query strings, signed S3 URLs)
+    survive intact in the middle.
+    """
+    name, sep, rest = spec.partition("=")
+    if not sep:
+        raise ValueError(
+            f"--model must be 'name=url=directory' (got {spec!r})"
+        )
+    url, sep, directory = rest.rpartition("=")
+    if not sep:
+        raise ValueError(
+            f"--model must be 'name=url=directory' (got {spec!r})"
+        )
+    name, url, directory = name.strip(), url.strip(), directory.strip()
+    if not (name and url and directory):
+        raise ValueError(f"--model fields cannot be empty: {spec!r}")
+    return {"name": name, "url": url, "directory": directory}
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """Prepare a PR for review on the chosen target.
+
+    For ``local`` targets: deploy the PR into a named installation,
+    fetch the PR's ``comfyrunner`` manifest block from GitHub, fetch
+    any declared workflow URLs into ``user/default/workflows/``, and
+    download missing models.
+
+    Remote and ephemeral runpod targets land in subsequent PRs.
+    """
+    out = None if args.json else _output
+
+    try:
+        owner, repo_name = _parse_repo(args.repo)
+        target = _parse_review_target(getattr(args, "target", None))
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    pr = args.pr
+
+    extra_models: list = []
+    for spec in (getattr(args, "model", None) or []):
+        try:
+            extra_models.append(_parse_model_flag(spec))
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+    extra_workflows = list(getattr(args, "workflow", None) or [])
+
+    from comfy_runner.manifest import ModelEntry
+    extra_model_entries = [ModelEntry.from_dict(m) for m in extra_models]
+
+    if target["kind"] == "remote":
+        _cmd_review_remote(
+            args, target, owner, repo_name, pr,
+            extra_model_entries, extra_workflows, out,
+        )
+        return
+
+    if target["kind"] == "runpod":
+        _cmd_review_runpod(
+            args, target, owner, repo_name, pr,
+            extra_model_entries, extra_workflows, out,
+        )
+        return
+
+    # ── local target ─────────────────────────────────────────────────────
+    install_name = target["install_name"]
+    target_label = f"local:{install_name}"
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label}...\n"
+        )
+
+    # --- Step 1: deploy the PR onto the local installation. -------------
+    deploy_args = argparse.Namespace(
+        name=install_name,
+        pr=pr,
+        branch=None,
+        tag=None,
+        commit=None,
+        reset=False,
+        latest=False,
+        pull=False,
+        repo_url=f"https://github.com/{owner}/{repo_name}",
+        json=False,  # always stream so the user sees progress
+    )
+    # ``cmd_deploy`` calls ``sys.exit(1)`` on failure; let it propagate.
+    if out:
+        out(f"\n--- Deploying PR #{pr} to '{install_name}' ---\n")
+    cmd_deploy(deploy_args)
+
+    # --- Step 2: manifest fetch + workflow fetch + model provision. -----
+    from comfy_runner.config import get_installation
+    from comfy_runner.review import prepare_local_review
+
+    record = get_installation(install_name)
+    if not record:
+        # Should not happen — cmd_deploy would have errored — but guard.
+        msg = f"Installation '{install_name}' missing after deploy"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]Error: {msg}[/red]")
+        sys.exit(1)
+    install_path = record["path"]
+
+    if out:
+        out(f"\n--- Resolving manifest for PR #{pr} ---\n")
+
+    review_result = prepare_local_review(
+        install_path, owner, repo_name, pr,
+        github_token=getattr(args, "github_token", None),
+        download_token=getattr(args, "token", "") or "",
+        extra_models=extra_model_entries,
+        extra_workflows=extra_workflows,
+        allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+        skip_provisioning=getattr(args, "no_provision_models", False),
+        send_output=out,
+    )
+
+    # --- Step 3: render. ------------------------------------------------
+    review_result["target"] = target_label
+    review_result["install_path"] = install_path
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
+    console.print(f"  [dim]Start ComfyUI: comfy_runner.py {install_name} start[/dim]")
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def _cmd_review_remote(
+    args: argparse.Namespace,
+    target: dict,
+    owner: str,
+    repo_name: str,
+    pr: int,
+    extra_model_entries: list,
+    extra_workflows: list[str],
+    out,
+) -> None:
+    """``cmd_review`` branch for ``--target remote:<pod-name>``."""
+    pod_name = target["pod_name"]
+    install_name = getattr(args, "install", None) or "main"
+    target_label = f"remote:{pod_name}"
+
+    try:
+        server = _station_server(args)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label} via {server}...\n"
+        )
+
+    from comfy_runner.review import prepare_remote_review
+    try:
+        review_result = prepare_remote_review(
+            server, pod_name, install_name,
+            owner, repo_name, pr,
+            github_token=getattr(args, "github_token", None),
+            download_token=getattr(args, "token", "") or "",
+            extra_models=extra_model_entries,
+            extra_workflows=extra_workflows,
+            allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+            skip_provisioning=getattr(args, "no_provision_models", False),
+            force_purpose=getattr(args, "force_purpose", False),
+            force_deploy=getattr(args, "force_deploy", False),
+            idle_timeout_s=getattr(args, "idle_stop_after", None),
+            send_output=out,
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    review_result["target"] = target_label
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
+    server_url = review_result.get("server_url") or ""
+    if server_url:
+        comfy_url = server_url.rsplit(":", 1)[0] + ":8188"
+        console.print(f"  [dim]Pod ComfyUI: {comfy_url}[/dim]")
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def _cmd_review_runpod(
+    args: argparse.Namespace,
+    target: dict,
+    owner: str,
+    repo_name: str,
+    pr: int,
+    extra_model_entries: list,
+    extra_workflows: list[str],
+    out,
+) -> None:
+    """``cmd_review`` branch for ``--target runpod[:<gpu>]``."""
+    gpu_type = target.get("gpu_type")
+    install_name = getattr(args, "install", None) or "main"
+    target_label = f"runpod:{gpu_type}" if gpu_type else "runpod"
+
+    try:
+        server = _station_server(args)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label} via {server}...\n"
+        )
+
+    from comfy_runner.review import prepare_runpod_review
+    try:
+        review_result = prepare_runpod_review(
+            server, owner, repo_name, pr,
+            install_name=install_name,
+            gpu_type=gpu_type,
+            idle_timeout_s=getattr(args, "idle_stop_after", None),
+            github_token=getattr(args, "github_token", None),
+            download_token=getattr(args, "token", "") or "",
+            extra_models=extra_model_entries,
+            extra_workflows=extra_workflows,
+            allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+            skip_provisioning=getattr(args, "no_provision_models", False),
+            send_output=out,
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    review_result["target"] = target_label
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    # ── Optional cleanup (terminate the pod after review prep). ──────
+    if getattr(args, "cleanup", False):
+        pod_name = review_result.get("pod_name", "")
+        if pod_name:
+            if out:
+                out(f"\n--- Cleaning up runpod pod '{pod_name}' ---\n")
+            from comfy_runner.review import cleanup_runpod_review
+            try:
+                cleanup_runpod_review(server, pr)
+                review_result["cleaned_up"] = True
+            except RuntimeError as e:
+                review_result["cleaned_up"] = False
+                review_result["cleanup_error"] = str(e)
+                if out:
+                    out(f"⚠ Cleanup failed: {e}\n")
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
+    server_url = review_result.get("server_url") or ""
+    if server_url:
+        comfy_url = server_url.rsplit(":", 1)[0] + ":8188"
+        console.print(f"  [dim]Pod ComfyUI: {comfy_url}[/dim]")
+    if review_result.get("created_new"):
+        idle = review_result.get("idle_timeout_s")
+        if idle:
+            console.print(
+                f"  [dim]Pod will idle-stop after {idle}s of inactivity. "
+                f"Use 'review-cleanup {pr}' to terminate sooner.[/dim]"
+            )
+    if review_result.get("cleaned_up"):
+        console.print("  [yellow]Pod terminated (--cleanup)[/yellow]")
+    elif review_result.get("cleanup_error"):
+        console.print(
+            f"  [red]Cleanup failed: {review_result['cleanup_error']}[/red]"
+        )
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def cmd_review_cleanup(args: argparse.Namespace) -> None:
+    """Terminate ephemeral PR pods (``purpose='pr'``) for a given PR.
+
+    Targets pods whose record has ``purpose == "pr"`` AND
+    ``pr_number == <pr>``. Does not touch ``persistent`` or ``test``
+    pods.
+    """
+    out = None if args.json else _output
+
+    try:
+        server = _station_server(args)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    from comfy_runner.review import cleanup_runpod_review
+    try:
+        result = cleanup_runpod_review(
+            server, args.pr, dry_run=getattr(args, "dry_run", False),
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    pr = result.get("pr", args.pr)
+    total = result.get("total_found", 0)
+    terminated = result.get("terminated", []) or []
+    skipped = result.get("skipped", []) or []
+    if total == 0:
+        console.print(f"[dim]No PR-#{pr} pods found.[/dim]")
+        return
+    if result.get("dry_run"):
+        console.print(
+            f"[yellow]Dry run — would terminate {total} pod(s):[/yellow]"
+        )
+        for s in skipped:
+            console.print(f"  • {s.get('name', '?')}")
+        return
+    console.print(
+        f"[green]✓ Terminated {len(terminated)} of {total} "
+        f"PR-#{pr} pod(s)[/green]"
+    )
+    for t in terminated:
+        console.print(f"  [dim]{t.get('name', '?')} ({t.get('id', '?')})[/dim]")
+    if skipped:
+        console.print(f"[yellow]Skipped {len(skipped)}:[/yellow]")
+        for s in skipped:
+            console.print(
+                f"  [yellow]{s.get('name', '?')}: "
+                f"{s.get('error', s.get('reason', '?'))}[/yellow]"
+            )
+
+
+def cmd_review_init(args: argparse.Namespace) -> None:
+    """Generate a ``comfyrunner`` block from a workflow JSON file.
+
+    Reads ``args.workflow`` (a path on disk), pulls model declarations
+    out of each node's ``properties.models``, and emits a fenced block
+    suitable for pasting into a PR description.
+    """
+    from comfy_runner.review_authoring import generate_block
+
+    workflow_path = Path(args.workflow)
+    workflow_url = getattr(args, "workflow_url", None)
+    try:
+        block = generate_block(workflow_path, workflow_url=workflow_url)
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "manifest": block.manifest_dict,
+            "block": block.text,
+            "warnings": list(block.warnings),
+        }, indent=2))
+        return
+
+    n_models = len(block.manifest_dict.get("models", []))
+    console.print(
+        f"[green]✓ Generated comfyrunner block "
+        f"({n_models} model{'s' if n_models != 1 else ''}, "
+        f"{len(block.manifest_dict.get('workflows', []))} workflow URL).[/green]"
+    )
+    console.print(
+        "[dim]Paste the block below into your PR description "
+        "between any two blank lines.[/dim]\n"
+    )
+    print(block.text)
+    if block.warnings:
+        console.print()
+        for w in block.warnings:
+            console.print(f"[yellow]⚠ {w}[/yellow]")
+
+
+def cmd_review_validate(args: argparse.Namespace) -> None:
+    """Lint a manifest source: file path, ``owner/repo#pr``, or PR URL.
+
+    Exit code is 0 if the manifest parsed cleanly with no error
+    findings, 1 otherwise.
+    """
+    from comfy_runner.review_authoring import lint_manifest_source
+
+    github_token = getattr(args, "github_token", None)
+    result = lint_manifest_source(args.source, github_token=github_token)
+
+    if args.json:
+        print(json.dumps({
+            "ok": result.ok,
+            "source": result.source,
+            "found_block": result.found_block,
+            "manifest": (
+                {
+                    "models": [m.to_dict() for m in result.manifest.models],
+                    "workflows": list(result.manifest.workflows),
+                }
+                if result.manifest is not None
+                else None
+            ),
+            "findings": [
+                {
+                    "severity": f.severity,
+                    "message": f.message,
+                    "path": f.path,
+                }
+                for f in result.findings
+            ],
+        }, indent=2))
+        sys.exit(0 if result.ok else 1)
+
+    console.print(f"[bold]Source:[/bold] {result.source}")
+    if result.found_block:
+        if result.manifest is not None:
+            console.print(
+                f"[green]✓ Found comfyrunner block "
+                f"({len(result.manifest.models)} models, "
+                f"{len(result.manifest.workflows)} workflows).[/green]"
+            )
+        else:
+            console.print("[red]✗ Found comfyrunner block but it failed validation.[/red]")
+    else:
+        console.print("[yellow]⚠ No comfyrunner block found.[/yellow]")
+
+    for f in result.findings:
+        if f.severity == "error":
+            tag = "[red]✗[/red]"
+        elif f.severity == "warn":
+            tag = "[yellow]⚠[/yellow]"
+        else:
+            tag = "[dim]ℹ[/dim]"
+        loc = f" [dim]({f.path})[/dim]" if f.path else ""
+        console.print(f"  {tag} {f.message}{loc}")
+
+    sys.exit(0 if result.ok else 1)
+
+
+def _render_review_result(
+    review_result: dict, target_label: str, pr: int,
+) -> None:
+    """Render the human-readable summary common to local and remote review."""
+    console.print()
+    console.print(f"[green]✓ PR #{pr} ready on {target_label}[/green]")
+    if review_result.get("install_path"):
+        console.print(f"  Install: {review_result['install_path']}")
+    if review_result.get("pod_name"):
+        purpose = review_result.get("pod_purpose")
+        purpose_str = f" [{purpose}]" if purpose else ""
+        console.print(f"  Pod: {review_result['pod_name']}{purpose_str}")
+    if review_result.get("server_url"):
+        console.print(f"  Server: {review_result['server_url']}")
+    if review_result.get("workflows"):
+        console.print(
+            f"  Workflows ({len(review_result['workflows'])}):"
+        )
+        for wf in review_result["workflows"]:
+            console.print(f"    [dim]{wf}[/dim]")
+    if review_result.get("downloaded"):
+        console.print(
+            f"  Models downloaded ({len(review_result['downloaded'])}):"
+        )
+        for m in review_result["downloaded"]:
+            console.print(f"    [dim]{m}[/dim]")
+    if review_result.get("skipped"):
+        console.print(
+            f"  Models already present ({len(review_result['skipped'])})"
+        )
+    if review_result.get("failed"):
+        console.print(
+            f"  [red]Models failed ({len(review_result['failed'])}):[/red]"
+        )
+        for m in review_result["failed"]:
+            console.print(f"    [red]{m}[/red]")
+    if review_result.get("failures"):
+        console.print(
+            f"  [yellow]Workflow fetch failures "
+            f"({len(review_result['failures'])}):[/yellow]"
+        )
+        for f in review_result["failures"]:
+            console.print(
+                f"    [yellow]{f.get('url', '?')}: "
+                f"{f.get('error', '?')}[/yellow]"
+            )
 
 
 def cmd_tunnel(args: argparse.Namespace) -> None:
@@ -1839,12 +2460,26 @@ def _test_run(args: argparse.Namespace) -> None:
     out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / _run_id()
     send_output = None if args.json else (lambda t: console.print(t, end=""))
 
+    # Suite-level watchdog: --max-runtime overrides suite.json.
+    from comfy_runner.testing.client import watchdog as _watchdog
+    budget = getattr(args, "max_runtime", None)
+    if budget is None and isinstance(suite.max_runtime_s, int):
+        budget = suite.max_runtime_s
+
+    def _on_abort() -> None:
+        try:
+            client.interrupt()
+        except Exception:
+            pass
+
     try:
-        suite_run = run_suite(
-            client, suite, out_dir,
-            timeout=args.timeout,
-            send_output=send_output,
-        )
+        with _watchdog(budget, on_abort=_on_abort) as cancelled:
+            suite_run = run_suite(
+                client, suite, out_dir,
+                timeout=args.timeout,
+                send_output=send_output,
+                cancelled=cancelled,
+            )
     except Exception as e:
         if args.json:
             print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -1866,11 +2501,20 @@ def _test_run(args: argparse.Namespace) -> None:
         for fmt, path in written.items():
             console.print(f"  [dim]{fmt}: {path}[/dim]")
 
+    # Non-zero exit when any test failed or the watchdog aborted.
+    if report.failed > 0 or report.timed_out:
+        sys.exit(1)
+
 
 def _test_run_runpod(args: argparse.Namespace) -> None:
     """Run tests on an ephemeral RunPod pod (provision → deploy → test → teardown)."""
     from comfy_runner.testing.runpod import RunPodTestConfig, run_on_runpod
 
+    on_overrun = getattr(args, "on_overrun", None)
+    # Default ``terminate`` for runpod targets — the same default the
+    # server applies for kind=="runpod".
+    if on_overrun is None:
+        on_overrun = "terminate"
     config = RunPodTestConfig(
         suite_path=args.suite,
         gpu_type=getattr(args, "gpu", None),
@@ -1885,6 +2529,8 @@ def _test_run_runpod(args: argparse.Namespace) -> None:
         formats=args.format,
         terminate=not getattr(args, "no_terminate", False),
         install_name=getattr(args, "install_name", None) or "main",
+        max_runtime_s=getattr(args, "max_runtime", None),
+        on_overrun=on_overrun,
     )
 
     send_output = None if args.json else (lambda t: console.print(t, end=""))
@@ -1898,13 +2544,18 @@ def _test_run_runpod(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
+    failed = (result.test_result or {}).get("failed", 0) if result.test_result else 0
+    nonzero = bool(result.error or result.timed_out or (failed > 0))
+
     if args.json:
         output: dict[str, object] = {
-            "ok": result.error is None,
+            "ok": not nonzero,
             "pod_id": result.pod_id,
             "pod_name": result.pod_name,
             "server_url": result.server_url,
             "terminated": result.terminated,
+            "timed_out": result.timed_out,
+            "aborted_reason": result.aborted_reason,
         }
         if result.error:
             output["error"] = result.error
@@ -1928,10 +2579,14 @@ def _test_run_runpod(args: argparse.Namespace) -> None:
                 console.print()
             if tr.get("output_dir"):
                 console.print(f"  Output: {tr['output_dir']}")
+            if result.timed_out:
+                console.print(
+                    "  [red]Aborted by watchdog (overrun).[/red]"
+                )
         if result.terminated:
             console.print(f"  [dim]Pod '{result.pod_name}' terminated[/dim]")
 
-    if result.error:
+    if nonzero:
         sys.exit(1)
 
 
@@ -2191,16 +2846,30 @@ def _test_fleet(args: argparse.Namespace) -> None:
     out_dir = Path(args.output) if args.output else Path(args.suite) / "runs" / f"fleet-{_run_id()}"
     send_output = None if args.json else (lambda t: console.print(t, end=""))
 
+    # Fleet-level watchdog: --max-runtime overrides suite.json.
+    from comfy_runner.testing.client import watchdog as _watchdog
+    from comfy_runner.testing.suite import load_suite as _load_suite_for_budget
+    budget = getattr(args, "max_runtime", None)
+    if budget is None:
+        try:
+            _suite = _load_suite_for_budget(args.suite)
+            if isinstance(_suite.max_runtime_s, int):
+                budget = _suite.max_runtime_s
+        except Exception:
+            pass
+
     try:
-        fleet_result = run_fleet(
-            targets=targets,
-            suite_path=args.suite,
-            output_dir=out_dir,
-            timeout=args.timeout,
-            max_workers=getattr(args, "max_workers", None),
-            send_output=send_output,
-            formats=args.format,
-        )
+        with _watchdog(budget) as cancelled:
+            fleet_result = run_fleet(
+                targets=targets,
+                suite_path=args.suite,
+                output_dir=out_dir,
+                timeout=args.timeout,
+                max_workers=getattr(args, "max_workers", None),
+                send_output=send_output,
+                formats=args.format,
+                cancelled=cancelled,
+            )
     except Exception as e:
         if args.json:
             print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -2208,16 +2877,23 @@ def _test_fleet(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
+    timed_out = cancelled.is_set()
+
     if args.json:
-        output = {"ok": fleet_result.targets_failed == 0}
+        output = {
+            "ok": fleet_result.targets_failed == 0 and not timed_out,
+            "timed_out": timed_out,
+        }
         output.update(fleet_result.to_dict())
         print(json.dumps(output, indent=2))
     else:
         console.print()
         console.print(render_fleet_console(fleet_result))
         console.print(f"\n  [dim]Output: {out_dir}[/dim]")
+        if timed_out:
+            console.print("  [red]Aborted by watchdog (overrun).[/red]")
 
-    if fleet_result.targets_failed > 0:
+    if fleet_result.targets_failed > 0 or timed_out:
         sys.exit(1)
 
 
@@ -3319,6 +3995,75 @@ def _station_pods(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
 
+    elif pod_action == "launch-pr":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            config = _station_config(args)
+            defaults = config.get("defaults", {})
+            body: dict = {"pr": args.pr}
+            if getattr(args, "repo", None):
+                body["repo"] = args.repo
+            if getattr(args, "gpu", None):
+                body["gpu_type"] = args.gpu
+            elif defaults.get("gpu_type"):
+                body["gpu_type"] = defaults["gpu_type"]
+            if getattr(args, "datacenter", None):
+                body["datacenter"] = args.datacenter
+            elif defaults.get("datacenter"):
+                body["datacenter"] = defaults["datacenter"]
+            if getattr(args, "image", None):
+                body["image"] = args.image
+            if getattr(args, "install", None):
+                body["install"] = args.install
+            if getattr(args, "idle_timeout", None) is not None:
+                body["idle_timeout_s"] = args.idle_timeout
+            data = runner._request("POST", "/pods/launch-pr", json=body)
+            job_id = data.get("job_id")
+            pod_name = data.get("name")
+            if not args.json:
+                console.print(
+                    f"Launching PR #[cyan]{args.pr}[/cyan] on pod "
+                    f"[cyan]{pod_name}[/cyan] (job: {job_id})...",
+                )
+            result = runner.poll_job(
+                job_id, timeout=900,
+                on_output=None if args.json else _output,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+            else:
+                console.print(f"\n✓ PR #[cyan]{args.pr}[/cyan] ready on pod [cyan]{pod_name}[/cyan].")
+                if result.get("server_url"):
+                    console.print(f"  Server:   {result['server_url']}")
+                if result.get("comfy_url"):
+                    console.print(f"  ComfyUI:  {result['comfy_url']}")
+                if result.get("idle_timeout_s"):
+                    console.print(f"  Idle in:  {result['idle_timeout_s']}s of inactivity")
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif pod_action == "touch":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("POST", f"/pods/{args.pod_name}/touch")
+            if args.json:
+                print(json.dumps(data, indent=2))
+            else:
+                console.print(
+                    f"✓ Pod [cyan]{args.pod_name}[/cyan] touched. "
+                    f"Idle in {data.get('idle_in_s', '?')}s.",
+                )
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     elif pod_action == "cleanup":
         try:
             runner = RemoteRunner(_station_server(args))
@@ -3404,23 +4149,42 @@ def _station_tests(args: argparse.Namespace) -> None:
             body = {"suite": args.suite, "target": target}
             if getattr(args, "timeout", None):
                 body["timeout"] = args.timeout
+            if getattr(args, "max_runtime", None) is not None:
+                body["max_runtime_s"] = args.max_runtime
+            if getattr(args, "on_overrun", None) is not None:
+                body["on_overrun"] = args.on_overrun
 
             data = runner._request("POST", "/tests/run", json=body)
             job_id = data.get("job_id")
             if not args.json:
                 console.print(f"Test started (job: {job_id})...")
             result = runner.poll_job(job_id, timeout=3600, on_output=None if args.json else _output)
+            timed_out = bool(result.get("timed_out"))
+            failed = result.get("failed", 0) or 0
             if args.json:
-                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+                print(json.dumps({
+                    "ok": failed == 0 and not timed_out,
+                    "job_id": job_id,
+                    "timed_out": timed_out,
+                    "result": result,
+                }, indent=2))
             else:
                 passed = result.get("passed", 0)
-                total = result.get("total", 0) if result.get("total") else (passed + result.get("failed", 0))
-                failed = result.get("failed", 0)
-                duration = result.get("duration", 0)
-                if failed == 0:
+                total = result.get("total", 0) if result.get("total") else (passed + failed)
+                duration = result.get("duration", 0) or 0
+                if timed_out:
+                    console.print(
+                        f"\n[red]✗ Aborted by watchdog (overrun): "
+                        f"{failed}/{total} failed[/red] ({duration:.1f}s)"
+                    )
+                elif failed == 0:
                     console.print(f"\n[green]✓ All {total} tests passed[/green] ({duration:.1f}s)")
                 else:
                     console.print(f"\n[red]✗ {failed}/{total} tests failed[/red] ({duration:.1f}s)")
+            if failed > 0 or timed_out:
+                sys.exit(1)
+        except SystemExit:
+            raise
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -3443,23 +4207,42 @@ def _station_tests(args: argparse.Namespace) -> None:
                 body["timeout"] = args.timeout
             if getattr(args, "max_workers", None):
                 body["max_workers"] = args.max_workers
+            if getattr(args, "max_runtime", None) is not None:
+                body["max_runtime_s"] = args.max_runtime
+            if getattr(args, "on_overrun", None) is not None:
+                body["on_overrun"] = args.on_overrun
 
             data = runner._request("POST", "/tests/fleet", json=body)
             job_id = data.get("job_id")
             if not args.json:
                 console.print(f"Fleet test started ({len(targets)} targets, job: {job_id})...")
             result = runner.poll_job(job_id, timeout=3600, on_output=None if args.json else _output)
+            timed_out = bool(result.get("timed_out"))
+            failed = result.get("targets_failed", 0) or 0
             if args.json:
-                print(json.dumps({"ok": True, "job_id": job_id, "result": result}, indent=2))
+                print(json.dumps({
+                    "ok": failed == 0 and not timed_out,
+                    "job_id": job_id,
+                    "timed_out": timed_out,
+                    "result": result,
+                }, indent=2))
             else:
                 passed = result.get("targets_passed", 0)
                 total = result.get("total_targets", 0)
-                failed = result.get("targets_failed", 0)
-                duration = result.get("total_duration", 0)
-                if failed == 0:
+                duration = result.get("total_duration", 0) or 0
+                if timed_out:
+                    console.print(
+                        f"\n[red]✗ Fleet aborted by watchdog (overrun): "
+                        f"{failed}/{total} targets failed[/red] ({duration:.1f}s)"
+                    )
+                elif failed == 0:
                     console.print(f"\n[green]✓ All {total} targets passed[/green] ({duration:.1f}s)")
                 else:
                     console.print(f"\n[red]✗ {failed}/{total} targets failed[/red] ({duration:.1f}s)")
+            if failed > 0 or timed_out:
+                sys.exit(1)
+        except SystemExit:
+            raise
         except Exception as e:
             if args.json:
                 print(json.dumps({"ok": False, "error": str(e)}, indent=2))
@@ -3935,7 +4718,152 @@ def main(argv: list[str] | None = None) -> None:
     deploy_group.add_argument("--reset", action="store_true", help="Reset to the original release ref")
     deploy_group.add_argument("--latest", action="store_true", help="Update to the latest standalone release's ComfyUI ref")
     deploy_group.add_argument("--pull", action="store_true", help="Re-fetch the currently tracked PR or branch")
+    p_deploy.add_argument(
+        "--repo", dest="repo_url",
+        help="Repo URL or owner/name to fetch from (overrides install's "
+             "origin for this deploy; mainly used for fork PRs).",
+    )
     p_deploy.set_defaults(func=cmd_deploy)
+
+    # review (PR-review preparation)
+    p_review = sub.add_parser(
+        "review",
+        help="Prepare a PR for review: deploy + manifest + model provisioning",
+    )
+    p_review.add_argument("pr", type=int, help="GitHub PR number")
+    p_review.add_argument(
+        "--repo", required=True,
+        help="Target repo as 'owner/name' or full GitHub URL "
+             "(e.g. comfy-org/ComfyUI)",
+    )
+    p_review.add_argument(
+        "--target", default="local",
+        help="Target spec: local, local:<install-name>, "
+             "remote:<pod-name>, runpod[:<gpu>] (default: local)",
+    )
+    p_review.add_argument(
+        "--workflow", action="append", default=[],
+        help="Extra workflow URL to fetch (repeatable). Merges with "
+             "any URLs in the PR's comfyrunner manifest block.",
+    )
+    p_review.add_argument(
+        "--model", action="append", default=[],
+        help="Extra model entry as 'name=url=directory' (repeatable). "
+             "Merges with any models in the PR's manifest.",
+    )
+    p_review.add_argument(
+        "--token",
+        help="Bearer token for authenticated model downloads "
+             "(HuggingFace / ModelScope). Not stored.",
+    )
+    p_review.add_argument(
+        "--github-token", dest="github_token",
+        help="GitHub token for fetching the PR body. Defaults to "
+             "$GITHUB_TOKEN; not required for public repos.",
+    )
+    p_review.add_argument(
+        "--no-provision-models", dest="no_provision_models",
+        action="store_true",
+        help="Fetch the manifest and save workflows but skip model "
+             "downloads.",
+    )
+    p_review.add_argument(
+        "--allow-arbitrary-urls", dest="allow_arbitrary_urls",
+        action="store_true",
+        help="Allow workflow URLs whose host is not in the default "
+             "allowlist (huggingface.co, civitai.com, modelscope.cn, "
+             "raw.githubusercontent.com, gist.githubusercontent.com, "
+             "github.com).",
+    )
+    p_review.add_argument(
+        "--server",
+        help="Override central station URL for remote/runpod targets "
+             "(default: read from station.json walking up from cwd).",
+    )
+    p_review.add_argument(
+        "--install",
+        default="main",
+        help="Installation name on the target pod for remote/runpod "
+             "targets (default: main). Ignored for local targets — use "
+             "--target local:<install-name> instead.",
+    )
+    p_review.add_argument(
+        "--force-purpose", dest="force_purpose", action="store_true",
+        help="Allow review against pods tagged purpose='test' (e2e test "
+             "pods). By default such pods are refused because reviews "
+             "would clobber their curated install state.",
+    )
+    p_review.add_argument(
+        "--cleanup", action="store_true",
+        help="For runpod target only: terminate the ephemeral PR pod "
+             "after review-prep finishes. Use 'review-cleanup' instead "
+             "if you want to clean up an existing pod later.",
+    )
+    p_review.add_argument(
+        "--force-deploy", dest="force_deploy", action="store_true",
+        help="For remote target: always deploy even if the pod already "
+             "has this PR deployed. Default is idempotent (skip deploy "
+             "if already current). No effect on local/runpod targets.",
+    )
+    p_review.add_argument(
+        "--idle-stop-after", dest="idle_stop_after", type=int, default=None,
+        metavar="SECONDS",
+        help="For remote/runpod targets: update the pod's idle timeout "
+             "to this many seconds. The central station's idle reaper "
+             "auto-stops purpose='pr' pods that have been idle this long.",
+    )
+    p_review.set_defaults(func=cmd_review)
+
+    # review-cleanup
+    p_review_cleanup = sub.add_parser(
+        "review-cleanup",
+        help="Terminate ephemeral PR pods (purpose='pr') for a given PR.",
+    )
+    p_review_cleanup.add_argument("pr", type=int, help="PR number")
+    p_review_cleanup.add_argument(
+        "--server",
+        help="Override central station URL (default: from station.json).",
+    )
+    p_review_cleanup.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="List matching pods without terminating them.",
+    )
+    p_review_cleanup.set_defaults(func=cmd_review_cleanup)
+
+    # review-init (generate a comfyrunner block from a workflow JSON)
+    p_review_init = sub.add_parser(
+        "review-init",
+        help="Generate a comfyrunner manifest block from a workflow JSON.",
+    )
+    p_review_init.add_argument(
+        "workflow",
+        help="Path to a workflow JSON file on disk.",
+    )
+    p_review_init.add_argument(
+        "--workflow-url", dest="workflow_url",
+        help="Public HTTPS URL the workflow file will be served from "
+             "(typically a raw.githubusercontent.com URL on the PR's "
+             "branch). If omitted, a placeholder is emitted.",
+    )
+    p_review_init.set_defaults(func=cmd_review_init)
+
+    # review-validate (lint a manifest file or PR)
+    p_review_validate = sub.add_parser(
+        "review-validate",
+        help="Lint a comfyrunner manifest from a file, PR shorthand, or PR URL.",
+    )
+    p_review_validate.add_argument(
+        "source",
+        help="Path to a file (markdown with comfyrunner block, or raw "
+             "manifest JSON), an 'owner/repo#pr' shorthand, or a "
+             "GitHub PR URL.",
+    )
+    p_review_validate.add_argument(
+        "--github-token", dest="github_token",
+        help="GitHub token for fetching PR bodies. Defaults to "
+             "$GITHUB_TOKEN; not required for public repos.",
+    )
+    p_review_validate.set_defaults(func=cmd_review_validate)
 
     # download-model
     p_dlm = sub.add_parser("download-model", help="Download a model by URL to a specific directory")
@@ -3999,6 +4927,23 @@ def main(argv: list[str] | None = None) -> None:
                             help="Keep the pod running after tests complete")
     p_test_run.add_argument("--install-name", default="main",
                             help="Installation name on the remote pod (default: main)")
+    p_test_run.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Suite-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s. The watchdog aborts the run on "
+            "overrun and (for runpod targets) tears down the pod."
+        ),
+    )
+    p_test_run.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults: terminate "
+            "for runpod targets, none otherwise (local mode)."
+        ),
+    )
 
     # test list
     p_test_list = test_sub.add_parser("list", help="Discover available test suites")
@@ -4037,6 +4982,24 @@ def main(argv: list[str] | None = None) -> None:
     fleet_deploy_group.add_argument("--pr", type=int, help="Deploy a PR before testing (ephemeral targets)")
     fleet_deploy_group.add_argument("--branch", help="Deploy a branch before testing (ephemeral targets)")
     fleet_deploy_group.add_argument("--commit", help="Deploy a commit before testing (ephemeral targets)")
+    p_test_fleet.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Fleet-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s. The watchdog aborts the run on "
+            "overrun and (for runpod/remote targets) dispatches the pod "
+            "action."
+        ),
+    )
+    p_test_fleet.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults per target "
+            "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
 
     p_test.set_defaults(func=cmd_test, _parser_test=p_test)
 
@@ -4234,6 +5197,27 @@ def main(argv: list[str] | None = None) -> None:
     p_st_pod_cleanup.add_argument("--prefix", default="test-", help="Pod name prefix to match (default: test-)")
     p_st_pod_cleanup.add_argument("--dry-run", action="store_true", help="List matching pods without terminating")
 
+    p_st_pod_launch_pr = st_pods_sub.add_parser(
+        "launch-pr",
+        help="Create-or-wake a pod for a PR and deploy the PR to it",
+    )
+    p_st_pod_launch_pr.add_argument("pr", type=int, help="GitHub PR number")
+    p_st_pod_launch_pr.add_argument("--repo", help="GitHub repo (URL or 'owner/name')")
+    p_st_pod_launch_pr.add_argument("--gpu", "-g", help="GPU type (default: from station config)")
+    p_st_pod_launch_pr.add_argument("--datacenter", help="Datacenter ID")
+    p_st_pod_launch_pr.add_argument("--image", help="Docker image")
+    p_st_pod_launch_pr.add_argument("--install", help="Installation name on the pod (default: main)")
+    p_st_pod_launch_pr.add_argument(
+        "--idle-timeout", type=int, dest="idle_timeout",
+        help="Seconds of inactivity before the pod is auto-stopped (default: 600)",
+    )
+
+    p_st_pod_touch = st_pods_sub.add_parser(
+        "touch",
+        help="Reset the idle timer on a pod (defers the auto-stop reaper)",
+    )
+    p_st_pod_touch.add_argument("pod_name", help="Pod name")
+
     p_st_pods.set_defaults(_parser_station_pods=p_st_pods)
 
     # station tests
@@ -4247,6 +5231,23 @@ def main(argv: list[str] | None = None) -> None:
     p_st_test_run.add_argument("--target", "-t", required=True,
                                help="Target: local:<url>, remote:<pod_name>, runpod:<gpu_type>")
     p_st_test_run.add_argument("--timeout", type=int, help="Per-workflow timeout (seconds)")
+    p_st_test_run.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Suite-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s. The watchdog aborts the run "
+            "on overrun and dispatches the on-overrun pod action."
+        ),
+    )
+    p_st_test_run.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults per target "
+            "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
 
     p_st_test_fleet = st_tests_sub.add_parser("fleet", help="Run a test suite across multiple targets")
     p_st_test_fleet.add_argument("suite", help="Suite name or path")
@@ -4254,6 +5255,22 @@ def main(argv: list[str] | None = None) -> None:
                                  help="Target spec (repeatable)")
     p_st_test_fleet.add_argument("--timeout", type=int, help="Per-workflow timeout (seconds)")
     p_st_test_fleet.add_argument("--max-workers", type=int, help="Max parallel workers")
+    p_st_test_fleet.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Fleet-level wall-clock budget in seconds. Overrides "
+            "suite.json's max_runtime_s."
+        ),
+    )
+    p_st_test_fleet.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts. Defaults per target "
+            "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
 
     p_st_test_status = st_tests_sub.add_parser("status", help="Check test run status")
     p_st_test_status.add_argument("test_id", help="Test run ID")
