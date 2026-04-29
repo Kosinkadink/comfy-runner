@@ -1398,6 +1398,7 @@ _ROUTES: list[dict[str, Any]] = [
                             "launch_args": {"type": "string", "description": "ComfyUI launch arguments for deploy step"},
                             "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility for deploy step"},
                             "force_purpose": {"type": "boolean", "description": "Override the refusal to review against pods tagged purpose='test' (e2e test pods)"},
+                            "skip_deploy": {"type": "boolean", "description": "Skip the deploy step (use when the caller has already deployed, e.g. via POST /pods/launch-pr)"},
                         },
                     }
                 }
@@ -1458,6 +1459,42 @@ _ROUTES: list[dict[str, Any]] = [
             },
         },
         "responses": _async_response("Review preparation started"),
+    },
+    {
+        "path": "/reviews/cleanup",
+        "method": "post",
+        "tags": ["Review", "Pods"],
+        "summary": "Terminate ephemeral PR pods for a given PR",
+        "description": (
+            "Walks all pod records and terminates any whose record has "
+            "``purpose == 'pr'`` AND ``pr_number == <pr>``. ``persistent`` "
+            "and ``test`` pods are never touched. Synchronous: returns "
+            "the per-pod termination outcome immediately."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["pr"],
+                        "properties": {
+                            "pr": {"type": "integer", "description": "PR number to clean up"},
+                            "dry_run": {"type": "boolean", "description": "List matches without terminating"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Cleanup complete", {
+            "pr": {"type": "integer"},
+            "dry_run": {"type": "boolean"},
+            "terminated": {"type": "array", "items": {"type": "object"}},
+            "skipped": {"type": "array", "items": {"type": "object"}},
+            "removed_records": {"type": "array", "items": {"type": "string"}},
+            "total_found": {"type": "integer"},
+            "total_terminated": {"type": "integer"},
+        }),
     },
     {
         "path": "/pods/{name}/stop",

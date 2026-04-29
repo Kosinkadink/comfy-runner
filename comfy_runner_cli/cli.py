@@ -700,18 +700,6 @@ def cmd_review(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
-    if target["kind"] == "runpod":
-        msg = (
-            "Target kind 'runpod' is not yet implemented for review. "
-            "Use --target local, --target local:<install-name>, or "
-            "--target remote:<pod-name>."
-        )
-        if args.json:
-            print(json.dumps({"ok": False, "error": msg}, indent=2))
-        else:
-            console.print(f"[red]{msg}[/red]")
-        sys.exit(2)
-
     pr = args.pr
 
     extra_models: list = []
@@ -731,6 +719,13 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     if target["kind"] == "remote":
         _cmd_review_remote(
+            args, target, owner, repo_name, pr,
+            extra_model_entries, extra_workflows, out,
+        )
+        return
+
+    if target["kind"] == "runpod":
+        _cmd_review_runpod(
             args, target, owner, repo_name, pr,
             extra_model_entries, extra_workflows, out,
         )
@@ -881,6 +876,169 @@ def _cmd_review_remote(
 
     if review_result.get("failed") or review_result.get("failures"):
         sys.exit(1)
+
+
+def _cmd_review_runpod(
+    args: argparse.Namespace,
+    target: dict,
+    owner: str,
+    repo_name: str,
+    pr: int,
+    extra_model_entries: list,
+    extra_workflows: list[str],
+    out,
+) -> None:
+    """``cmd_review`` branch for ``--target runpod[:<gpu>]``."""
+    gpu_type = target.get("gpu_type")
+    install_name = getattr(args, "install", None) or "main"
+    target_label = f"runpod:{gpu_type}" if gpu_type else "runpod"
+
+    try:
+        server = _station_server(args)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label} via {server}...\n"
+        )
+
+    from comfy_runner.review import prepare_runpod_review
+    try:
+        review_result = prepare_runpod_review(
+            server, owner, repo_name, pr,
+            install_name=install_name,
+            gpu_type=gpu_type,
+            github_token=getattr(args, "github_token", None),
+            download_token=getattr(args, "token", "") or "",
+            extra_models=extra_model_entries,
+            extra_workflows=extra_workflows,
+            allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+            skip_provisioning=getattr(args, "no_provision_models", False),
+            send_output=out,
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    review_result["target"] = target_label
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    # ── Optional cleanup (terminate the pod after review prep). ──────
+    if getattr(args, "cleanup", False):
+        pod_name = review_result.get("pod_name", "")
+        if pod_name:
+            if out:
+                out(f"\n--- Cleaning up runpod pod '{pod_name}' ---\n")
+            from comfy_runner.review import cleanup_runpod_review
+            try:
+                cleanup_runpod_review(server, pr)
+                review_result["cleaned_up"] = True
+            except RuntimeError as e:
+                review_result["cleaned_up"] = False
+                review_result["cleanup_error"] = str(e)
+                if out:
+                    out(f"⚠ Cleanup failed: {e}\n")
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
+    server_url = review_result.get("server_url") or ""
+    if server_url:
+        comfy_url = server_url.rsplit(":", 1)[0] + ":8188"
+        console.print(f"  [dim]Pod ComfyUI: {comfy_url}[/dim]")
+    if review_result.get("created_new"):
+        idle = review_result.get("idle_timeout_s")
+        if idle:
+            console.print(
+                f"  [dim]Pod will idle-stop after {idle}s of inactivity. "
+                f"Use 'review-cleanup {pr}' to terminate sooner.[/dim]"
+            )
+    if review_result.get("cleaned_up"):
+        console.print("  [yellow]Pod terminated (--cleanup)[/yellow]")
+    elif review_result.get("cleanup_error"):
+        console.print(
+            f"  [red]Cleanup failed: {review_result['cleanup_error']}[/red]"
+        )
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def cmd_review_cleanup(args: argparse.Namespace) -> None:
+    """Terminate ephemeral PR pods (``purpose='pr'``) for a given PR.
+
+    Targets pods whose record has ``purpose == "pr"`` AND
+    ``pr_number == <pr>``. Does not touch ``persistent`` or ``test``
+    pods.
+    """
+    out = None if args.json else _output
+
+    try:
+        server = _station_server(args)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    from comfy_runner.review import cleanup_runpod_review
+    try:
+        result = cleanup_runpod_review(
+            server, args.pr, dry_run=getattr(args, "dry_run", False),
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    pr = result.get("pr", args.pr)
+    total = result.get("total_found", 0)
+    terminated = result.get("terminated", []) or []
+    skipped = result.get("skipped", []) or []
+    if total == 0:
+        console.print(f"[dim]No PR-#{pr} pods found.[/dim]")
+        return
+    if result.get("dry_run"):
+        console.print(
+            f"[yellow]Dry run — would terminate {total} pod(s):[/yellow]"
+        )
+        for s in skipped:
+            console.print(f"  • {s.get('name', '?')}")
+        return
+    console.print(
+        f"[green]✓ Terminated {len(terminated)} of {total} "
+        f"PR-#{pr} pod(s)[/green]"
+    )
+    for t in terminated:
+        console.print(f"  [dim]{t.get('name', '?')} ({t.get('id', '?')})[/dim]")
+    if skipped:
+        console.print(f"[yellow]Skipped {len(skipped)}:[/yellow]")
+        for s in skipped:
+            console.print(
+                f"  [yellow]{s.get('name', '?')}: "
+                f"{s.get('error', s.get('reason', '?'))}[/yellow]"
+            )
 
 
 def _render_review_result(
@@ -4525,7 +4683,29 @@ def main(argv: list[str] | None = None) -> None:
              "pods). By default such pods are refused because reviews "
              "would clobber their curated install state.",
     )
+    p_review.add_argument(
+        "--cleanup", action="store_true",
+        help="For runpod target only: terminate the ephemeral PR pod "
+             "after review-prep finishes. Use 'review-cleanup' instead "
+             "if you want to clean up an existing pod later.",
+    )
     p_review.set_defaults(func=cmd_review)
+
+    # review-cleanup
+    p_review_cleanup = sub.add_parser(
+        "review-cleanup",
+        help="Terminate ephemeral PR pods (purpose='pr') for a given PR.",
+    )
+    p_review_cleanup.add_argument("pr", type=int, help="PR number")
+    p_review_cleanup.add_argument(
+        "--server",
+        help="Override central station URL (default: from station.json).",
+    )
+    p_review_cleanup.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="List matching pods without terminating them.",
+    )
+    p_review_cleanup.set_defaults(func=cmd_review_cleanup)
 
     # download-model
     p_dlm = sub.add_parser("download-model", help="Download a model by URL to a specific directory")

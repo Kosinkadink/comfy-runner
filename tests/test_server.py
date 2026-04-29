@@ -700,6 +700,152 @@ class TestPodsReview:
         assert final["status"] == "done"
         assert final["result"]["pod_purpose"] == "persistent"
 
+    # ── skip_deploy (item 3 — runpod target uses launch-pr first) ─────
+
+    def test_skip_deploy_omits_deploy_step(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="pr")
+        runner = MagicMock()
+        # Only one HTTP call expected: /reviews/local. No deploy.
+        runner._request = MagicMock(return_value={
+            "ok": True, "job_id": "review-1",
+        })
+        runner.poll_job = MagicMock(return_value={
+            "manifest": None, "resolved": None,
+            "downloaded": [], "skipped": [], "failed": [], "errors": [],
+            "workflows": [], "workflows_dir": "/x", "failures": [],
+        })
+        monkeypatch.setattr(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            lambda url: runner,
+        )
+        resp = client.post(
+            "/pods/pod-a/review", json=self._body(skip_deploy=True),
+        )
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        # Exactly one HTTP call, and it was /reviews/local.
+        runner._request.assert_called_once()
+        assert runner._request.call_args.args == ("POST", "/reviews/local")
+        # deploy_result is None when deploy was skipped.
+        assert final["result"]["deploy_result"] is None
+        # Visible in job output too.
+        assert any(
+            "Skipping deploy" in line for line in final.get("output", [])
+        )
+
+
+# =====================================================================
+# POST /reviews/cleanup — terminate ephemeral PR pods (item 3)
+# =====================================================================
+
+
+class TestReviewsCleanup:
+    def _stub_provider(self, monkeypatch, *, terminate_raises=None):
+        provider = MagicMock()
+        if terminate_raises:
+            provider.terminate_pod = MagicMock(side_effect=terminate_raises)
+        else:
+            provider.terminate_pod = MagicMock()
+        monkeypatch.setattr(
+            "comfy_runner_server.server._get_runpod_provider",
+            lambda: provider,
+        )
+        return provider
+
+    def _stub_records(self, monkeypatch, records: dict):
+        from comfy_runner.hosted import config as hcfg
+
+        def list_pod_records(_provider):
+            return dict(records)
+
+        removed: list[str] = []
+
+        def remove_pod_record(_provider, name):
+            removed.append(name)
+            return name in records
+        monkeypatch.setattr(hcfg, "list_pod_records", list_pod_records)
+        monkeypatch.setattr(hcfg, "remove_pod_record", remove_pod_record)
+        return removed
+
+    def test_terminates_only_matching_pr_pods(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        provider = self._stub_provider(monkeypatch)
+        removed = self._stub_records(monkeypatch, {
+            "pr-foo-42": {"id": "id-42", "purpose": "pr", "pr_number": 42},
+            "pr-foo-99": {"id": "id-99", "purpose": "pr", "pr_number": 99},
+            "dev-box":   {"id": "id-d",  "purpose": "persistent"},
+            "test-rig":  {"id": "id-t",  "purpose": "test", "pr_number": 42},
+        })
+        resp = client.post("/reviews/cleanup", json={"pr": 42})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["total_found"] == 1
+        assert data["total_terminated"] == 1
+        assert data["terminated"] == [{"name": "pr-foo-42", "id": "id-42"}]
+        assert data["removed_records"] == ["pr-foo-42"]
+        # Only the matching pr-#42 pod was terminated.
+        provider.terminate_pod.assert_called_once_with("id-42")
+        # Persistent + test pods + non-matching PR pods were untouched.
+        assert removed == ["pr-foo-42"]
+
+    def test_dry_run_lists_without_terminating(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        provider = self._stub_provider(monkeypatch)
+        self._stub_records(monkeypatch, {
+            "pr-foo-42": {"id": "id-42", "purpose": "pr", "pr_number": 42},
+        })
+        resp = client.post(
+            "/reviews/cleanup", json={"pr": 42, "dry_run": True},
+        )
+        data = resp.get_json()
+        assert data["dry_run"] is True
+        assert data["total_found"] == 1
+        assert data["total_terminated"] == 0
+        assert data["skipped"] == [
+            {"name": "pr-foo-42", "id": "id-42", "reason": "dry-run"}
+        ]
+        provider.terminate_pod.assert_not_called()
+
+    def test_no_matches_returns_zero(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._stub_provider(monkeypatch)
+        self._stub_records(monkeypatch, {
+            "pr-foo-7": {"id": "id-7", "purpose": "pr", "pr_number": 7},
+        })
+        resp = client.post("/reviews/cleanup", json={"pr": 999})
+        data = resp.get_json()
+        assert data["total_found"] == 0
+        assert data["terminated"] == []
+
+    def test_invalid_pr_rejected(self, client, tmp_config_dir):
+        for bad in (None, "x", -1, 0, True):
+            resp = client.post(
+                "/reviews/cleanup", json={"pr": bad},
+            )
+            assert resp.status_code == 400, bad
+
+    def test_terminate_failure_collected_as_skipped(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._stub_provider(
+            monkeypatch, terminate_raises=RuntimeError("API timeout"),
+        )
+        self._stub_records(monkeypatch, {
+            "pr-foo-42": {"id": "id-42", "purpose": "pr", "pr_number": 42},
+        })
+        resp = client.post("/reviews/cleanup", json={"pr": 42})
+        data = resp.get_json()
+        assert data["total_terminated"] == 0
+        assert len(data["skipped"]) == 1
+        assert "API timeout" in data["skipped"][0]["error"]
+
 
 # =====================================================================
 # OpenAPI spec contains the new routes
@@ -718,3 +864,9 @@ class TestOpenAPIIncludesReviewRoutes:
         spec = resp.get_json()
         assert "/pods/{name}/review" in spec["paths"]
         assert "post" in spec["paths"]["/pods/{name}/review"]
+
+    def test_spec_contains_reviews_cleanup(self, client):
+        resp = client.get("/openapi.json")
+        spec = resp.get_json()
+        assert "/reviews/cleanup" in spec["paths"]
+        assert "post" in spec["paths"]["/reviews/cleanup"]

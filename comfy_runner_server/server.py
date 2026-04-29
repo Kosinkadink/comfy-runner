@@ -2979,6 +2979,82 @@ def create_app() -> Any:
         threading.Thread(target=_run, daemon=True).start()
         return jsonify({"ok": True, "job_id": job_id, "async": True})
 
+    # ------------------------------------------------------------------
+    # POST /reviews/cleanup — terminate ephemeral PR pods (purpose='pr')
+    # ------------------------------------------------------------------
+    @app.route("/reviews/cleanup", methods=["POST"])
+    def route_reviews_cleanup() -> Any:
+        """Terminate runpod pods that were created for a specific PR.
+
+        Body: ``{pr: <int>, dry_run?: bool}``. Targets pods whose record
+        has ``purpose == "pr"`` AND ``pr_number == <pr>``. Dry-run lists
+        matches without acting. Persistent and test pods are never
+        touched, even if their name happens to mention the PR.
+        """
+        from comfy_runner.hosted.config import (
+            list_pod_records, remove_pod_record,
+        )
+
+        body = request.get_json(silent=True) or {}
+        pr = body.get("pr")
+        if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+            return _err("'pr' must be a positive integer")
+        dry_run = bool(body.get("dry_run", False))
+
+        try:
+            provider = _get_runpod_provider()
+        except RuntimeError as e:
+            return _err(str(e))
+
+        records = list_pod_records("runpod")
+        candidates: list[tuple[str, dict]] = []
+        for name, rec in records.items():
+            if rec.get("purpose") != "pr":
+                continue
+            if rec.get("pr_number") != pr:
+                continue
+            candidates.append((name, rec))
+
+        terminated: list[dict] = []
+        skipped: list[dict] = []
+        removed_records: list[str] = []
+        if dry_run:
+            for name, rec in candidates:
+                skipped.append({
+                    "name": name,
+                    "id": rec.get("id", ""),
+                    "reason": "dry-run",
+                })
+        else:
+            for name, rec in candidates:
+                pod_id = rec.get("id", "")
+                try:
+                    if pod_id:
+                        provider.terminate_pod(pod_id)
+                    terminated.append({"name": name, "id": pod_id})
+                    try:
+                        if remove_pod_record("runpod", name):
+                            removed_records.append(name)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    skipped.append({
+                        "name": name,
+                        "id": pod_id,
+                        "error": str(e),
+                    })
+
+        return jsonify({
+            "ok": True,
+            "pr": pr,
+            "dry_run": dry_run,
+            "terminated": terminated,
+            "skipped": skipped,
+            "removed_records": removed_records,
+            "total_found": len(candidates),
+            "total_terminated": len(terminated),
+        })
+
     # ==================================================================
     # Central Orchestration — Pod Management
     # ==================================================================
@@ -3354,6 +3430,11 @@ def create_app() -> Any:
         ):
             return _err("'extra_workflows' must be a list of strings")
 
+        # When ``skip_deploy`` is set, the caller has already deployed
+        # the PR (e.g. via POST /pods/launch-pr in the runpod-target
+        # flow) and only wants the review-prep step to run.
+        skip_deploy = bool(body.get("skip_deploy", False))
+
         # ── Purpose gating ───────────────────────────────────────────────
         # Reviews mutate install state on the pod. Match the pod's
         # ``purpose`` tag against what's safe:
@@ -3426,34 +3507,43 @@ def create_app() -> Any:
                 runner = RemoteRunner(server_url)
 
                 # ── 1) Deploy the PR via the sidecar ───────────────────
-                deploy_body: dict[str, Any] = {
-                    "pr": int(pr),
-                    "repo": f"https://github.com/{owner}/{repo}",
-                    "start": True,
-                }
-                if body.get("title"):
-                    deploy_body["title"] = body["title"]
-                if body.get("launch_args"):
-                    deploy_body["launch_args"] = body["launch_args"]
-                if body.get("cuda_compat"):
-                    deploy_body["cuda_compat"] = True
-
-                out(
-                    f"Deploying PR #{pr} ({owner}/{repo}) "
-                    f"to '{install_name}'...\n"
-                )
-                deploy_resp = runner._request(
-                    "POST", f"/{install_name}/deploy", json=deploy_body,
-                )
-                deploy_remote_job = deploy_resp.get("job_id")
-                if not deploy_remote_job:
-                    _jobs.fail(
-                        job_id, "Deploy did not return a job_id", lines,
+                # Skipped when ``skip_deploy=True`` — the runpod target
+                # uses POST /pods/launch-pr first, which already deploys,
+                # so this proxy just runs the review prep step.
+                if skip_deploy:
+                    out(
+                        "Skipping deploy step (skip_deploy=true).\n"
                     )
-                    return
-                deploy_result = runner.poll_job(
-                    deploy_remote_job, timeout=900, on_output=out,
-                )
+                    deploy_result = None
+                else:
+                    deploy_body: dict[str, Any] = {
+                        "pr": int(pr),
+                        "repo": f"https://github.com/{owner}/{repo}",
+                        "start": True,
+                    }
+                    if body.get("title"):
+                        deploy_body["title"] = body["title"]
+                    if body.get("launch_args"):
+                        deploy_body["launch_args"] = body["launch_args"]
+                    if body.get("cuda_compat"):
+                        deploy_body["cuda_compat"] = True
+
+                    out(
+                        f"Deploying PR #{pr} ({owner}/{repo}) "
+                        f"to '{install_name}'...\n"
+                    )
+                    deploy_resp = runner._request(
+                        "POST", f"/{install_name}/deploy", json=deploy_body,
+                    )
+                    deploy_remote_job = deploy_resp.get("job_id")
+                    if not deploy_remote_job:
+                        _jobs.fail(
+                            job_id, "Deploy did not return a job_id", lines,
+                        )
+                        return
+                    deploy_result = runner.poll_job(
+                        deploy_remote_job, timeout=900, on_output=out,
+                    )
 
                 # ── 2) Prepare review via the sidecar ──────────────────
                 review_body: dict[str, Any] = {

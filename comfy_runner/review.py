@@ -355,3 +355,152 @@ def prepare_remote_review(
     review_result["server_url"] = final.get("server_url", "")
     review_result["deploy_result"] = final.get("deploy_result")
     return review_result
+
+
+# ---------------------------------------------------------------------------
+# Runpod target — ephemeral fresh pod per PR via the central station
+# ---------------------------------------------------------------------------
+
+def prepare_runpod_review(
+    server_url: str,
+    owner: str,
+    repo: str,
+    pr: int,
+    *,
+    install_name: str = "main",
+    gpu_type: str | None = None,
+    idle_timeout_s: int | None = None,
+    image: str | None = None,
+    volume_id: str | None = None,
+    volume_size_gb: int | None = None,
+    datacenter: str | None = None,
+    cloud_type: str | None = None,
+    github_token: str | None = None,
+    download_token: str = "",
+    extra_models: list[_manifest.ModelEntry] | None = None,
+    extra_workflows: list[str] | None = None,
+    allow_arbitrary_urls: bool = False,
+    skip_provisioning: bool = False,
+    send_output: Callable[[str], None] | None = None,
+    poll_timeout: int = 1800,
+) -> dict[str, Any]:
+    """Provision (or wake) an ephemeral PR pod and prepare it for review.
+
+    Two-step orchestration against the central station:
+
+    1. ``POST /pods/launch-pr`` creates-or-wakes a pod tagged
+       ``purpose='pr'`` / ``pr_number=<pr>`` and deploys the PR.
+    2. ``POST /pods/{name}/review`` with ``skip_deploy=True`` runs the
+       review-prep step (manifest + workflows + models).
+
+    The pod stays alive after this call returns; the central server's
+    idle reaper auto-stops it after ``idle_timeout_s`` of inactivity.
+    Use :func:`cleanup_runpod_review` to terminate it sooner.
+
+    Returns the same ``ReviewResult`` dict shape as
+    :func:`prepare_remote_review`, with extra ``created_new`` and
+    ``idle_timeout_s`` fields from the launch step.
+    """
+    from .hosted.remote import RemoteRunner
+
+    out = send_output or (lambda _t: None)
+
+    # ── 1) Launch-or-wake the PR pod (deploys as part of the call). ──
+    launch_body: dict[str, Any] = {
+        "pr": int(pr),
+        "repo": f"https://github.com/{owner}/{repo}",
+        "install": install_name,
+    }
+    if gpu_type:
+        launch_body["gpu_type"] = gpu_type
+    if idle_timeout_s is not None:
+        launch_body["idle_timeout_s"] = int(idle_timeout_s)
+    if image:
+        launch_body["image"] = image
+    if volume_id:
+        launch_body["volume_id"] = volume_id
+    if volume_size_gb is not None:
+        launch_body["volume_size_gb"] = int(volume_size_gb)
+    if datacenter:
+        launch_body["datacenter"] = datacenter
+    if cloud_type:
+        launch_body["cloud_type"] = cloud_type
+
+    runner = RemoteRunner(server_url)
+    out("Provisioning PR pod via central station...\n")
+    launch_resp = runner._request(
+        "POST", "/pods/launch-pr", json=launch_body,
+    )
+    launch_job_id = launch_resp.get("job_id")
+    if not launch_job_id:
+        raise RuntimeError("Station did not return a job_id for launch-pr")
+    pod_name = launch_resp.get("name") or ""
+
+    launch_result = runner.poll_job(
+        launch_job_id, timeout=poll_timeout, on_output=send_output,
+    )
+    pod_name = launch_result.get("name") or pod_name
+    if not pod_name:
+        raise RuntimeError("launch-pr did not return a pod name")
+
+    # ── 2) Run the review-prep step (skip_deploy — already deployed). ─
+    review_body: dict[str, Any] = {
+        "install": install_name,
+        "owner": owner,
+        "repo": repo,
+        "pr": int(pr),
+        "skip_deploy": True,
+        "allow_arbitrary_urls": bool(allow_arbitrary_urls),
+        "skip_provisioning": bool(skip_provisioning),
+    }
+    if github_token:
+        review_body["github_token"] = github_token
+    if download_token:
+        review_body["download_token"] = download_token
+    if extra_models:
+        review_body["extra_models"] = [m.to_dict() for m in extra_models]
+    if extra_workflows:
+        review_body["extra_workflows"] = list(extra_workflows)
+
+    review_resp = runner._request(
+        "POST", f"/pods/{pod_name}/review", json=review_body,
+    )
+    review_job_id = review_resp.get("job_id")
+    if not review_job_id:
+        raise RuntimeError("Station did not return a job_id for review")
+
+    final = runner.poll_job(
+        review_job_id, timeout=poll_timeout, on_output=send_output,
+    )
+
+    review_result = dict(final.get("review_result") or {})
+    review_result["pod_name"] = final.get("pod_name", pod_name)
+    review_result["pod_purpose"] = final.get("pod_purpose")
+    review_result["server_url"] = (
+        final.get("server_url") or launch_result.get("server_url") or ""
+    )
+    review_result["deploy_result"] = launch_result.get("deploy_result")
+    review_result["created_new"] = bool(launch_result.get("created", False))
+    review_result["idle_timeout_s"] = launch_result.get("idle_timeout_s")
+    return review_result
+
+
+def cleanup_runpod_review(
+    server_url: str,
+    pr: int,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Terminate ephemeral PR pods (``purpose='pr'``) for a given PR.
+
+    Wraps ``POST /reviews/cleanup`` on the central station. Returns the
+    server's response dict (``terminated``, ``skipped``, ``total_found``,
+    …).
+    """
+    from .hosted.remote import RemoteRunner
+
+    runner = RemoteRunner(server_url)
+    return runner._request(
+        "POST", "/reviews/cleanup",
+        json={"pr": int(pr), "dry_run": bool(dry_run)},
+    )

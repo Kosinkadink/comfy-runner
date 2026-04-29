@@ -20,6 +20,7 @@ from comfy_runner_cli.cli import (  # noqa: E402
     _parse_repo,
     _parse_review_target,
     cmd_review,
+    cmd_review_cleanup,
 )
 
 
@@ -188,26 +189,10 @@ def _review_args(**overrides) -> argparse.Namespace:
         "server": None,
         "install": "main",
         "force_purpose": False,
+        "cleanup": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
-
-
-class TestCmdReviewTargetGuard:
-    def test_runpod_target_exits_2(self):
-        args = _review_args(target="runpod:RTX_4090")
-        with pytest.raises(SystemExit) as exc:
-            cmd_review(args)
-        assert exc.value.code == 2
-
-    def test_runpod_target_json_error(self, capsys):
-        args = _review_args(target="runpod:RTX_4090", json=True)
-        with pytest.raises(SystemExit):
-            cmd_review(args)
-        out = capsys.readouterr().out
-        payload = json.loads(out)
-        assert payload["ok"] is False
-        assert "runpod" in payload["error"]
 
 
 class TestCmdReviewParseErrors:
@@ -593,3 +578,196 @@ class TestCmdReviewRemote:
         ) as mock_prep:
             cmd_review(args)
         assert mock_prep.call_args.kwargs["force_purpose"] is True
+
+
+# ---------------------------------------------------------------------------
+# cmd_review — runpod target (item 3)
+# ---------------------------------------------------------------------------
+
+class TestCmdReviewRunpod:
+    """``--target runpod[:<gpu>]`` dispatches to prepare_runpod_review."""
+
+    _OK_RESULT = {
+        "manifest": None, "resolved": None,
+        "downloaded": [], "skipped": [], "failed": [], "errors": [],
+        "workflows": [], "workflows_dir": "/x", "failures": [],
+        "pod_name": "pr-foo-123", "pod_purpose": "pr",
+        "server_url": "https://pod-a.ts.net:9189",
+        "deploy_result": {"restarted": True},
+        "created_new": True,
+        "idle_timeout_s": 1800,
+    }
+
+    def test_calls_prepare_runpod_with_gpu_type(
+        self, tmp_config_dir, capsys,
+    ):
+        args = _review_args(
+            target="runpod:RTX_4090",
+            server="https://station.example", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_runpod_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["ok"] is True
+        assert payload["target"] == "runpod:RTX_4090"
+        assert payload["pod_name"] == "pr-foo-123"
+        assert payload["created_new"] is True
+        assert payload["idle_timeout_s"] == 1800
+
+        kwargs = mock_prep.call_args.kwargs
+        assert kwargs["gpu_type"] == "RTX_4090"
+
+    def test_runpod_bare_omits_gpu_type(self, tmp_config_dir):
+        args = _review_args(
+            target="runpod",
+            server="https://station.example", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_runpod_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        # gpu_type=None is the "any GPU" sentinel from _parse_review_target.
+        assert mock_prep.call_args.kwargs["gpu_type"] is None
+
+    def test_cleanup_flag_calls_cleanup_runpod_review(
+        self, tmp_config_dir,
+    ):
+        args = _review_args(
+            target="runpod:RTX_4090",
+            server="https://station.example",
+            cleanup=True, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_runpod_review",
+            return_value=dict(self._OK_RESULT),
+        ), patch(
+            "comfy_runner.review.cleanup_runpod_review",
+            return_value={"ok": True, "total_terminated": 1},
+        ) as mock_cleanup:
+            cmd_review(args)
+        # --cleanup hits the station's /reviews/cleanup with this PR.
+        assert mock_cleanup.call_args.args[0] == "https://station.example"
+        assert mock_cleanup.call_args.args[1] == 123
+
+    def test_cleanup_failure_does_not_break_review(
+        self, tmp_config_dir, capsys,
+    ):
+        args = _review_args(
+            target="runpod:RTX_4090",
+            server="https://station.example",
+            cleanup=True, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_runpod_review",
+            return_value=dict(self._OK_RESULT),
+        ), patch(
+            "comfy_runner.review.cleanup_runpod_review",
+            side_effect=RuntimeError("network glitch"),
+        ):
+            cmd_review(args)
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        # The review still succeeds (ok=True); cleanup_error surfaces.
+        assert payload["ok"] is True
+        assert payload["cleanup_error"] == "network glitch"
+
+    def test_no_station_config_errors(self, tmp_path: Path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        args = _review_args(
+            target="runpod:RTX_4090", server=None, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_runpod_review",
+        ) as mock_prep:
+            with pytest.raises(SystemExit) as exc:
+                cmd_review(args)
+        assert exc.value.code == 1
+        mock_prep.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert "station.json" in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# cmd_review_cleanup (item 3)
+# ---------------------------------------------------------------------------
+
+def _cleanup_args(**overrides) -> argparse.Namespace:
+    defaults = {
+        "pr": 123,
+        "server": "https://station.example",
+        "dry_run": False,
+        "json": False,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestCmdReviewCleanup:
+    def test_terminates_returns_summary(self, tmp_config_dir, capsys):
+        args = _cleanup_args(json=True)
+        result = {
+            "ok": True, "pr": 123, "dry_run": False,
+            "terminated": [{"name": "pr-foo-123", "id": "abc"}],
+            "skipped": [], "removed_records": ["pr-foo-123"],
+            "total_found": 1, "total_terminated": 1,
+        }
+        with patch(
+            "comfy_runner.review.cleanup_runpod_review",
+            return_value=result,
+        ) as mock_clean:
+            cmd_review_cleanup(args)
+        mock_clean.assert_called_once_with(
+            "https://station.example", 123, dry_run=False,
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["total_terminated"] == 1
+
+    def test_dry_run_passes_flag(self, tmp_config_dir):
+        args = _cleanup_args(dry_run=True, json=True)
+        with patch(
+            "comfy_runner.review.cleanup_runpod_review",
+            return_value={"ok": True, "total_found": 0, "terminated": []},
+        ) as mock_clean:
+            cmd_review_cleanup(args)
+        assert mock_clean.call_args.kwargs == {"dry_run": True}
+
+    def test_no_matches_quiet(self, tmp_config_dir, capsys):
+        args = _cleanup_args(json=False)
+        with patch(
+            "comfy_runner.review.cleanup_runpod_review",
+            return_value={
+                "ok": True, "pr": 123, "total_found": 0,
+                "terminated": [], "skipped": [],
+            },
+        ):
+            cmd_review_cleanup(args)
+        out = capsys.readouterr().out
+        assert "No PR-#123 pods" in out
+
+    def test_no_station_config_errors(self, tmp_path: Path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        args = _cleanup_args(server=None, json=True)
+        with patch(
+            "comfy_runner.review.cleanup_runpod_review",
+        ) as mock_clean:
+            with pytest.raises(SystemExit) as exc:
+                cmd_review_cleanup(args)
+        assert exc.value.code == 1
+        mock_clean.assert_not_called()
+
+    def test_runtime_error_propagates(self, tmp_config_dir, capsys):
+        args = _cleanup_args(json=True)
+        with patch(
+            "comfy_runner.review.cleanup_runpod_review",
+            side_effect=RuntimeError("boom"),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_review_cleanup(args)
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert "boom" in payload["error"]

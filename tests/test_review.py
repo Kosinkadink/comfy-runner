@@ -22,9 +22,11 @@ from comfy_runner.manifest import (  # noqa: E402
 )
 from comfy_runner.review import (  # noqa: E402
     ReviewResult,
+    cleanup_runpod_review,
     fetch_and_resolve_manifest,
     prepare_local_review,
     prepare_remote_review,
+    prepare_runpod_review,
     provision_models_local,
     workflows_dest_for,
 )
@@ -656,3 +658,203 @@ class TestPrepareRemoteReview:
             )
         # poll_job got the same callable for streaming output.
         assert runner.poll_job.call_args.kwargs["on_output"] is collector
+
+
+# ---------------------------------------------------------------------------
+# prepare_runpod_review (item 3)
+# ---------------------------------------------------------------------------
+
+class TestPrepareRunpodReview:
+    """Two-step launch-pr → review chained against the central station."""
+
+    def _runner_with_two_jobs(
+        self, *, launch_result=None, review_result=None,
+        launch_resp=None, review_resp=None,
+    ):
+        runner = MagicMock()
+        runner._request = MagicMock(side_effect=[
+            launch_resp or {
+                "ok": True, "job_id": "launch-1", "name": "pr-foo-99",
+            },
+            review_resp or {"ok": True, "job_id": "review-1"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            launch_result or {
+                "name": "pr-foo-99",
+                "pr": 99,
+                "created": True,
+                "server_url": "https://pod-a.ts.net:9189",
+                "comfy_url": "https://pod-a.ts.net:8188",
+                "idle_timeout_s": 1800,
+                "deploy_result": {"restarted": True},
+            },
+            review_result or {
+                "pod_name": "pr-foo-99",
+                "pod_purpose": "pr",
+                "server_url": "https://pod-a.ts.net:9189",
+                "deploy_result": None,
+                "review_result": {
+                    "manifest": None, "resolved": None,
+                    "downloaded": [], "skipped": [], "failed": [],
+                    "errors": [], "workflows": [], "workflows_dir": "/x",
+                    "failures": [],
+                },
+            },
+        ])
+        return runner
+
+    def test_two_step_orchestration(self):
+        runner = self._runner_with_two_jobs()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            result = prepare_runpod_review(
+                "https://station.example",
+                "comfy-org", "ComfyUI", 99,
+                gpu_type="RTX_4090",
+            )
+
+        # Two HTTP calls: launch-pr first, then pods/<name>/review.
+        calls = runner._request.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args == ("POST", "/pods/launch-pr")
+        launch_body = calls[0].kwargs["json"]
+        assert launch_body["pr"] == 99
+        assert launch_body["repo"] == "https://github.com/comfy-org/ComfyUI"
+        assert launch_body["install"] == "main"
+        assert launch_body["gpu_type"] == "RTX_4090"
+
+        assert calls[1].args == ("POST", "/pods/pr-foo-99/review")
+        review_body = calls[1].kwargs["json"]
+        assert review_body["skip_deploy"] is True
+        assert review_body["install"] == "main"
+        assert review_body["pr"] == 99
+
+        # Result merges both layers.
+        assert result["pod_name"] == "pr-foo-99"
+        assert result["pod_purpose"] == "pr"
+        assert result["server_url"] == "https://pod-a.ts.net:9189"
+        assert result["created_new"] is True
+        assert result["idle_timeout_s"] == 1800
+        assert result["deploy_result"] == {"restarted": True}
+
+    def test_no_gpu_type_omitted_from_body(self):
+        runner = self._runner_with_two_jobs()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_runpod_review(
+                "https://station.example",
+                "o", "r", 1,
+            )
+        launch_body = runner._request.call_args_list[0].kwargs["json"]
+        assert "gpu_type" not in launch_body
+
+    def test_idle_timeout_passed_through(self):
+        runner = self._runner_with_two_jobs()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_runpod_review(
+                "https://station.example",
+                "o", "r", 1,
+                idle_timeout_s=600,
+            )
+        launch_body = runner._request.call_args_list[0].kwargs["json"]
+        assert launch_body["idle_timeout_s"] == 600
+
+    def test_extras_passed_to_review_step(self):
+        runner = self._runner_with_two_jobs()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_runpod_review(
+                "https://station.example",
+                "o", "r", 1,
+                github_token="ghp",
+                download_token="hf",
+                extra_models=[ModelEntry("m", "https://h/m", "loras")],
+                extra_workflows=["https://h/wf.json"],
+                allow_arbitrary_urls=True,
+                skip_provisioning=True,
+            )
+        review_body = runner._request.call_args_list[1].kwargs["json"]
+        assert review_body["github_token"] == "ghp"
+        assert review_body["download_token"] == "hf"
+        assert review_body["allow_arbitrary_urls"] is True
+        assert review_body["skip_provisioning"] is True
+        assert review_body["extra_workflows"] == ["https://h/wf.json"]
+        assert review_body["extra_models"] == [
+            {"name": "m", "url": "https://h/m", "directory": "loras"}
+        ]
+
+    def test_launch_missing_job_id_raises(self):
+        runner = self._runner_with_two_jobs(
+            launch_resp={"ok": True},  # no job_id
+        )
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            with pytest.raises(RuntimeError, match="job_id"):
+                prepare_runpod_review(
+                    "https://station.example", "o", "r", 1,
+                )
+
+    def test_launch_missing_name_raises(self):
+        runner = self._runner_with_two_jobs(
+            launch_resp={"ok": True, "job_id": "j"},  # no name
+            launch_result={"created": True},  # poll returns no name
+        )
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            with pytest.raises(RuntimeError, match="pod name"):
+                prepare_runpod_review(
+                    "https://station.example", "o", "r", 1,
+                )
+
+
+# ---------------------------------------------------------------------------
+# cleanup_runpod_review (item 3)
+# ---------------------------------------------------------------------------
+
+class TestCleanupRunpodReview:
+    def test_posts_to_reviews_cleanup(self):
+        runner = MagicMock()
+        runner._request = MagicMock(return_value={
+            "ok": True, "pr": 42, "dry_run": False,
+            "terminated": [{"name": "pr-foo-42", "id": "abc"}],
+            "skipped": [], "removed_records": ["pr-foo-42"],
+            "total_found": 1, "total_terminated": 1,
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            result = cleanup_runpod_review("https://station", 42)
+        runner._request.assert_called_once_with(
+            "POST", "/reviews/cleanup",
+            json={"pr": 42, "dry_run": False},
+        )
+        assert result["total_terminated"] == 1
+
+    def test_dry_run_passes_flag(self):
+        runner = MagicMock()
+        runner._request = MagicMock(return_value={
+            "ok": True, "pr": 7, "dry_run": True,
+            "terminated": [], "skipped": [{"name": "p"}],
+            "total_found": 1, "total_terminated": 0,
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            cleanup_runpod_review("https://station", 7, dry_run=True)
+        body = runner._request.call_args.kwargs["json"]
+        assert body["dry_run"] is True
