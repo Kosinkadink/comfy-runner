@@ -174,6 +174,90 @@ comfy_runner.py deploy [name] --pull
 
 Using `--branch` persists the branch name so `--pull` can re-fetch it later. The deploy command automatically stops the instance before deploying, installs changed requirements, restarts if it was running, and captures a post-update snapshot.
 
+### PR Review
+
+End-to-end preparation of a PR for review: deploy the PR, parse a `comfyrunner` manifest block from the PR description, fetch any declared workflow URLs into `user/default/workflows/`, and download any missing models. See [docs/manifest-spec.md](docs/manifest-spec.md) for the manifest format.
+
+```bash
+# Review a PR locally on the default installation
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI
+
+# Review on a named local install
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target local:dev
+
+# Review on an existing pod (auto-wakes the pod if it's stopped, then
+# deploys + provisions). The station refuses pods tagged purpose='test'
+# unless --force-purpose is set, and warns when reviewing against a
+# purpose='persistent' (general-dev) pod whose state would get
+# clobbered.
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target remote:my-pod
+
+# Review on a fresh ephemeral RunPod pod (auto-tagged purpose='pr',
+# pr_number=1234 in the pod registry so review-cleanup can find it).
+# --idle-stop-after sets a per-review idle timeout (in seconds) so the
+# station's idle reaper auto-stops the pod after the review session.
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target runpod:RTX_4090 --idle-stop-after 1800
+
+# Pass extra workflow URLs / model entries from the CLI (these win
+# over anything in the PR body's manifest block).
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI \
+    --workflow https://raw.githubusercontent.com/comfy-org/ComfyUI/<branch>/examples/demo.json \
+    --model "sdxl_base.safetensors=https://huggingface.co/.../sdxl_base.safetensors=checkpoints"
+
+# Idempotent on remote targets: a second review of the same PR skips
+# the deploy step. Force a re-deploy with --force-deploy.
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target remote:my-pod --force-deploy
+
+# Tear down ephemeral PR pods (purpose='pr') for a given PR number.
+comfy_runner.py review-cleanup 1234
+comfy_runner.py review-cleanup 1234 --dry-run
+```
+
+#### Manifest authoring tools
+
+Two pure-local commands that help PR authors get the `comfyrunner` block right *before* anyone runs review prep against the PR:
+
+```bash
+# Generate a comfyrunner block from a workflow JSON file (pulls models
+# out of node.properties.models). Paste the output into the PR body.
+comfy_runner.py review-init examples/demo.json \
+    --workflow-url https://raw.githubusercontent.com/<owner>/<repo>/<branch>/examples/demo.json
+
+# Lint a manifest source. Source can be:
+#   * a local file path (.md / .json / anything text)
+#   * an "owner/repo#pr" shorthand
+#   * a GitHub PR URL
+# Exit 0 on a valid manifest, 1 on any error finding.
+comfy_runner.py review-validate path/to/PR_DESCRIPTION.md
+comfy_runner.py review-validate comfy-org/ComfyUI#1234
+comfy_runner.py review-validate https://github.com/comfy-org/ComfyUI/pull/1234
+```
+
+Both commands run entirely on the local machine — no station, no network for `review-init`, only a single GitHub fetch for `review-validate` against a PR.
+
+#### Example PR-body block
+
+Authors paste this fenced block anywhere in the PR description; `review` parses it via the GitHub API. Both `comfyrunner` and `comfy-runner` are accepted as the language tag:
+
+````markdown
+```comfyrunner
+{
+  "workflows": [
+    "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/<branch>/examples/sdxl_demo.json"
+  ],
+  "models": [
+    {
+      "name": "sdxl_base.safetensors",
+      "url": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors",
+      "directory": "checkpoints"
+    }
+  ]
+}
+```
+````
+
+CLI `--workflow` / `--model` flags merge with this block; the CLI wins on conflicts. Workflow URLs are fetched from the URL allowlist by default (`huggingface.co`, `civitai.com`, `modelscope.cn`, `raw.githubusercontent.com`, `gist.githubusercontent.com`, `github.com`); other hosts require `--allow-arbitrary-urls`.
+
 ### Model Downloads & Uploads
 
 ```bash
