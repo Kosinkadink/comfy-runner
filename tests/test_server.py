@@ -1079,3 +1079,115 @@ class TestOpenAPIIncludesReviewRoutes:
         spec = resp.get_json()
         assert "/reviews/cleanup" in spec["paths"]
         assert "post" in spec["paths"]["/reviews/cleanup"]
+
+
+# =====================================================================
+# GET /tailnet/runners — auto-discovery endpoint
+# =====================================================================
+
+
+class TestTailnetRunners:
+    def test_returns_discovery_payload(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        payload = {
+            "ok": True,
+            "runners": [{
+                "hostname": "comfy-pr-1",
+                "fqdn": "comfy-pr-1.tn.ts.net",
+                "host": "100.64.0.10",
+                "server_url": "http://100.64.0.10:9189",
+                "provider": "runpod",
+                "pod_name": "pr-1",
+                "purpose": "pr",
+                "pr_number": 1,
+                "gpu": "RTX 4090",
+                "ram_gb": 64,
+                "platform": "linux",
+                "os": "Ubuntu 22.04",
+                "comfy_runner_detected": True,
+            }],
+            "tailnet_configured": True,
+            "device_count": 3,
+            "online_count": 2,
+        }
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value=payload,
+        ) as mock_disc:
+            resp = client.get("/tailnet/runners")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data == payload
+        mock_disc.assert_called_once_with(force_refresh=False)
+
+    def test_refresh_query_param_propagates(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={"ok": True, "runners": []},
+        ) as mock_disc:
+            client.get("/tailnet/runners?refresh=1")
+        assert mock_disc.call_args.kwargs["force_refresh"] is True
+
+    def test_discovery_exception_returns_503(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            side_effect=RuntimeError("api down"),
+        ):
+            resp = client.get("/tailnet/runners")
+        assert resp.status_code == 503
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "api down" in data["error"]
+
+    def test_dashboard_renders_with_no_credentials(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        # No tailnet creds → discovery returns the not-configured payload;
+        # dashboard must still render 200 OK with the disabled notice.
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True, "runners": [], "tailnet_configured": False,
+                "device_count": 0, "online_count": 0,
+            },
+        ):
+            resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert "Comfy-Runners (Tailnet)" in body
+        assert "discovery disabled" in body
+
+    def test_dashboard_renders_runner_rows(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True,
+                "tailnet_configured": True,
+                "device_count": 5,
+                "online_count": 3,
+                "runners": [{
+                    "hostname": "comfy-pr-1234",
+                    "fqdn": "comfy-pr-1234.tn.ts.net",
+                    "host": "100.64.0.10",
+                    "server_url": "http://100.64.0.10:9189",
+                    "provider": "runpod",
+                    "pod_name": "pr-1234",
+                    "purpose": "pr",
+                    "pr_number": 1234,
+                    "gpu": "RTX 4090",
+                    "ram_gb": 64,
+                    "platform": "linux",
+                    "os": "Ubuntu 22.04",
+                    "comfy_runner_detected": True,
+                }],
+            },
+        ):
+            resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert "comfy-pr-1234" in body
+        assert "RTX 4090" in body
+        assert "runpod" in body
+        assert "#1234" in body
