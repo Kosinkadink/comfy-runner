@@ -1182,7 +1182,41 @@ _DASHBOARD_HTML = """\
 <h1>comfy-runner Dashboard</h1>
 <p class="refresh">Auto-refreshes every 15 seconds</p>
 
-<h2>Pods</h2>
+<h2>Comfy-Runners (Tailnet)</h2>
+{% if tailnet.error %}
+<p class="refresh">Tailnet discovery failed: {{ tailnet.error }}</p>
+{% elif not tailnet.tailnet_configured %}
+<p class="refresh">Tailscale API key / tailnet not configured —
+discovery disabled.</p>
+{% elif tailnet.runners %}
+<p class="refresh">{{ tailnet.runners|length }} responder(s) of
+{{ tailnet.online_count }} online tailnet device(s)
+({{ tailnet.device_count }} total).</p>
+<table>
+<tr>
+  <th>Name</th><th>Provider</th><th>Purpose</th>
+  <th>GPU</th><th>RAM (GB)</th><th>$/hr</th>
+  <th>PR #</th><th>Server URL</th>
+</tr>
+{% for r in tailnet.runners %}
+<tr>
+  <td>{{ r.hostname }}</td>
+  <td class="{% if r.provider == 'runpod' %}running{% endif %}">{{ r.provider }}</td>
+  <td>{% if r.purpose %}{{ r.purpose }}{% else %}-{% endif %}</td>
+  <td>{% if r.gpu %}{{ r.gpu }}{% else %}-{% endif %}</td>
+  <td>{% if r.ram_gb is not none %}{{ r.ram_gb }}{% else %}-{% endif %}</td>
+  <td>{% if r.cost_per_hr is defined and r.cost_per_hr %}{{ "%.2f"|format(r.cost_per_hr) }}{% else %}-{% endif %}</td>
+  <td>{% if r.pr_number %}<a href="https://github.com/comfyanonymous/ComfyUI/pull/{{ r.pr_number }}">#{{ r.pr_number }}</a>{% else %}-{% endif %}</td>
+  <td><a href="{{ r.server_url }}">{{ r.server_url }}</a></td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No comfy-runners detected on the tailnet
+({{ tailnet.online_count }} online device(s) probed).</p>
+{% endif %}
+
+<h2>Pods (RunPod registry)</h2>
 {% if pods %}
 <table>
 <tr><th>Name</th><th>Status</th><th>GPU</th><th>$/hr</th><th>Server URL</th></tr>
@@ -4635,6 +4669,35 @@ def create_app() -> Any:
         return send_file(str(report_path))
 
     # ==================================================================
+    # Tailnet — auto-discovery of comfy-runners on the configured tailnet
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # GET /tailnet/runners — list comfy-runners reachable on the tailnet
+    # ------------------------------------------------------------------
+    @app.route("/tailnet/runners", methods=["GET"])
+    def route_tailnet_runners() -> Any:
+        """Auto-discover comfy-runner instances on the configured tailnet.
+
+        Probes ``/system-info`` on every online Tailscale device in
+        parallel; only responders are returned. Each runner is enriched
+        with hardware info (from system-info) and pod metadata
+        (provider/purpose/pr_number) when joinable against a configured
+        runpod pod record.
+
+        Query parameters:
+        * ``refresh=1`` — bypass the 30 s device-list cache.
+        """
+        from comfy_runner.hosted.tailnet import discover_comfy_runners
+
+        force = request.args.get("refresh", "0") in ("1", "true", "yes")
+        try:
+            result = discover_comfy_runners(force_refresh=force)
+        except Exception as e:
+            return _err(f"Tailnet discovery failed: {e}", 503)
+        return jsonify(result)
+
+    # ==================================================================
     # Dashboard — simple HTML status page
     # ==================================================================
 
@@ -4670,6 +4733,27 @@ def create_app() -> Any:
         except Exception:
             pods_data = []
 
+        # Tailnet discovery — best-effort; render an empty section
+        # rather than failing the whole page if discovery raises. The
+        # ``error`` field distinguishes a real failure (Tailscale API
+        # down, transport error) from the "not configured" path so the
+        # template can show an actionable message instead of silently
+        # claiming discovery is disabled.
+        tailnet_data: dict[str, Any] = {
+            "ok": True, "runners": [], "tailnet_configured": False,
+            "device_count": 0, "online_count": 0, "error": None,
+        }
+        try:
+            from comfy_runner.hosted.tailnet import discover_comfy_runners
+            tailnet_data = discover_comfy_runners()
+            tailnet_data.setdefault("error", None)
+        except Exception as e:
+            log.warning("Dashboard tailnet discovery failed: %s", e)
+            tailnet_data = {
+                "ok": False, "runners": [], "tailnet_configured": True,
+                "device_count": 0, "online_count": 0, "error": str(e),
+            }
+
         test_runs = _list_test_runs(limit=20)
         active_jobs = _jobs.list_active()
 
@@ -4677,6 +4761,7 @@ def create_app() -> Any:
         return render_template_string(
             html,
             pods=pods_data,
+            tailnet=tailnet_data,
             test_runs=test_runs,
             jobs=active_jobs,
         )

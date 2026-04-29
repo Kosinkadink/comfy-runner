@@ -1912,6 +1912,67 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
 
+    # ── Tailnet ───────────────────────────────────────────────────────
+    {
+        "path": "/tailnet/runners",
+        "method": "get",
+        "tags": ["Tailnet"],
+        "summary": "Auto-discover comfy-runners on the tailnet",
+        "description": (
+            "Lists every comfy-runner reachable on the configured "
+            "Tailscale tailnet by listing devices via the Tailscale REST "
+            "API and probing /system-info on each online device in "
+            "parallel. Only responders are returned. Each runner is "
+            "enriched with hardware info (from /system-info) and pod "
+            "metadata (provider/purpose/pr_number) when joinable against "
+            "a configured runpod pod record."
+        ),
+        "parameters": [
+            {
+                "name": "refresh",
+                "in": "query",
+                "schema": {"type": "string", "enum": ["1", "true", "yes"]},
+                "description": "Bypass the 30 s device-list cache.",
+                "required": False,
+            },
+        ],
+        "responses": _ok_response("Discovered tailnet runners", {
+            "runners": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "hostname": {"type": "string"},
+                        "fqdn": {"type": "string"},
+                        "host": {"type": "string", "description": "IP/FQDN used for probing"},
+                        "server_url": {"type": "string"},
+                        "provider": {"type": "string", "enum": ["runpod", "local"]},
+                        "pod_name": {"type": "string", "nullable": True},
+                        "purpose": {"type": "string", "nullable": True, "enum": ["pr", "persistent", "test", None]},
+                        "pr_number": {"type": "integer", "nullable": True},
+                        "gpu": {"type": "string"},
+                        "ram_gb": {"type": "integer", "nullable": True},
+                        "platform": {"type": "string"},
+                        "os": {"type": "string"},
+                        "comfy_runner_detected": {"type": "boolean"},
+                    },
+                },
+            },
+            "tailnet_configured": {"type": "boolean"},
+            "device_count": {"type": "integer"},
+            "online_count": {"type": "integer"},
+            "error": {
+                "type": "string",
+                "nullable": True,
+                "description": (
+                    "Set when the most recent Tailscale device-list "
+                    "fetch failed (HTTP non-2xx or transport error). "
+                    "Null on success."
+                ),
+            },
+        }),
+    },
+
     # ── Dashboard ─────────────────────────────────────────────────────
     {
         "path": "/dashboard",
