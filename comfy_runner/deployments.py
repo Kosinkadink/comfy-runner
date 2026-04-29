@@ -142,7 +142,10 @@ def execute_deploy(
             )
         result = deploy_reset(install_path, original_ref, send_output=send_output)
     elif pr:
-        result = deploy_pr(install_path, int(pr), send_output=send_output)
+        result = deploy_pr(
+            install_path, int(pr),
+            repo_url=repo_url, send_output=send_output,
+        )
     elif branch:
         result = deploy_ref(
             install_path, branch, repo_url=repo_url, send_output=send_output
@@ -167,6 +170,8 @@ def execute_deploy(
     if pr:
         updates["deployed_pr"] = int(pr)
         updates["deployed_branch"] = None
+        if repo_url:
+            updates["deployed_repo"] = repo_url
     elif branch:
         updates["deployed_branch"] = branch
         updates["deployed_pr"] = None

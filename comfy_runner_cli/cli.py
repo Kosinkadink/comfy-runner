@@ -478,6 +478,21 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     name = args.name
     out = None if args.json else _output
 
+    # Normalize --repo into a full HTTPS URL. Accepts owner/name shorthand
+    # or any of the URL forms _parse_repo handles.
+    repo_url = getattr(args, "repo_url", None)
+    if repo_url and "://" not in repo_url:
+        try:
+            owner, repo_name = _parse_repo(repo_url)
+            repo_url = f"https://github.com/{owner}/{repo_name}"
+            args.repo_url = repo_url
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     try:
         record = get_installation(name)
         if not record:
@@ -506,6 +521,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             reset=getattr(args, "reset", False),
             latest=getattr(args, "latest", False),
             pull=getattr(args, "pull", False),
+            repo_url=getattr(args, "repo_url", None),
             send_output=out,
         )
 
@@ -576,6 +592,343 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             sys.exit(1)
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Review (PR-review preparation)
+# ---------------------------------------------------------------------------
+
+def _parse_review_target(spec: str | None) -> dict:
+    """Parse a review target spec into ``{"kind": ..., ...}``.
+
+    Formats (review-specific — distinct from station-test target specs):
+
+    * ``local``                  — local installation named ``main``
+    * ``local:<install-name>``   — named local installation
+    * ``remote:<pod-name>``      — existing pod via the central server
+    * ``runpod`` / ``runpod:<gpu>`` — fresh PR pod via the central server
+
+    ``None`` and the empty string both default to ``local``.
+    """
+    if spec is None or spec == "":
+        return {"kind": "local", "install_name": "main"}
+    if spec == "local":
+        return {"kind": "local", "install_name": "main"}
+    if spec.startswith("local:"):
+        name = spec[len("local:") :].strip()
+        if not name:
+            raise ValueError("local: target requires an installation name")
+        return {"kind": "local", "install_name": name}
+    if spec.startswith("remote:"):
+        pod = spec[len("remote:") :].strip()
+        if not pod:
+            raise ValueError("remote: target requires a pod name")
+        return {"kind": "remote", "pod_name": pod}
+    if spec == "runpod":
+        return {"kind": "runpod", "gpu_type": None}
+    if spec.startswith("runpod:"):
+        gpu = spec[len("runpod:") :].strip()
+        return {"kind": "runpod", "gpu_type": gpu or None}
+    raise ValueError(
+        f"Unknown target spec: {spec!r}. "
+        "Use local, local:<install>, remote:<pod>, or runpod[:<gpu>]."
+    )
+
+
+def _parse_repo(repo: str) -> tuple[str, str]:
+    """Parse ``owner/name`` or full GitHub URL into ``(owner, name)``."""
+    if not repo:
+        raise ValueError("--repo is required (e.g. comfy-org/ComfyUI)")
+    r = repo.strip()
+    if "://" in r:
+        r = r.split("://", 1)[1]
+    if r.endswith(".git"):
+        r = r[: -len(".git")]
+    if r.startswith("github.com/"):
+        r = r[len("github.com/") :]
+    parts = [p for p in r.split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(
+            f"Could not parse --repo {repo!r}; expected 'owner/name' "
+            "or a full GitHub URL"
+        )
+    return parts[-2], parts[-1]
+
+
+def _parse_model_flag(spec: str) -> dict[str, str]:
+    """Parse a ``--model NAME=URL=DIRECTORY`` CLI flag.
+
+    Splits the *first* ``=`` for name and the *last* ``=`` for directory
+    so URLs containing ``=`` (HuggingFace query strings, signed S3 URLs)
+    survive intact in the middle.
+    """
+    name, sep, rest = spec.partition("=")
+    if not sep:
+        raise ValueError(
+            f"--model must be 'name=url=directory' (got {spec!r})"
+        )
+    url, sep, directory = rest.rpartition("=")
+    if not sep:
+        raise ValueError(
+            f"--model must be 'name=url=directory' (got {spec!r})"
+        )
+    name, url, directory = name.strip(), url.strip(), directory.strip()
+    if not (name and url and directory):
+        raise ValueError(f"--model fields cannot be empty: {spec!r}")
+    return {"name": name, "url": url, "directory": directory}
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """Prepare a PR for review on the chosen target.
+
+    For ``local`` targets: deploy the PR into a named installation,
+    fetch the PR's ``comfyrunner`` manifest block from GitHub, fetch
+    any declared workflow URLs into ``user/default/workflows/``, and
+    download missing models.
+
+    Remote and ephemeral runpod targets land in subsequent PRs.
+    """
+    out = None if args.json else _output
+
+    try:
+        owner, repo_name = _parse_repo(args.repo)
+        target = _parse_review_target(getattr(args, "target", None))
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if target["kind"] == "runpod":
+        msg = (
+            "Target kind 'runpod' is not yet implemented for review. "
+            "Use --target local, --target local:<install-name>, or "
+            "--target remote:<pod-name>."
+        )
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        sys.exit(2)
+
+    pr = args.pr
+
+    extra_models: list = []
+    for spec in (getattr(args, "model", None) or []):
+        try:
+            extra_models.append(_parse_model_flag(spec))
+        except ValueError as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            else:
+                console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+    extra_workflows = list(getattr(args, "workflow", None) or [])
+
+    from comfy_runner.manifest import ModelEntry
+    extra_model_entries = [ModelEntry.from_dict(m) for m in extra_models]
+
+    if target["kind"] == "remote":
+        _cmd_review_remote(
+            args, target, owner, repo_name, pr,
+            extra_model_entries, extra_workflows, out,
+        )
+        return
+
+    # ── local target ─────────────────────────────────────────────────────
+    install_name = target["install_name"]
+    target_label = f"local:{install_name}"
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label}...\n"
+        )
+
+    # --- Step 1: deploy the PR onto the local installation. -------------
+    deploy_args = argparse.Namespace(
+        name=install_name,
+        pr=pr,
+        branch=None,
+        tag=None,
+        commit=None,
+        reset=False,
+        latest=False,
+        pull=False,
+        repo_url=f"https://github.com/{owner}/{repo_name}",
+        json=False,  # always stream so the user sees progress
+    )
+    # ``cmd_deploy`` calls ``sys.exit(1)`` on failure; let it propagate.
+    if out:
+        out(f"\n--- Deploying PR #{pr} to '{install_name}' ---\n")
+    cmd_deploy(deploy_args)
+
+    # --- Step 2: manifest fetch + workflow fetch + model provision. -----
+    from comfy_runner.config import get_installation
+    from comfy_runner.review import prepare_local_review
+
+    record = get_installation(install_name)
+    if not record:
+        # Should not happen — cmd_deploy would have errored — but guard.
+        msg = f"Installation '{install_name}' missing after deploy"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, indent=2))
+        else:
+            console.print(f"[red]Error: {msg}[/red]")
+        sys.exit(1)
+    install_path = record["path"]
+
+    if out:
+        out(f"\n--- Resolving manifest for PR #{pr} ---\n")
+
+    review_result = prepare_local_review(
+        install_path, owner, repo_name, pr,
+        github_token=getattr(args, "github_token", None),
+        download_token=getattr(args, "token", "") or "",
+        extra_models=extra_model_entries,
+        extra_workflows=extra_workflows,
+        allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+        skip_provisioning=getattr(args, "no_provision_models", False),
+        send_output=out,
+    )
+
+    # --- Step 3: render. ------------------------------------------------
+    review_result["target"] = target_label
+    review_result["install_path"] = install_path
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
+    console.print(f"  [dim]Start ComfyUI: comfy_runner.py {install_name} start[/dim]")
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def _cmd_review_remote(
+    args: argparse.Namespace,
+    target: dict,
+    owner: str,
+    repo_name: str,
+    pr: int,
+    extra_model_entries: list,
+    extra_workflows: list[str],
+    out,
+) -> None:
+    """``cmd_review`` branch for ``--target remote:<pod-name>``."""
+    pod_name = target["pod_name"]
+    install_name = getattr(args, "install", None) or "main"
+    target_label = f"remote:{pod_name}"
+
+    try:
+        server = _station_server(args)
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label} via {server}...\n"
+        )
+
+    from comfy_runner.review import prepare_remote_review
+    try:
+        review_result = prepare_remote_review(
+            server, pod_name, install_name,
+            owner, repo_name, pr,
+            github_token=getattr(args, "github_token", None),
+            download_token=getattr(args, "token", "") or "",
+            extra_models=extra_model_entries,
+            extra_workflows=extra_workflows,
+            allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+            skip_provisioning=getattr(args, "no_provision_models", False),
+            force_purpose=getattr(args, "force_purpose", False),
+            send_output=out,
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    review_result["target"] = target_label
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
+    server_url = review_result.get("server_url") or ""
+    if server_url:
+        comfy_url = server_url.rsplit(":", 1)[0] + ":8188"
+        console.print(f"  [dim]Pod ComfyUI: {comfy_url}[/dim]")
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def _render_review_result(
+    review_result: dict, target_label: str, pr: int,
+) -> None:
+    """Render the human-readable summary common to local and remote review."""
+    console.print()
+    console.print(f"[green]✓ PR #{pr} ready on {target_label}[/green]")
+    if review_result.get("install_path"):
+        console.print(f"  Install: {review_result['install_path']}")
+    if review_result.get("pod_name"):
+        purpose = review_result.get("pod_purpose")
+        purpose_str = f" [{purpose}]" if purpose else ""
+        console.print(f"  Pod: {review_result['pod_name']}{purpose_str}")
+    if review_result.get("server_url"):
+        console.print(f"  Server: {review_result['server_url']}")
+    if review_result.get("workflows"):
+        console.print(
+            f"  Workflows ({len(review_result['workflows'])}):"
+        )
+        for wf in review_result["workflows"]:
+            console.print(f"    [dim]{wf}[/dim]")
+    if review_result.get("downloaded"):
+        console.print(
+            f"  Models downloaded ({len(review_result['downloaded'])}):"
+        )
+        for m in review_result["downloaded"]:
+            console.print(f"    [dim]{m}[/dim]")
+    if review_result.get("skipped"):
+        console.print(
+            f"  Models already present ({len(review_result['skipped'])})"
+        )
+    if review_result.get("failed"):
+        console.print(
+            f"  [red]Models failed ({len(review_result['failed'])}):[/red]"
+        )
+        for m in review_result["failed"]:
+            console.print(f"    [red]{m}[/red]")
+    if review_result.get("failures"):
+        console.print(
+            f"  [yellow]Workflow fetch failures "
+            f"({len(review_result['failures'])}):[/yellow]"
+        )
+        for f in review_result["failures"]:
+            console.print(
+                f"    [yellow]{f.get('url', '?')}: "
+                f"{f.get('error', '?')}[/yellow]"
+            )
 
 
 def cmd_tunnel(args: argparse.Namespace) -> None:
@@ -4097,7 +4450,82 @@ def main(argv: list[str] | None = None) -> None:
     deploy_group.add_argument("--reset", action="store_true", help="Reset to the original release ref")
     deploy_group.add_argument("--latest", action="store_true", help="Update to the latest standalone release's ComfyUI ref")
     deploy_group.add_argument("--pull", action="store_true", help="Re-fetch the currently tracked PR or branch")
+    p_deploy.add_argument(
+        "--repo", dest="repo_url",
+        help="Repo URL or owner/name to fetch from (overrides install's "
+             "origin for this deploy; mainly used for fork PRs).",
+    )
     p_deploy.set_defaults(func=cmd_deploy)
+
+    # review (PR-review preparation)
+    p_review = sub.add_parser(
+        "review",
+        help="Prepare a PR for review: deploy + manifest + model provisioning",
+    )
+    p_review.add_argument("pr", type=int, help="GitHub PR number")
+    p_review.add_argument(
+        "--repo", required=True,
+        help="Target repo as 'owner/name' or full GitHub URL "
+             "(e.g. comfy-org/ComfyUI)",
+    )
+    p_review.add_argument(
+        "--target", default="local",
+        help="Target spec: local, local:<install-name>, "
+             "remote:<pod-name>, runpod[:<gpu>] (default: local)",
+    )
+    p_review.add_argument(
+        "--workflow", action="append", default=[],
+        help="Extra workflow URL to fetch (repeatable). Merges with "
+             "any URLs in the PR's comfyrunner manifest block.",
+    )
+    p_review.add_argument(
+        "--model", action="append", default=[],
+        help="Extra model entry as 'name=url=directory' (repeatable). "
+             "Merges with any models in the PR's manifest.",
+    )
+    p_review.add_argument(
+        "--token",
+        help="Bearer token for authenticated model downloads "
+             "(HuggingFace / ModelScope). Not stored.",
+    )
+    p_review.add_argument(
+        "--github-token", dest="github_token",
+        help="GitHub token for fetching the PR body. Defaults to "
+             "$GITHUB_TOKEN; not required for public repos.",
+    )
+    p_review.add_argument(
+        "--no-provision-models", dest="no_provision_models",
+        action="store_true",
+        help="Fetch the manifest and save workflows but skip model "
+             "downloads.",
+    )
+    p_review.add_argument(
+        "--allow-arbitrary-urls", dest="allow_arbitrary_urls",
+        action="store_true",
+        help="Allow workflow URLs whose host is not in the default "
+             "allowlist (huggingface.co, civitai.com, modelscope.cn, "
+             "raw.githubusercontent.com, gist.githubusercontent.com, "
+             "github.com).",
+    )
+    p_review.add_argument(
+        "--server",
+        help="Override central station URL for remote/runpod targets "
+             "(default: read from station.json walking up from cwd).",
+    )
+    p_review.add_argument(
+        "--install",
+        default="main",
+        help="Installation name on the target pod for remote/runpod "
+             "targets (default: main). Ignored for local targets — use "
+             "--target local:<install-name> instead.",
+    )
+    p_review.add_argument(
+        "--force-purpose", dest="force_purpose", action="store_true",
+        help="Allow review against pods tagged purpose='test' (e2e test "
+             "pods). By default such pods are refused because reviews "
+             "would clobber their curated install state.",
+    )
+    p_review.set_defaults(func=cmd_review)
 
     # download-model
     p_dlm = sub.add_parser("download-model", help="Download a model by URL to a specific directory")

@@ -6,6 +6,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -257,3 +258,463 @@ class TestFlaskApp:
         data = resp.get_json()
         assert data["ok"] is False
         assert "error" in data
+
+
+# =====================================================================
+# POST /reviews/local — sidecar review prep endpoint (item 2)
+# =====================================================================
+
+
+def _wait_job(client, job_id: str, timeout: float = 5.0) -> dict:
+    """Poll /job/<job_id> until status != 'running' or timeout elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/job/{job_id}")
+        data = resp.get_json()
+        assert data["ok"] is True, data
+        if data.get("status") != "running":
+            return data
+        time.sleep(0.02)
+    raise AssertionError(f"Job {job_id} still running after {timeout}s")
+
+
+class TestReviewsLocal:
+    def _body(self, **overrides) -> dict:
+        body = {
+            "install": "main",
+            "owner": "comfy-org",
+            "repo": "ComfyUI",
+            "pr": 42,
+        }
+        body.update(overrides)
+        return body
+
+    def test_happy_path_runs_prepare_and_finishes_job(
+        self, client, fake_install, monkeypatch,
+    ):
+        review_result = {
+            "manifest": {"models": [], "workflows": []},
+            "resolved": None,
+            "downloaded": ["checkpoints/x"],
+            "skipped": [],
+            "failed": [],
+            "errors": [],
+            "workflows": [],
+            "workflows_dir": str(fake_install),
+            "failures": [],
+        }
+        monkeypatch.setattr(
+            "comfy_runner.review.prepare_local_review",
+            lambda *a, **kw: review_result,
+        )
+
+        resp = client.post("/reviews/local", json=self._body())
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["async"] is True
+        job_id = data["job_id"]
+
+        final = _wait_job(client, job_id)
+        assert final["status"] == "done"
+        assert final["result"] == review_result
+
+    def test_install_404_for_unknown(self, client, tmp_config_dir):
+        resp = client.post("/reviews/local", json=self._body(install="nope"))
+        assert resp.status_code == 404
+        assert resp.get_json()["ok"] is False
+
+    def test_install_rejects_path_traversal(self, client, tmp_config_dir):
+        resp = client.post(
+            "/reviews/local", json=self._body(install=".."),
+        )
+        assert resp.status_code == 400
+        assert "safe identifier" in resp.get_json()["error"]
+
+    def test_missing_pr_rejected(self, client, fake_install):
+        body = self._body()
+        del body["pr"]
+        resp = client.post("/reviews/local", json=body)
+        assert resp.status_code == 400
+        assert "pr" in resp.get_json()["error"].lower()
+
+    def test_negative_pr_rejected(self, client, fake_install):
+        resp = client.post("/reviews/local", json=self._body(pr=-1))
+        assert resp.status_code == 400
+
+    def test_pr_must_be_int_not_bool(self, client, fake_install):
+        # Without this guard, JSON booleans would be accepted as ints.
+        resp = client.post("/reviews/local", json=self._body(pr=True))
+        assert resp.status_code == 400
+
+    def test_missing_owner_rejected(self, client, fake_install):
+        body = self._body()
+        del body["owner"]
+        resp = client.post("/reviews/local", json=body)
+        assert resp.status_code == 400
+
+    def test_extra_models_must_be_list(self, client, fake_install):
+        resp = client.post(
+            "/reviews/local", json=self._body(extra_models="not-a-list"),
+        )
+        assert resp.status_code == 400
+
+    def test_extra_workflows_must_be_list_of_strings(self, client, fake_install):
+        resp = client.post(
+            "/reviews/local", json=self._body(extra_workflows=[1, 2, 3]),
+        )
+        assert resp.status_code == 400
+
+    def test_invalid_extra_models_rejected(self, client, fake_install):
+        resp = client.post(
+            "/reviews/local",
+            json=self._body(extra_models=[{"missing": "fields"}]),
+        )
+        assert resp.status_code == 400
+        assert "extra_models" in resp.get_json()["error"]
+
+    def test_extras_threaded_to_prepare(
+        self, client, fake_install, monkeypatch,
+    ):
+        captured: dict = {}
+
+        def fake_prepare(install_path, owner, repo, pr, **kw):
+            captured["args"] = (install_path, owner, repo, pr)
+            captured["kwargs"] = kw
+            return {
+                "manifest": None, "resolved": None,
+                "downloaded": [], "skipped": [], "failed": [], "errors": [],
+                "workflows": [], "workflows_dir": "/x", "failures": [],
+            }
+        monkeypatch.setattr(
+            "comfy_runner.review.prepare_local_review", fake_prepare,
+        )
+
+        resp = client.post("/reviews/local", json=self._body(
+            extra_workflows=["https://h/wf.json"],
+            extra_models=[{"name": "m.safetensors", "url": "https://h/m",
+                           "directory": "loras"}],
+            github_token="ghp",
+            download_token="hf",
+            allow_arbitrary_urls=True,
+            skip_provisioning=True,
+        ))
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id)
+        assert final["status"] == "done"
+
+        assert captured["args"][1] == "comfy-org"
+        assert captured["args"][2] == "ComfyUI"
+        assert captured["args"][3] == 42
+        kw = captured["kwargs"]
+        assert kw["github_token"] == "ghp"
+        assert kw["download_token"] == "hf"
+        assert kw["allow_arbitrary_urls"] is True
+        assert kw["skip_provisioning"] is True
+        assert kw["extra_workflows"] == ["https://h/wf.json"]
+        assert len(kw["extra_models"]) == 1
+        assert kw["extra_models"][0].name == "m.safetensors"
+
+    def test_prepare_exception_fails_job(
+        self, client, fake_install, monkeypatch,
+    ):
+        def boom(*a, **kw):
+            raise RuntimeError("disk full")
+        monkeypatch.setattr(
+            "comfy_runner.review.prepare_local_review", boom,
+        )
+
+        resp = client.post("/reviews/local", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id)
+        assert final["status"] == "error"
+        assert "disk full" in final["error"]
+
+
+# =====================================================================
+# POST /pods/<name>/review — station-mediated review prep (item 2)
+# =====================================================================
+
+
+class _FakePod:
+    def __init__(self, status: str = "RUNNING") -> None:
+        self.status = status
+
+
+class TestPodsReview:
+    """``POST /pods/<name>/review`` — auto-wake + deploy + review proxy."""
+
+    def _setup_pod(
+        self, monkeypatch, status: str = "RUNNING",
+        purpose: str | None = None,
+    ):
+        """Register a pod record + stub the runpod provider."""
+        from comfy_runner.hosted import config as hcfg
+        # Create a pod record via the existing hosted config API.
+        rec: dict = {
+            "id": "pod-id-123", "name": "pod-a", "gpu_type": "RTX_4090",
+        }
+        if purpose is not None:
+            rec["purpose"] = purpose
+        monkeypatch.setattr(
+            hcfg, "get_pod_record",
+            lambda provider, name: rec if name == "pod-a" else None,
+        )
+
+        provider = MagicMock()
+        provider.get_pod = MagicMock(return_value=_FakePod(status))
+        provider.start_pod = MagicMock()
+        # Patch the lazy provider getter inside server.py.
+        monkeypatch.setattr(
+            "comfy_runner_server.server._get_runpod_provider",
+            lambda: provider,
+        )
+        # Resolve the pod's sidecar URL deterministically.
+        monkeypatch.setattr(
+            "comfy_runner_server.server._get_pod_server_url",
+            lambda name, **_: "https://pod-a.ts.net:9189",
+        )
+        monkeypatch.setattr(
+            "comfy_runner_server.server._wait_for_remote_server",
+            lambda url, **_: None,
+        )
+        monkeypatch.setattr(
+            "comfy_runner_server.server._touch_pod_activity",
+            lambda name: None,
+        )
+        return provider
+
+    def _setup_runner(self, monkeypatch, *,
+                       deploy_result=None, review_result=None,
+                       deploy_job=True, review_job=True):
+        runner = MagicMock()
+
+        # First call → deploy job, second call → review job.
+        responses = []
+        if deploy_job:
+            responses.append({"ok": True, "job_id": "deploy-1"})
+        else:
+            responses.append({"ok": True})
+        if review_job:
+            responses.append({"ok": True, "job_id": "review-1"})
+        else:
+            responses.append({"ok": True})
+        runner._request = MagicMock(side_effect=responses)
+
+        results = [
+            deploy_result or {"restarted": True},
+            review_result or {
+                "manifest": None, "resolved": None,
+                "downloaded": [], "skipped": [], "failed": [], "errors": [],
+                "workflows": [], "workflows_dir": "/x", "failures": [],
+            },
+        ]
+        runner.poll_job = MagicMock(side_effect=results)
+        monkeypatch.setattr(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            lambda url: runner,
+        )
+        return runner
+
+    def _body(self, **overrides) -> dict:
+        body = {"owner": "comfy-org", "repo": "ComfyUI", "pr": 99}
+        body.update(overrides)
+        return body
+
+    def test_happy_path_running_pod(self, client, tmp_config_dir, monkeypatch):
+        provider = self._setup_pod(monkeypatch, status="RUNNING")
+        runner = self._setup_runner(monkeypatch)
+
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        job_id = data["job_id"]
+
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done", final
+        result = final["result"]
+        assert result["pod_name"] == "pod-a"
+        assert result["server_url"] == "https://pod-a.ts.net:9189"
+        assert "deploy_result" in result and "review_result" in result
+
+        # Running pod is NOT auto-started.
+        provider.start_pod.assert_not_called()
+
+        # Two HTTP calls: deploy then review.
+        calls = runner._request.call_args_list
+        assert calls[0].args == ("POST", "/main/deploy")
+        assert calls[1].args == ("POST", "/reviews/local")
+        deploy_body = calls[0].kwargs["json"]
+        assert deploy_body["pr"] == 99
+        assert deploy_body["repo"] == "https://github.com/comfy-org/ComfyUI"
+        review_body = calls[1].kwargs["json"]
+        assert review_body == {
+            "install": "main", "owner": "comfy-org",
+            "repo": "ComfyUI", "pr": 99,
+        }
+
+    def test_auto_wakes_stopped_pod(self, client, tmp_config_dir, monkeypatch):
+        provider = self._setup_pod(monkeypatch, status="STOPPED")
+        self._setup_runner(monkeypatch)
+
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done", final
+        # Stopped pod was started.
+        provider.start_pod.assert_called_once_with("pod-id-123")
+
+    def test_terminated_pod_fails(self, client, tmp_config_dir, monkeypatch):
+        provider = self._setup_pod(monkeypatch, status="TERMINATED")
+        # No runner needed — we should fail before any HTTP call.
+
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "error"
+        assert "terminated" in final["error"].lower()
+
+    def test_missing_pod_404(self, client, tmp_config_dir, monkeypatch):
+        from comfy_runner.hosted import config as hcfg
+        monkeypatch.setattr(
+            hcfg, "get_pod_record", lambda provider, name: None,
+        )
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        assert resp.status_code == 404
+
+    def test_invalid_pod_name_rejected(self, client, tmp_config_dir):
+        resp = client.post("/pods/..%2Fevil/review", json=self._body())
+        # _validate_pod_name rejects ``..`` etc; flask URL decoding may
+        # serve a 404 if the route doesn't match. Either is acceptable;
+        # the key is we never reach the worker.
+        assert resp.status_code in (400, 404)
+
+    def test_install_validated(self, client, tmp_config_dir, monkeypatch):
+        self._setup_pod(monkeypatch)
+        resp = client.post(
+            "/pods/pod-a/review", json=self._body(install=".."),
+        )
+        assert resp.status_code == 400
+
+    def test_extras_passed_through(self, client, tmp_config_dir, monkeypatch):
+        self._setup_pod(monkeypatch)
+        runner = self._setup_runner(monkeypatch)
+        body = self._body(
+            extra_workflows=["https://h/wf.json"],
+            extra_models=[{"name": "m", "url": "https://h/m",
+                           "directory": "loras"}],
+            github_token="ghp",
+            download_token="hf",
+            allow_arbitrary_urls=True,
+            skip_provisioning=True,
+        )
+        resp = client.post("/pods/pod-a/review", json=body)
+        job_id = resp.get_json()["job_id"]
+        _wait_job(client, job_id, timeout=5)
+
+        review_body = runner._request.call_args_list[1].kwargs["json"]
+        assert review_body["github_token"] == "ghp"
+        assert review_body["download_token"] == "hf"
+        assert review_body["allow_arbitrary_urls"] is True
+        assert review_body["skip_provisioning"] is True
+        assert review_body["extra_workflows"] == ["https://h/wf.json"]
+        assert review_body["extra_models"] == [
+            {"name": "m", "url": "https://h/m", "directory": "loras"}
+        ]
+
+    # ── Purpose gating ────────────────────────────────────────────────
+
+    def test_test_purpose_pod_refused(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="test")
+        # Don't set up the runner — we should fail before any HTTP call.
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        assert resp.status_code == 409
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "test" in data["error"]
+        assert "force_purpose" in data["error"]
+
+    def test_test_purpose_pod_allowed_with_force(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="test")
+        self._setup_runner(monkeypatch)
+        resp = client.post(
+            "/pods/pod-a/review",
+            json=self._body(force_purpose=True),
+        )
+        assert resp.status_code == 200
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        assert final["result"]["pod_purpose"] == "test"
+        # Force-purpose warning was surfaced.
+        assert any(
+            "force_purpose" in line for line in final.get("output", [])
+        )
+
+    def test_pr_purpose_pod_allowed_silently(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="pr")
+        self._setup_runner(monkeypatch)
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        assert final["result"]["pod_purpose"] == "pr"
+        # No purpose-warning lines for ``pr`` pods.
+        for line in final.get("output", []):
+            assert "purpose='persistent'" not in line
+            assert "purpose='test'" not in line
+
+    def test_persistent_purpose_pod_warns_but_allows(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        self._setup_pod(monkeypatch, purpose="persistent")
+        self._setup_runner(monkeypatch)
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        assert final["result"]["pod_purpose"] == "persistent"
+        # The warning text must appear in the job output.
+        assert any(
+            "persistent" in line and "general-dev" in line
+            for line in final.get("output", [])
+        )
+
+    def test_missing_purpose_treated_as_persistent(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        # Pre-existing pods without an explicit ``purpose`` field default
+        # to persistent for safety.
+        self._setup_pod(monkeypatch, purpose=None)
+        self._setup_runner(monkeypatch)
+        resp = client.post("/pods/pod-a/review", json=self._body())
+        job_id = resp.get_json()["job_id"]
+        final = _wait_job(client, job_id, timeout=5)
+        assert final["status"] == "done"
+        assert final["result"]["pod_purpose"] == "persistent"
+
+
+# =====================================================================
+# OpenAPI spec contains the new routes
+# =====================================================================
+
+
+class TestOpenAPIIncludesReviewRoutes:
+    def test_spec_contains_reviews_local(self, client):
+        resp = client.get("/openapi.json")
+        spec = resp.get_json()
+        assert "/reviews/local" in spec["paths"]
+        assert "post" in spec["paths"]["/reviews/local"]
+
+    def test_spec_contains_pods_review(self, client):
+        resp = client.get("/openapi.json")
+        spec = resp.get_json()
+        assert "/pods/{name}/review" in spec["paths"]
+        assert "post" in spec["paths"]["/pods/{name}/review"]

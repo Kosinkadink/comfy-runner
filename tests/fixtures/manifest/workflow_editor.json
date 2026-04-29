@@ -1,0 +1,21 @@
+{
+  "version": 0.4,
+  "last_node_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "CheckpointLoaderSimple",
+      "properties": {
+        "models": [
+          {
+            "name": "embedded.safetensors",
+            "url": "https://huggingface.co/test/embedded.safetensors",
+            "directory": "checkpoints"
+          }
+        ]
+      },
+      "widgets_values": ["embedded.safetensors"]
+    }
+  ],
+  "links": []
+}

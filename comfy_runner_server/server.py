@@ -2879,6 +2879,107 @@ def create_app() -> Any:
         ]})
 
     # ==================================================================
+    # PR review preparation
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # POST /reviews/local — fetch manifest + workflows + models for a PR
+    # ------------------------------------------------------------------
+    @app.route("/reviews/local", methods=["POST"])
+    def route_reviews_local() -> Any:
+        """Run prepare_local_review against a named installation.
+
+        Body: ``{install, owner, repo, pr, github_token?, download_token?,
+        extra_models?, extra_workflows?, allow_arbitrary_urls?,
+        skip_provisioning?}``. Async — returns ``job_id`` whose
+        ``result`` matches :func:`comfy_runner.review.prepare_local_review`.
+
+        The deploy step is *not* run here — callers are expected to have
+        already deployed the PR (e.g. via ``POST /<install>/deploy``) so
+        this endpoint is composable with the existing deploy proxy.
+        """
+        from safe_file import is_safe_path_component
+
+        body = request.get_json(silent=True) or {}
+
+        install = body.get("install", "")
+        if not isinstance(install, str) or not install or not is_safe_path_component(install):
+            return _err("'install' is required and must be a safe identifier")
+
+        owner = body.get("owner", "")
+        repo = body.get("repo", "")
+        if not isinstance(owner, str) or not owner.strip():
+            return _err("'owner' is required")
+        if not isinstance(repo, str) or not repo.strip():
+            return _err("'repo' is required")
+
+        pr = body.get("pr")
+        if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+            return _err("'pr' must be a positive integer")
+
+        extra_models_raw = body.get("extra_models") or []
+        extra_workflows_raw = body.get("extra_workflows") or []
+        if not isinstance(extra_models_raw, list):
+            return _err("'extra_models' must be a list")
+        if not isinstance(extra_workflows_raw, list) or not all(
+            isinstance(w, str) for w in extra_workflows_raw
+        ):
+            return _err("'extra_workflows' must be a list of strings")
+
+        from comfy_runner.manifest import ModelEntry
+        try:
+            extra_models = [ModelEntry.from_dict(m) for m in extra_models_raw]
+        except (ValueError, AttributeError, TypeError) as e:
+            return _err(f"invalid 'extra_models': {e}")
+
+        github_token = body.get("github_token")
+        if github_token is not None and not isinstance(github_token, str):
+            return _err("'github_token' must be a string")
+        download_token = body.get("download_token", "") or ""
+        if not isinstance(download_token, str):
+            return _err("'download_token' must be a string")
+
+        allow_arbitrary_urls = bool(body.get("allow_arbitrary_urls", False))
+        skip_provisioning = bool(body.get("skip_provisioning", False))
+
+        record, err = _get_record(install)
+        if not record:
+            return _err(err, 404)
+        install_path = record["path"]
+
+        job_id = _jobs.create(
+            label=f"review {owner}/{repo}#{pr} on {install}"
+        )
+
+        def _run() -> None:
+            from comfy_runner.review import prepare_local_review
+
+            out, lines = _make_collector(job_id)
+            lock = _get_install_lock(install)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Installation '{install}' is busy", lines)
+                return
+            try:
+                result = prepare_local_review(
+                    install_path, owner, repo, int(pr),
+                    github_token=github_token,
+                    download_token=download_token,
+                    extra_models=extra_models,
+                    extra_workflows=list(extra_workflows_raw),
+                    allow_arbitrary_urls=allow_arbitrary_urls,
+                    skip_provisioning=skip_provisioning,
+                    send_output=out,
+                )
+                _jobs.finish(job_id, result, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True})
+
+    # ==================================================================
     # Central Orchestration — Pod Management
     # ==================================================================
 
@@ -3192,6 +3293,205 @@ def create_app() -> Any:
                         "server_url": server_url,
                         "deploy_result": data,
                     }, lines)
+
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"ok": True, "job_id": job_id, "async": True, "name": name})
+
+    # ------------------------------------------------------------------
+    # POST /pods/<name>/review — auto-wake + deploy + prepare review (async)
+    # ------------------------------------------------------------------
+    @app.route("/pods/<name>/review", methods=["POST"])
+    def route_pods_review(name: str) -> Any:
+        """End-to-end review prep on an existing pod.
+
+        Auto-wakes the pod if it is stopped, deploys the requested PR via
+        the pod's sidecar ``/<install>/deploy`` route, and finally calls
+        the sidecar's ``/reviews/local`` route. Returns a single station
+        ``job_id``; its eventual ``result`` carries both
+        ``deploy_result`` and ``review_result`` plus pod metadata.
+        """
+        from safe_file import is_safe_path_component
+
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        from comfy_runner.hosted.config import get_pod_record
+
+        rec = get_pod_record("runpod", name)
+        if not rec:
+            return _err(f"Pod '{name}' not found in config", 404)
+
+        body = request.get_json(silent=True) or {}
+        install_name = body.get("install", "main")
+        if not isinstance(install_name, str) or not install_name or not is_safe_path_component(install_name):
+            return _err("'install' must be a safe identifier")
+
+        owner = body.get("owner", "")
+        repo = body.get("repo", "")
+        if not isinstance(owner, str) or not owner.strip():
+            return _err("'owner' is required")
+        if not isinstance(repo, str) or not repo.strip():
+            return _err("'repo' is required")
+
+        pr = body.get("pr")
+        if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
+            return _err("'pr' must be a positive integer")
+
+        # Best-effort body validation; the sidecar re-validates everything
+        # but we want to fail fast for obvious shape errors.
+        extra_models = body.get("extra_models") or []
+        extra_workflows = body.get("extra_workflows") or []
+        if not isinstance(extra_models, list):
+            return _err("'extra_models' must be a list")
+        if not isinstance(extra_workflows, list) or not all(
+            isinstance(w, str) for w in extra_workflows
+        ):
+            return _err("'extra_workflows' must be a list of strings")
+
+        # ── Purpose gating ───────────────────────────────────────────────
+        # Reviews mutate install state on the pod. Match the pod's
+        # ``purpose`` tag against what's safe:
+        #   * "pr"          → designed for this; allow.
+        #   * "persistent"  → general dev pod; allow with a one-line warning
+        #                     so the user knows their dev install state is
+        #                     about to be deployed-over.
+        #   * "test"        → e2e test pods have curated install state we
+        #                     shouldn't trample; refuse unless the caller
+        #                     opts in with ``force_purpose: true``.
+        force_purpose = bool(body.get("force_purpose", False))
+        pod_purpose = rec.get("purpose", "persistent")
+        if pod_purpose == "test" and not force_purpose:
+            return _err(
+                f"Pod '{name}' has purpose='test' (e2e test pod). "
+                f"Reviews would clobber its curated install state. "
+                f"Pass force_purpose=true to override.",
+                409,
+            )
+
+        job_id = _jobs.create(
+            label=f"pod review {owner}/{repo}#{pr} on {name}"
+        )
+
+        def _run() -> None:
+            from comfy_runner.hosted.remote import RemoteRunner
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=5):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                pod_id = rec["id"]
+
+                pod = provider.get_pod(pod_id)
+                if not pod or pod.status in ("TERMINATED", "EXITED"):
+                    _jobs.fail(
+                        job_id,
+                        f"Pod '{name}' is terminated or gone",
+                        lines,
+                    )
+                    return
+                if pod.status != "RUNNING":
+                    out(f"Pod was {pod.status} — auto-waking...\n")
+                    provider.start_pod(pod_id)
+                else:
+                    out("Pod is RUNNING.\n")
+
+                # Surface purpose so the operator knows what kind of pod
+                # this review is about to mutate. ``pr`` pods are silent.
+                if pod_purpose == "persistent":
+                    out(
+                        f"⚠ Pod '{name}' is purpose='persistent' "
+                        f"(general-dev). Review will deploy over its "
+                        f"current install state.\n"
+                    )
+                elif pod_purpose == "test" and force_purpose:
+                    out(
+                        f"⚠ Pod '{name}' is purpose='test' but "
+                        f"force_purpose=true — proceeding.\n"
+                    )
+
+                _touch_pod_activity(name)
+                server_url = _get_pod_server_url(name)
+                out(f"Connecting to {server_url}...\n")
+                _wait_for_remote_server(server_url, send_output=out)
+
+                runner = RemoteRunner(server_url)
+
+                # ── 1) Deploy the PR via the sidecar ───────────────────
+                deploy_body: dict[str, Any] = {
+                    "pr": int(pr),
+                    "repo": f"https://github.com/{owner}/{repo}",
+                    "start": True,
+                }
+                if body.get("title"):
+                    deploy_body["title"] = body["title"]
+                if body.get("launch_args"):
+                    deploy_body["launch_args"] = body["launch_args"]
+                if body.get("cuda_compat"):
+                    deploy_body["cuda_compat"] = True
+
+                out(
+                    f"Deploying PR #{pr} ({owner}/{repo}) "
+                    f"to '{install_name}'...\n"
+                )
+                deploy_resp = runner._request(
+                    "POST", f"/{install_name}/deploy", json=deploy_body,
+                )
+                deploy_remote_job = deploy_resp.get("job_id")
+                if not deploy_remote_job:
+                    _jobs.fail(
+                        job_id, "Deploy did not return a job_id", lines,
+                    )
+                    return
+                deploy_result = runner.poll_job(
+                    deploy_remote_job, timeout=900, on_output=out,
+                )
+
+                # ── 2) Prepare review via the sidecar ──────────────────
+                review_body: dict[str, Any] = {
+                    "install": install_name,
+                    "owner": owner,
+                    "repo": repo,
+                    "pr": int(pr),
+                }
+                for k in (
+                    "github_token", "download_token", "extra_models",
+                    "extra_workflows", "allow_arbitrary_urls",
+                    "skip_provisioning",
+                ):
+                    if k in body:
+                        review_body[k] = body[k]
+
+                out("\nPreparing review (manifest + workflows + models)...\n")
+                review_resp = runner._request(
+                    "POST", "/reviews/local", json=review_body,
+                )
+                review_remote_job = review_resp.get("job_id")
+                if not review_remote_job:
+                    _jobs.fail(
+                        job_id, "Review prepare did not return a job_id",
+                        lines,
+                    )
+                    return
+                review_result = runner.poll_job(
+                    review_remote_job, timeout=900, on_output=out,
+                )
+
+                _jobs.finish(job_id, {
+                    "pod_name": name,
+                    "pod_purpose": pod_purpose,
+                    "server_url": server_url,
+                    "deploy_result": deploy_result,
+                    "review_result": review_result,
+                }, lines)
 
             except Exception as e:
                 _jobs.fail(job_id, str(e), lines)

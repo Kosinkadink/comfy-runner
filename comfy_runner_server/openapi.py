@@ -1348,6 +1348,118 @@ _ROUTES: list[dict[str, Any]] = [
         "responses": _async_response("Deploy started"),
     },
     {
+        "path": "/pods/{name}/review",
+        "method": "post",
+        "tags": ["Pods", "Review"],
+        "summary": "Prepare a PR for review on a pod (async)",
+        "description": (
+            "End-to-end PR review preparation on an existing pod. Auto-wakes "
+            "the pod if it is stopped, deploys the requested PR via the pod's "
+            "sidecar, and runs prepare_local_review (manifest + workflows + "
+            "model downloads) server-side. The single returned job_id covers "
+            "the entire flow; its result carries both deploy_result and "
+            "review_result plus pod metadata."
+        ),
+        "parameters": [_POD_NAME_PARAM],
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["owner", "repo", "pr"],
+                        "properties": {
+                            "owner": {"type": "string", "description": "GitHub repo owner"},
+                            "repo": {"type": "string", "description": "GitHub repo name"},
+                            "pr": {"type": "integer", "description": "PR number"},
+                            "install": {"type": "string", "default": "main", "description": "Installation name on the pod"},
+                            "github_token": {"type": "string", "description": "GitHub token for fetching PR body (defaults to pod's $GITHUB_TOKEN)"},
+                            "download_token": {"type": "string", "description": "Bearer token for authenticated model downloads"},
+                            "extra_models": {
+                                "type": "array",
+                                "description": "Extra ModelEntry objects to merge into the manifest",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "url": {"type": "string"},
+                                        "directory": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "extra_workflows": {
+                                "type": "array",
+                                "description": "Extra workflow URLs to fetch",
+                                "items": {"type": "string"},
+                            },
+                            "allow_arbitrary_urls": {"type": "boolean", "description": "Allow non-allowlisted workflow URL hosts"},
+                            "skip_provisioning": {"type": "boolean", "description": "Skip model downloads (manifest + workflows only)"},
+                            "title": {"type": "string", "description": "PR title for display in deploy step"},
+                            "launch_args": {"type": "string", "description": "ComfyUI launch arguments for deploy step"},
+                            "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility for deploy step"},
+                            "force_purpose": {"type": "boolean", "description": "Override the refusal to review against pods tagged purpose='test' (e2e test pods)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Review preparation started"),
+    },
+    {
+        "path": "/reviews/local",
+        "method": "post",
+        "tags": ["Review"],
+        "summary": "Prepare a PR for review on this installation (async)",
+        "description": (
+            "Sidecar-side endpoint that runs prepare_local_review against a "
+            "named installation: fetches the PR's comfyrunner manifest block "
+            "from GitHub, downloads any declared workflow URLs into "
+            "user/default/workflows/, and downloads missing models. The "
+            "deploy step is *not* run here — callers are expected to deploy "
+            "first via POST /<install>/deploy. Returns a job_id; its result "
+            "is the same dict shape as comfy_runner.review.prepare_local_review."
+        ),
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["install", "owner", "repo", "pr"],
+                        "properties": {
+                            "install": {"type": "string", "description": "Installation name (must be a safe identifier)"},
+                            "owner": {"type": "string", "description": "GitHub repo owner"},
+                            "repo": {"type": "string", "description": "GitHub repo name"},
+                            "pr": {"type": "integer", "description": "PR number"},
+                            "github_token": {"type": "string", "description": "GitHub token for fetching PR body"},
+                            "download_token": {"type": "string", "description": "Bearer token for authenticated model downloads"},
+                            "extra_models": {
+                                "type": "array",
+                                "description": "Extra ModelEntry objects to merge into the manifest",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "url": {"type": "string"},
+                                        "directory": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "extra_workflows": {
+                                "type": "array",
+                                "description": "Extra workflow URLs to fetch",
+                                "items": {"type": "string"},
+                            },
+                            "allow_arbitrary_urls": {"type": "boolean", "description": "Allow non-allowlisted workflow URL hosts"},
+                            "skip_provisioning": {"type": "boolean", "description": "Skip model downloads (manifest + workflows only)"},
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Review preparation started"),
+    },
+    {
         "path": "/pods/{name}/stop",
         "method": "post",
         "tags": ["Pods"],
