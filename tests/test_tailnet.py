@@ -244,6 +244,29 @@ class TestMatchPodRecord:
     def test_unknown_pod_returns_none(self):
         assert tn._match_pod_record("comfy-mystery", self._RECORDS) is None
 
+    def test_literal_n_suffix_pod_matches_itself(self):
+        # When a pod's literal name ends in -N (e.g. PR pods are
+        # "pr-1234"), the exact-match path must win — even if the same
+        # registry also has a record with the suffix-stripped form.
+        records = {
+            "dev": {"id": "p1", "purpose": "persistent"},
+            "dev-1": {"id": "p2", "purpose": "test"},
+        }
+        match = tn._match_pod_record("comfy-dev-1", records)
+        assert match is not None
+        name, rec = match
+        # Must be the literal "dev-1" pod, NOT the suffix-stripped "dev".
+        assert name == "dev-1"
+        assert rec["id"] == "p2"
+
+    def test_drift_suffix_only_used_when_exact_fails(self):
+        # No literal record for "pr-1234-1" — fall back to "pr-1234".
+        match = tn._match_pod_record("comfy-pr-1234-1", self._RECORDS)
+        assert match is not None
+        name, rec = match
+        assert name == "pr-1234"
+        assert rec["pr_number"] == 1234
+
 
 # ---------------------------------------------------------------------------
 # discover_comfy_runners — end-to-end

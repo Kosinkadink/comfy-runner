@@ -1158,6 +1158,23 @@ class TestTailnetRunners:
         assert "Comfy-Runners (Tailnet)" in body
         assert "discovery disabled" in body
 
+    def test_dashboard_renders_discovery_failure(self, client, tmp_config_dir):
+        # Discovery raises (Tailscale API down): dashboard must render
+        # 200 with an explicit error message, NOT silently claim the
+        # tailnet is "not configured".
+        from unittest.mock import patch
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            side_effect=RuntimeError("api down"),
+        ):
+            resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert "Comfy-Runners (Tailnet)" in body
+        assert "Tailnet discovery failed" in body
+        assert "api down" in body
+        assert "discovery disabled" not in body
+
     def test_dashboard_renders_runner_rows(self, client, tmp_config_dir):
         from unittest.mock import patch
         with patch(

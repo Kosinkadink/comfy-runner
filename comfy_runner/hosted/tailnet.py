@@ -59,32 +59,35 @@ def list_devices(force: bool = False) -> list[dict[str, Any]]:
     if not api_key or not tailnet:
         return []
 
-    now = time.monotonic()
+    # Fetch under the lock so concurrent callers don't stampede the
+    # Tailscale REST API when the cache goes stale. The fetch is bounded
+    # by a 10 s timeout, so worst-case wait for a queued caller is the
+    # same 10 s; subsequent callers see the just-refreshed cache.
     with _DEVICES_LOCK:
+        now = time.monotonic()
         if not force and now - _DEVICES_CACHE["at"] < _DEVICES_TTL:
             return list(_DEVICES_CACHE["devices"])
 
-    try:
-        import requests
-        resp = requests.get(
-            f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/devices",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10,
-        )
-        if not resp.ok:
-            log.warning(
-                "Tailscale device list failed: HTTP %s", resp.status_code,
+        try:
+            import requests
+            resp = requests.get(
+                f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/devices",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
             )
+            if not resp.ok:
+                log.warning(
+                    "Tailscale device list failed: HTTP %s", resp.status_code,
+                )
+                return []
+            devices = resp.json().get("devices", []) or []
+        except Exception as e:
+            log.warning("Tailscale device list failed: %s", e)
             return []
-        devices = resp.json().get("devices", []) or []
-    except Exception as e:
-        log.warning("Tailscale device list failed: %s", e)
-        return []
 
-    with _DEVICES_LOCK:
         _DEVICES_CACHE["at"] = now
         _DEVICES_CACHE["devices"] = devices
-    return list(devices)
+        return list(devices)
 
 
 def _clear_devices_cache() -> None:
@@ -205,25 +208,33 @@ def _match_pod_record(
     """Find the runpod pod record (if any) that matches *short_hostname*.
 
     Pods deployed by ``startup_main.sh`` register on the tailnet as
-    ``comfy-{pod_name}`` (with optional ``-1``, ``-2``, ... suffix on
-    drift). Match by stripping the ``comfy-`` prefix and any trailing
-    ``-N`` suffix, then checking against pod-record names.
+    ``comfy-{pod_name}`` (with optional ``-1``, ``-2``, ... suffix
+    appended by Tailscale on hostname-reclaim drift).
+
+    Match priority:
+
+    1. Exact match against ``base`` — wins when a pod's name itself
+       legitimately ends in ``-N`` (e.g. PR pod ``pr-1234``).
+    2. Strip a trailing ``-N`` drift suffix and retry — only used when
+       the exact match fails.
     """
     if not short_hostname.startswith("comfy-"):
         return None
     base = short_hostname[len("comfy-"):]
-    # Strip a trailing "-N" suffix if present.
-    import re
-    m = re.match(r"^(.*?)(?:-\d+)?$", base)
-    candidate = m.group(1) if m else base
-    rec = records.get(candidate)
-    if rec is not None:
-        return candidate, rec
-    # Fall back to exact match of the full base (handles names that
-    # legitimately end in "-<digits>").
+
+    # 1. Exact match wins.
     rec = records.get(base)
     if rec is not None:
         return base, rec
+
+    # 2. Otherwise, try the drift-suffix-stripped form.
+    import re
+    m = re.match(r"^(.*?)-\d+$", base)
+    if m is not None:
+        candidate = m.group(1)
+        rec = records.get(candidate)
+        if rec is not None:
+            return candidate, rec
     return None
 
 

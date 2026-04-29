@@ -1183,7 +1183,9 @@ _DASHBOARD_HTML = """\
 <p class="refresh">Auto-refreshes every 15 seconds</p>
 
 <h2>Comfy-Runners (Tailnet)</h2>
-{% if not tailnet.tailnet_configured %}
+{% if tailnet.error %}
+<p class="refresh">Tailnet discovery failed: {{ tailnet.error }}</p>
+{% elif not tailnet.tailnet_configured %}
 <p class="refresh">Tailscale API key / tailnet not configured —
 discovery disabled.</p>
 {% elif tailnet.runners %}
@@ -4732,15 +4734,25 @@ def create_app() -> Any:
             pods_data = []
 
         # Tailnet discovery — best-effort; render an empty section
-        # rather than failing the whole page if discovery raises.
+        # rather than failing the whole page if discovery raises. The
+        # ``error`` field distinguishes a real failure (Tailscale API
+        # down, transport error) from the "not configured" path so the
+        # template can show an actionable message instead of silently
+        # claiming discovery is disabled.
         tailnet_data: dict[str, Any] = {
-            "ok": False, "runners": [], "tailnet_configured": False,
+            "ok": True, "runners": [], "tailnet_configured": False,
+            "device_count": 0, "online_count": 0, "error": None,
         }
         try:
             from comfy_runner.hosted.tailnet import discover_comfy_runners
             tailnet_data = discover_comfy_runners()
+            tailnet_data.setdefault("error", None)
         except Exception as e:
             log.warning("Dashboard tailnet discovery failed: %s", e)
+            tailnet_data = {
+                "ok": False, "runners": [], "tailnet_configured": True,
+                "device_count": 0, "online_count": 0, "error": str(e),
+            }
 
         test_runs = _list_test_runs(limit=20)
         active_jobs = _jobs.list_active()
