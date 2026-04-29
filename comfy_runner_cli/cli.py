@@ -605,8 +605,12 @@ def _parse_review_target(spec: str | None) -> dict:
 
     * ``local``                  — local installation named ``main``
     * ``local:<install-name>``   — named local installation
-    * ``remote:<pod-name>``      — existing pod via the central server
-    * ``runpod`` / ``runpod:<gpu>`` — fresh PR pod via the central server
+    * ``remote:<pod-name>``      — existing pod via the central station
+    * ``runpod`` / ``runpod:<gpu>`` — fresh PR pod via the central station
+    * ``server:<url>``           — direct against any reachable
+      comfy-runner server (no station). URL must include scheme; on
+      Tailscale use the full MagicDNS FQDN, e.g.
+      ``server:https://mybox.tailnet.ts.net:9189``.
 
     ``None`` and the empty string both default to ``local``.
     """
@@ -629,9 +633,20 @@ def _parse_review_target(spec: str | None) -> dict:
     if spec.startswith("runpod:"):
         gpu = spec[len("runpod:") :].strip()
         return {"kind": "runpod", "gpu_type": gpu or None}
+    if spec.startswith("server:"):
+        url = spec[len("server:") :].strip()
+        if not url:
+            raise ValueError("server: target requires a URL")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError(
+                f"server: target URL must include scheme (got {url!r}). "
+                "On Tailscale, use the full MagicDNS FQDN, e.g. "
+                "server:https://mybox.tailnet.ts.net:9189."
+            )
+        return {"kind": "server", "server_url": url.rstrip("/")}
     raise ValueError(
-        f"Unknown target spec: {spec!r}. "
-        "Use local, local:<install>, remote:<pod>, or runpod[:<gpu>]."
+        f"Unknown target spec: {spec!r}. Use local, local:<install>, "
+        "remote:<pod>, runpod[:<gpu>], or server:<url>."
     )
 
 
@@ -726,6 +741,13 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     if target["kind"] == "runpod":
         _cmd_review_runpod(
+            args, target, owner, repo_name, pr,
+            extra_model_entries, extra_workflows, out,
+        )
+        return
+
+    if target["kind"] == "server":
+        _cmd_review_server(
             args, target, owner, repo_name, pr,
             extra_model_entries, extra_workflows, out,
         )
@@ -976,6 +998,69 @@ def _cmd_review_runpod(
         console.print(
             f"  [red]Cleanup failed: {review_result['cleanup_error']}[/red]"
         )
+
+    if review_result.get("failed") or review_result.get("failures"):
+        sys.exit(1)
+
+
+def _cmd_review_server(
+    args: argparse.Namespace,
+    target: dict,
+    owner: str,
+    repo_name: str,
+    pr: int,
+    extra_model_entries: list,
+    extra_workflows: list[str],
+    out,
+) -> None:
+    """``cmd_review`` branch for ``--target server:<url>`` (no station).
+
+    Talks directly to a comfy-runner server's ``/<install>/deploy`` and
+    ``/reviews/local`` endpoints. Use this for tailnet workstations or
+    any always-on comfy-runner you can reach via HTTP.
+    """
+    server_url = target["server_url"]
+    install_name = getattr(args, "install", None) or "main"
+    target_label = f"server:{server_url}"
+
+    if out:
+        out(
+            f"Preparing PR #{pr} ({owner}/{repo_name}) for review "
+            f"on {target_label}...\n"
+        )
+
+    from comfy_runner.review import prepare_server_review
+    try:
+        review_result = prepare_server_review(
+            server_url, install_name,
+            owner, repo_name, pr,
+            github_token=getattr(args, "github_token", None),
+            download_token=getattr(args, "token", "") or "",
+            extra_models=extra_model_entries,
+            extra_workflows=extra_workflows,
+            allow_arbitrary_urls=getattr(args, "allow_arbitrary_urls", False),
+            skip_provisioning=getattr(args, "no_provision_models", False),
+            force_deploy=getattr(args, "force_deploy", False),
+            send_output=out,
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    review_result["target"] = target_label
+    review_result["pr"] = pr
+    review_result["repo"] = f"{owner}/{repo_name}"
+
+    if args.json:
+        print(json.dumps({"ok": True, **review_result}, indent=2))
+        if review_result.get("failed") or review_result.get("failures"):
+            sys.exit(1)
+        return
+
+    _render_review_result(review_result, target_label, pr)
 
     if review_result.get("failed") or review_result.get("failures"):
         sys.exit(1)
@@ -4739,7 +4824,10 @@ def main(argv: list[str] | None = None) -> None:
     p_review.add_argument(
         "--target", default="local",
         help="Target spec: local, local:<install-name>, "
-             "remote:<pod-name>, runpod[:<gpu>] (default: local)",
+             "remote:<pod-name>, runpod[:<gpu>], or server:<url> "
+             "(default: local). 'server:' targets a comfy-runner server "
+             "directly (no central station) — use the full Tailscale "
+             "MagicDNS FQDN, e.g. server:https://mybox.tailnet.ts.net:9189.",
     )
     p_review.add_argument(
         "--workflow", action="append", default=[],
@@ -4783,9 +4871,9 @@ def main(argv: list[str] | None = None) -> None:
     p_review.add_argument(
         "--install",
         default="main",
-        help="Installation name on the target pod for remote/runpod "
-             "targets (default: main). Ignored for local targets — use "
-             "--target local:<install-name> instead.",
+        help="Installation name on the target server for remote/runpod/"
+             "server targets (default: main). Ignored for local targets — "
+             "use --target local:<install-name> instead.",
     )
     p_review.add_argument(
         "--force-purpose", dest="force_purpose", action="store_true",
@@ -4801,9 +4889,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_review.add_argument(
         "--force-deploy", dest="force_deploy", action="store_true",
-        help="For remote target: always deploy even if the pod already "
-             "has this PR deployed. Default is idempotent (skip deploy "
-             "if already current). No effect on local/runpod targets.",
+        help="For remote and server targets: always deploy even if the "
+             "install already has this PR deployed. Default is idempotent "
+             "(skip deploy if already current). No effect on local/runpod "
+             "targets.",
     )
     p_review.add_argument(
         "--idle-stop-after", dest="idle_stop_after", type=int, default=None,

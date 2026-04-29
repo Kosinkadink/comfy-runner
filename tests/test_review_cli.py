@@ -79,6 +79,38 @@ class TestParseReviewTarget:
         with pytest.raises(ValueError, match="Unknown target"):
             _parse_review_target("nonsense")
 
+    def test_server_https(self):
+        assert _parse_review_target("server:https://h.ts.net:9189") == {
+            "kind": "server", "server_url": "https://h.ts.net:9189",
+        }
+
+    def test_server_http(self):
+        assert _parse_review_target("server:http://localhost:9189") == {
+            "kind": "server", "server_url": "http://localhost:9189",
+        }
+
+    def test_server_strips_trailing_slash(self):
+        assert _parse_review_target("server:https://h.ts.net:9189/") == {
+            "kind": "server", "server_url": "https://h.ts.net:9189",
+        }
+
+    def test_server_strips_whitespace(self):
+        assert _parse_review_target("server: https://h.ts.net:9189 ") == {
+            "kind": "server", "server_url": "https://h.ts.net:9189",
+        }
+
+    def test_server_empty_rejected(self):
+        with pytest.raises(ValueError, match="server"):
+            _parse_review_target("server:")
+
+    def test_server_missing_scheme_rejected(self):
+        with pytest.raises(ValueError, match="scheme"):
+            _parse_review_target("server:mybox.tailnet.ts.net:9189")
+
+    def test_server_bare_hostname_rejected(self):
+        with pytest.raises(ValueError, match="scheme"):
+            _parse_review_target("server:localhost")
+
 
 # ---------------------------------------------------------------------------
 # _parse_repo
@@ -743,6 +775,190 @@ class TestCmdReviewRunpod:
             cmd_review(args)
         # idle_timeout_s is plumbed to launch-pr's body via prepare_runpod_review.
         assert mock_prep.call_args.kwargs["idle_timeout_s"] == 900
+
+
+# ---------------------------------------------------------------------------
+# cmd_review — server target (direct, no central station)
+# ---------------------------------------------------------------------------
+
+class TestCmdReviewServer:
+    """``--target server:<url>`` dispatches to prepare_server_review."""
+
+    _OK_RESULT = {
+        "manifest": None,
+        "resolved": None,
+        "downloaded": [],
+        "skipped": [],
+        "failed": [],
+        "errors": [],
+        "workflows": [],
+        "workflows_dir": "/x",
+        "failures": [],
+        "server_url": "https://h.ts.net:9189",
+        "deploy_result": {"restarted": True},
+    }
+
+    def test_calls_prepare_server_review_directly(self, capsys):
+        args = _review_args(
+            target="server:https://h.ts.net:9189", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["ok"] is True
+        assert payload["target"] == "server:https://h.ts.net:9189"
+        assert payload["pr"] == 123
+        # prepare_server_review got positional args (url, install, owner,
+        # repo, pr) — not a station URL.
+        call = mock_prep.call_args
+        assert call.args[0] == "https://h.ts.net:9189"
+        assert call.args[1] == "main"
+        assert call.args[2] == "comfy-org"
+        assert call.args[3] == "ComfyUI"
+        assert call.args[4] == 123
+
+    def test_install_override_passes_through(self):
+        args = _review_args(
+            target="server:https://h.ts.net:9189",
+            install="staging", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        assert mock_prep.call_args.args[1] == "staging"
+
+    def test_does_not_require_station_config(self, tmp_path: Path, monkeypatch):
+        # No station.json anywhere — server target must still work since
+        # it does not consult the central station.
+        monkeypatch.chdir(tmp_path)
+        args = _review_args(
+            target="server:https://h.ts.net:9189", server=None, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        mock_prep.assert_called_once()
+
+    def test_does_not_call_remote_or_local_paths(self):
+        args = _review_args(
+            target="server:https://h.ts.net:9189", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ), patch(
+            "comfy_runner.review.prepare_remote_review",
+        ) as mock_remote, patch(
+            "comfy_runner.review.prepare_runpod_review",
+        ) as mock_runpod, patch(
+            "comfy_runner_cli.cli.cmd_deploy",
+        ) as mock_deploy, patch(
+            "comfy_runner.review.prepare_local_review",
+        ) as mock_local:
+            cmd_review(args)
+        mock_remote.assert_not_called()
+        mock_runpod.assert_not_called()
+        mock_deploy.assert_not_called()
+        mock_local.assert_not_called()
+
+    def test_runtime_error_exits_1(self, capsys):
+        args = _review_args(
+            target="server:https://h.ts.net:9189", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            side_effect=RuntimeError("Failed to connect: timeout"),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_review(args)
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert "timeout" in payload["error"]
+
+    def test_partial_failures_cause_exit_1(self):
+        bad = dict(self._OK_RESULT)
+        bad["failures"] = [{"url": "https://h/x", "error": "404"}]
+        args = _review_args(
+            target="server:https://h.ts.net:9189", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=bad,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cmd_review(args)
+        assert exc.value.code == 1
+
+    def test_threads_extras(self):
+        args = _review_args(
+            target="server:https://h.ts.net:9189",
+            workflow=["https://h/wf.json"],
+            model=["a.safetensors=https://h/a=checkpoints"],
+            token="hf_tok", github_token="ghp_tok",
+            no_provision_models=True, allow_arbitrary_urls=True,
+            json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        kwargs = mock_prep.call_args.kwargs
+        assert kwargs["github_token"] == "ghp_tok"
+        assert kwargs["download_token"] == "hf_tok"
+        assert kwargs["skip_provisioning"] is True
+        assert kwargs["allow_arbitrary_urls"] is True
+        assert kwargs["extra_workflows"] == ["https://h/wf.json"]
+        assert len(kwargs["extra_models"]) == 1
+        assert kwargs["extra_models"][0].name == "a.safetensors"
+
+    def test_force_deploy_threaded(self):
+        args = _review_args(
+            target="server:https://h.ts.net:9189",
+            force_deploy=True, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        assert mock_prep.call_args.kwargs["force_deploy"] is True
+
+    def test_force_deploy_default_false(self):
+        args = _review_args(
+            target="server:https://h.ts.net:9189", json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        assert mock_prep.call_args.kwargs["force_deploy"] is False
+
+    def test_does_not_pass_idle_or_force_purpose(self):
+        # Idle reaper / purpose tags are station-only concepts; the
+        # direct-server function does not accept those kwargs.
+        args = _review_args(
+            target="server:https://h.ts.net:9189",
+            idle_stop_after=600, force_purpose=True, json=True,
+        )
+        with patch(
+            "comfy_runner.review.prepare_server_review",
+            return_value=dict(self._OK_RESULT),
+        ) as mock_prep:
+            cmd_review(args)
+        kwargs = mock_prep.call_args.kwargs
+        assert "idle_timeout_s" not in kwargs
+        assert "force_purpose" not in kwargs
 
 
 # ---------------------------------------------------------------------------

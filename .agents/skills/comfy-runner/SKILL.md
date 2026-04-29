@@ -312,10 +312,11 @@ End-to-end PR review prep: deploy the PR, parse a fenced ` ```comfyrunner ` bloc
 | `review <pr> --repo owner/name --target local:<install>` | Local review on a named install |
 | `review <pr> --repo owner/name --target remote:<pod-name>` | Review on an existing fleet pod (auto-wakes if stopped) |
 | `review <pr> --repo owner/name --target runpod[:<gpu>]` | Spawn an ephemeral RunPod pod tagged ``purpose='pr'``, ``pr_number=<pr>`` |
+| `review <pr> --repo owner/name --target server:<url>` | Direct review against any reachable comfy-runner server — no central station. URL must include scheme; on Tailscale use the full MagicDNS FQDN |
 | `review ... --workflow <url>` (repeatable) | Add an extra workflow URL (CLI wins over PR-body manifest) |
 | `review ... --model "name=url=directory"` (repeatable) | Add an extra model entry |
 | `review ... --force-purpose` | Allow review against ``purpose='test'`` pods (refused by default) |
-| `review ... --force-deploy` | Skip the idempotent "PR already deployed" check on remote targets |
+| `review ... --force-deploy` | Skip the idempotent "PR already deployed" check on remote and server targets |
 | `review ... --idle-stop-after <seconds>` | Update the pod's idle-reaper timeout per-review |
 | `review ... --cleanup` | (runpod target) Terminate the ephemeral pod after review prep |
 | `review ... --allow-arbitrary-urls` | Permit non-allowlisted hosts for workflow / model URLs |
@@ -327,7 +328,9 @@ Purpose gating on `remote:` / `runpod:` targets:
 - `purpose='persistent'` (default for `pods create`) → allow with a warning that the dev install state will be deployed-over.
 - `purpose='test'` → refused (HTTP 409) unless `--force-purpose`.
 
-Idempotency: a second `review` of the same PR on a remote pod skips the deploy step (the orchestrator GETs `/<install>/info` and compares the deployed PR + repo). Override with `--force-deploy`.
+Idempotency: a second `review` of the same PR on a remote or server target skips the deploy step (the orchestrator GETs `/<install>/info` and compares the deployed PR + repo). Override with `--force-deploy`.
+
+The `server:<url>` target is the only one that does *not* require a configured central station — it talks straight to the target's `/<install>/deploy` and `/reviews/local` endpoints. Use it when reviewing on always-on tailnet workstations, manually-set-up cloud VMs, or any reachable comfy-runner instance whose lifecycle the station does not own.
 
 #### Manifest authoring (pure-local, no station)
 

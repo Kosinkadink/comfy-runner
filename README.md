@@ -198,14 +198,21 @@ comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target remote:my-pod
 # station's idle reaper auto-stops the pod after the review session.
 comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target runpod:RTX_4090 --idle-stop-after 1800
 
+# Review directly against any reachable comfy-runner server — no central
+# station required. Use this for tailnet workstations, manually-set-up
+# cloud VMs, or any always-on comfy-runner you can hit over HTTP. URL
+# must include the scheme; on Tailscale use the full MagicDNS FQDN.
+comfy_runner.py review 1234 --repo comfy-org/ComfyUI \
+    --target server:https://mybox.tailnet.ts.net:9189
+
 # Pass extra workflow URLs / model entries from the CLI (these win
 # over anything in the PR body's manifest block).
 comfy_runner.py review 1234 --repo comfy-org/ComfyUI \
     --workflow https://raw.githubusercontent.com/comfy-org/ComfyUI/<branch>/examples/demo.json \
     --model "sdxl_base.safetensors=https://huggingface.co/.../sdxl_base.safetensors=checkpoints"
 
-# Idempotent on remote targets: a second review of the same PR skips
-# the deploy step. Force a re-deploy with --force-deploy.
+# Idempotent on remote and server targets: a second review of the same
+# PR skips the deploy step. Force a re-deploy with --force-deploy.
 comfy_runner.py review 1234 --repo comfy-org/ComfyUI --target remote:my-pod --force-deploy
 
 # Tear down ephemeral PR pods (purpose='pr') for a given PR number.

@@ -22,12 +22,15 @@ from comfy_runner.manifest import (  # noqa: E402
 )
 from comfy_runner.review import (  # noqa: E402
     ReviewResult,
+    _normalize_repo_url,
     cleanup_runpod_review,
     fetch_and_resolve_manifest,
     prepare_local_review,
     prepare_remote_review,
     prepare_runpod_review,
+    prepare_server_review,
     provision_models_local,
+    remote_install_at_pr,
     workflows_dest_for,
 )
 
@@ -923,3 +926,378 @@ class TestCleanupRunpodReview:
             cleanup_runpod_review("https://station", 7, dry_run=True)
         body = runner._request.call_args.kwargs["json"]
         assert body["dry_run"] is True
+
+
+# ---------------------------------------------------------------------------
+# _normalize_repo_url
+# ---------------------------------------------------------------------------
+
+class TestNormalizeRepoUrl:
+    def test_empty(self):
+        assert _normalize_repo_url("") == ""
+        assert _normalize_repo_url("   ") == ""
+
+    def test_owner_name_slug(self):
+        assert _normalize_repo_url("Comfy-Org/ComfyUI") == "comfy-org/comfyui"
+
+    def test_full_https_url_with_dot_git(self):
+        assert _normalize_repo_url(
+            "https://github.com/Comfy-Org/ComfyUI.git"
+        ) == "comfy-org/comfyui"
+
+    def test_full_url_no_dot_git(self):
+        assert _normalize_repo_url(
+            "https://github.com/Kosinkadink/comfy-runner"
+        ) == "kosinkadink/comfy-runner"
+
+    def test_strips_trailing_slash(self):
+        assert _normalize_repo_url(
+            "https://github.com/o/r/"
+        ) == "o/r"
+
+
+# ---------------------------------------------------------------------------
+# remote_install_at_pr
+# ---------------------------------------------------------------------------
+
+class TestRemoteInstallAtPr:
+    def _runner(self, info: dict | None = None, *, raise_exc: Exception | None = None):
+        runner = MagicMock()
+        if raise_exc is not None:
+            runner._request = MagicMock(side_effect=raise_exc)
+        else:
+            runner._request = MagicMock(return_value=info or {})
+        return runner
+
+    def test_match_returns_true(self):
+        runner = self._runner({
+            "deployed_pr": 42,
+            "deployed_repo": "https://github.com/Comfy-Org/ComfyUI",
+        })
+        assert remote_install_at_pr(
+            runner, "main", 42, "comfy-org", "ComfyUI",
+        ) is True
+        runner._request.assert_called_once_with("GET", "/main/info")
+
+    def test_match_with_dot_git_suffix(self):
+        runner = self._runner({
+            "deployed_pr": 42,
+            "deployed_repo": "https://github.com/Comfy-Org/ComfyUI.git",
+        })
+        assert remote_install_at_pr(
+            runner, "main", 42, "Comfy-Org", "ComfyUI",
+        ) is True
+
+    def test_match_with_owner_name_slug(self):
+        runner = self._runner({
+            "deployed_pr": 42,
+            "deployed_repo": "Comfy-Org/ComfyUI",
+        })
+        assert remote_install_at_pr(
+            runner, "main", 42, "comfy-org", "comfyui",
+        ) is True
+
+    def test_pr_mismatch_returns_false(self):
+        runner = self._runner({
+            "deployed_pr": 41,
+            "deployed_repo": "https://github.com/Comfy-Org/ComfyUI",
+        })
+        assert remote_install_at_pr(
+            runner, "main", 42, "comfy-org", "ComfyUI",
+        ) is False
+
+    def test_repo_mismatch_returns_false(self):
+        runner = self._runner({
+            "deployed_pr": 42,
+            "deployed_repo": "https://github.com/other/ComfyUI",
+        })
+        assert remote_install_at_pr(
+            runner, "main", 42, "comfy-org", "ComfyUI",
+        ) is False
+
+    def test_no_deployed_pr_returns_false(self):
+        runner = self._runner({"deployed_repo": "owner/repo"})
+        assert remote_install_at_pr(
+            runner, "main", 42, "owner", "repo",
+        ) is False
+
+    def test_invalid_deployed_pr_returns_false(self):
+        runner = self._runner({
+            "deployed_pr": "not-an-int",
+            "deployed_repo": "owner/repo",
+        })
+        assert remote_install_at_pr(
+            runner, "main", 42, "owner", "repo",
+        ) is False
+
+    def test_request_exception_returns_false_and_warns(self):
+        runner = self._runner(raise_exc=RuntimeError("connection refused"))
+        sink: list[str] = []
+        result = remote_install_at_pr(
+            runner, "main", 42, "owner", "repo",
+            send_output=lambda t: sink.append(t),
+        )
+        assert result is False
+        assert any("idempotency check" in line for line in sink)
+
+
+# ---------------------------------------------------------------------------
+# prepare_server_review
+# ---------------------------------------------------------------------------
+
+class TestPrepareServerReview:
+    """``prepare_server_review`` talks straight to a comfy-runner server.
+
+    No central station, no /pods/{name}/review proxy — just /<install>/info,
+    /<install>/deploy, /reviews/local on the target server.
+    """
+
+    def _runner(
+        self,
+        *,
+        info: dict | None = None,
+        deploy_resp: dict | None = None,
+        review_resp: dict | None = None,
+        deploy_poll: dict | None = None,
+        review_poll: dict | None = None,
+    ):
+        """Build a fake RemoteRunner with sequential _request side_effect."""
+        runner = MagicMock()
+        # _request will be called: GET /info (idempotency), POST /deploy,
+        # POST /reviews/local. poll_job will be called twice (deploy +
+        # review). Default to "not at PR" + simple OK responses so the
+        # full happy path runs.
+        info_default = info if info is not None else {}
+        runner._request = MagicMock(side_effect=[
+            info_default,
+            deploy_resp or {"ok": True, "job_id": "deploy-job"},
+            review_resp or {"ok": True, "job_id": "review-job"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            deploy_poll or {"restarted": True, "port": 8188},
+            review_poll or {"workflows": [], "downloaded": [], "failures": []},
+        ])
+        return runner
+
+    def test_full_happy_path_deploy_then_review(self):
+        runner = self._runner()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            result = prepare_server_review(
+                "https://h.ts.net:9189", "main",
+                "comfy-org", "ComfyUI", 42,
+            )
+        # Three requests: info (idempotency), deploy, review.
+        assert runner._request.call_count == 3
+        info_call = runner._request.call_args_list[0]
+        assert info_call.args == ("GET", "/main/info")
+        deploy_call = runner._request.call_args_list[1]
+        assert deploy_call.args == ("POST", "/main/deploy")
+        deploy_body = deploy_call.kwargs["json"]
+        assert deploy_body["pr"] == 42
+        assert deploy_body["repo"] == "https://github.com/comfy-org/ComfyUI"
+        assert deploy_body["start"] is True
+        review_call = runner._request.call_args_list[2]
+        assert review_call.args == ("POST", "/reviews/local")
+        review_body = review_call.kwargs["json"]
+        assert review_body["install"] == "main"
+        assert review_body["owner"] == "comfy-org"
+        assert review_body["repo"] == "ComfyUI"
+        assert review_body["pr"] == 42
+        # Two poll_job calls: deploy then review.
+        assert runner.poll_job.call_count == 2
+        # Result has the review payload + server_url + deploy_result.
+        assert result["server_url"] == "https://h.ts.net:9189"
+        assert result["deploy_result"]["restarted"] is True
+
+    def test_idempotent_skip_when_already_at_pr(self):
+        runner = MagicMock()
+        # /info responds with matching PR — skip deploy entirely.
+        runner._request = MagicMock(side_effect=[
+            {
+                "deployed_pr": 42,
+                "deployed_repo": "https://github.com/Comfy-Org/ComfyUI",
+            },
+            {"ok": True, "job_id": "review-job"},
+        ])
+        runner.poll_job = MagicMock(return_value={
+            "workflows": [], "downloaded": [], "failures": [],
+        })
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            result = prepare_server_review(
+                "https://h.ts.net:9189", "main",
+                "comfy-org", "ComfyUI", 42,
+            )
+        # Only two requests: info, then directly /reviews/local. No deploy.
+        assert runner._request.call_count == 2
+        assert runner._request.call_args_list[0].args == ("GET", "/main/info")
+        assert runner._request.call_args_list[1].args == (
+            "POST", "/reviews/local",
+        )
+        # poll_job called once (review only).
+        assert runner.poll_job.call_count == 1
+        # Result records the skip.
+        assert result["deploy_result"] == {
+            "skipped": True, "reason": "PR already deployed",
+        }
+
+    def test_force_deploy_skips_idempotency_check(self):
+        runner = MagicMock()
+        # If force_deploy=True, /info should NOT be called — only deploy +
+        # review.
+        runner._request = MagicMock(side_effect=[
+            {"ok": True, "job_id": "deploy-job"},
+            {"ok": True, "job_id": "review-job"},
+        ])
+        runner.poll_job = MagicMock(side_effect=[
+            {"restarted": True},
+            {"workflows": []},
+        ])
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_server_review(
+                "https://h.ts.net:9189", "main",
+                "owner", "repo", 1,
+                force_deploy=True,
+            )
+        calls = runner._request.call_args_list
+        assert calls[0].args == ("POST", "/main/deploy")
+        assert calls[1].args == ("POST", "/reviews/local")
+        assert all(c.args[0] != "GET" for c in calls)
+
+    def test_passes_through_extras_to_review_body(self):
+        runner = self._runner()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_server_review(
+                "https://h.ts.net:9189", "main",
+                "o", "r", 1,
+                github_token="ghp_x",
+                download_token="hf_y",
+                extra_models=[ModelEntry("m.safetensors", "https://h/m", "loras")],
+                extra_workflows=["https://h/w.json"],
+                allow_arbitrary_urls=True,
+                skip_provisioning=True,
+            )
+        # Third _request is the review POST.
+        review_body = runner._request.call_args_list[2].kwargs["json"]
+        assert review_body["github_token"] == "ghp_x"
+        assert review_body["download_token"] == "hf_y"
+        assert review_body["extra_models"] == [
+            {"name": "m.safetensors", "url": "https://h/m", "directory": "loras"},
+        ]
+        assert review_body["extra_workflows"] == ["https://h/w.json"]
+        assert review_body["allow_arbitrary_urls"] is True
+        assert review_body["skip_provisioning"] is True
+
+    def test_omits_optional_fields_when_unset(self):
+        runner = self._runner()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_server_review(
+                "https://h.ts.net:9189", "main",
+                "o", "r", 1,
+            )
+        review_body = runner._request.call_args_list[2].kwargs["json"]
+        assert "github_token" not in review_body
+        assert "download_token" not in review_body
+        assert "extra_models" not in review_body
+        assert "extra_workflows" not in review_body
+        assert review_body["allow_arbitrary_urls"] is False
+        assert review_body["skip_provisioning"] is False
+
+    def test_install_name_threaded_to_endpoints(self):
+        runner = self._runner()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_server_review(
+                "https://h.ts.net:9189", "staging",
+                "o", "r", 1,
+            )
+        calls = runner._request.call_args_list
+        assert calls[0].args == ("GET", "/staging/info")
+        assert calls[1].args == ("POST", "/staging/deploy")
+        review_body = calls[2].kwargs["json"]
+        assert review_body["install"] == "staging"
+
+    def test_deploy_missing_job_id_raises(self):
+        runner = MagicMock()
+        runner._request = MagicMock(side_effect=[
+            {},  # info — not at PR
+            {"ok": True},  # deploy — no job_id
+        ])
+        runner.poll_job = MagicMock()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            with pytest.raises(RuntimeError, match="job_id for deploy"):
+                prepare_server_review(
+                    "https://h.ts.net:9189", "main", "o", "r", 1,
+                )
+
+    def test_review_missing_job_id_raises(self):
+        runner = MagicMock()
+        runner._request = MagicMock(side_effect=[
+            {},  # info
+            {"ok": True, "job_id": "deploy-job"},
+            {"ok": True},  # review — no job_id
+        ])
+        runner.poll_job = MagicMock(return_value={"restarted": True})
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            with pytest.raises(RuntimeError, match="job_id for review"):
+                prepare_server_review(
+                    "https://h.ts.net:9189", "main", "o", "r", 1,
+                )
+
+    def test_deploy_poll_failure_propagates(self):
+        runner = MagicMock()
+        runner._request = MagicMock(side_effect=[
+            {},
+            {"ok": True, "job_id": "deploy-job"},
+        ])
+        runner.poll_job = MagicMock(
+            side_effect=RuntimeError("Job deploy-job failed: boom"),
+        )
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                prepare_server_review(
+                    "https://h.ts.net:9189", "main", "o", "r", 1,
+                )
+
+    def test_pipes_send_output_to_poll_jobs(self):
+        sink: list[str] = []
+        runner = self._runner()
+        with patch(
+            "comfy_runner.hosted.remote.RemoteRunner",
+            return_value=runner,
+        ):
+            prepare_server_review(
+                "https://h.ts.net:9189", "main", "o", "r", 1,
+                send_output=lambda t: sink.append(t),
+            )
+        # Both poll_job calls got the same callback.
+        for call in runner.poll_job.call_args_list:
+            assert call.kwargs["on_output"] is not None
+        # The wrapper printed at least the deploy/review banners.
+        assert any("Deploying PR" in t for t in sink)
+        assert any("Preparing review" in t for t in sink)

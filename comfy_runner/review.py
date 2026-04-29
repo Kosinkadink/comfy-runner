@@ -283,6 +283,75 @@ def prepare_local_review(
 
 
 # ---------------------------------------------------------------------------
+# Idempotency helpers — shared by remote (station-mediated) and direct-server
+# review paths. Centralising here keeps the "is this install already at the
+# requested PR?" check in one place.
+# ---------------------------------------------------------------------------
+
+def _normalize_repo_url(value: str) -> str:
+    """Reduce a repo URL or ``owner/name`` slug to a canonical form.
+
+    Strips scheme, ``github.com/`` prefix, ``.git`` suffix, leading/trailing
+    slashes, and lower-cases. So ``https://github.com/Comfy-Org/ComfyUI.git``
+    and ``Comfy-Org/ComfyUI`` both reduce to ``comfy-org/comfyui``.
+    """
+    if not value:
+        return ""
+    s = value.strip().lower()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if s.startswith("github.com/"):
+        s = s[len("github.com/"):]
+    if s.endswith(".git"):
+        s = s[: -len(".git")]
+    return s.strip("/")
+
+
+def remote_install_at_pr(
+    runner: Any,
+    install_name: str,
+    pr: int,
+    owner: str,
+    repo: str,
+    *,
+    send_output: Callable[[str], None] | None = None,
+) -> bool:
+    """Best-effort check: is *install_name* on the runner already at this PR?
+
+    Used to make the deploy step in review flows idempotent: re-reviewing a
+    PR that's already deployed should be a no-op for the deploy step.
+    Returns ``False`` on any error so the caller falls back to a real deploy
+    rather than skipping incorrectly.
+
+    *runner* is anything with a ``_request("GET", path)`` method (typically
+    :class:`comfy_runner.hosted.remote.RemoteRunner`).
+    """
+    out = send_output or (lambda _t: None)
+    try:
+        info = runner._request("GET", f"/{install_name}/info")
+    except Exception as e:  # transport, JSON, or remote-error
+        out(f"  (skipping idempotency check: {e})\n")
+        return False
+
+    deployed_pr = info.get("deployed_pr")
+    if deployed_pr is None:
+        return False
+    try:
+        if int(deployed_pr) != int(pr):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    deployed_repo = info.get("deployed_repo") or ""
+    requested_repo = f"{owner}/{repo}"
+    if _normalize_repo_url(deployed_repo) != _normalize_repo_url(
+        requested_repo
+    ):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Remote target — central-station-mediated review on an existing pod
 # ---------------------------------------------------------------------------
 
@@ -363,6 +432,120 @@ def prepare_remote_review(
     if final.get("idle_timeout_s") is not None:
         review_result["idle_timeout_s"] = final.get("idle_timeout_s")
     return review_result
+
+
+# ---------------------------------------------------------------------------
+# Server target — direct review against any reachable comfy-runner server
+# ---------------------------------------------------------------------------
+
+def prepare_server_review(
+    server_url: str,
+    install_name: str,
+    owner: str,
+    repo: str,
+    pr: int,
+    *,
+    github_token: str | None = None,
+    download_token: str = "",
+    extra_models: list[_manifest.ModelEntry] | None = None,
+    extra_workflows: list[str] | None = None,
+    allow_arbitrary_urls: bool = False,
+    skip_provisioning: bool = False,
+    force_deploy: bool = False,
+    send_output: Callable[[str], None] | None = None,
+    poll_timeout: int = 1800,
+) -> dict[str, Any]:
+    """Trigger a review directly against a comfy-runner server.
+
+    Talks straight to the server's ``/<install>/deploy`` and
+    ``/reviews/local`` endpoints — no central station in the loop.
+    Suitable for any reachable comfy-runner instance: a tailnet
+    workstation, a manually-provisioned cloud VM, or even a RunPod pod's
+    sidecar URL when station-mediation isn't desired.
+
+    Behaviour mirrors :func:`prepare_remote_review` for the deploy step:
+
+    * ``force_deploy=False`` (default): GET ``/<install>/info`` first; skip
+      deploy when the install already has the requested PR checked out.
+      Otherwise POST ``/<install>/deploy`` to switch the install onto the
+      PR (which restarts ComfyUI if it was running).
+    * ``force_deploy=True``: always POST ``/<install>/deploy`` regardless.
+
+    Then POSTs ``/reviews/local`` to fetch the manifest, save workflows,
+    and download missing models on the runner.
+
+    Returns the same shape as :func:`prepare_local_review`, augmented
+    with ``server_url`` and ``deploy_result``. Raises ``RuntimeError`` on
+    transport / job failure.
+    """
+    from .hosted.remote import RemoteRunner
+
+    out = send_output or (lambda _t: None)
+    runner = RemoteRunner(server_url)
+
+    # ── 1) Deploy (idempotent unless force_deploy). ────────────────────
+    deploy_result: dict[str, Any] | None
+    if not force_deploy and remote_install_at_pr(
+        runner, install_name, pr, owner, repo, send_output=out,
+    ):
+        out(
+            f"PR #{pr} ({owner}/{repo}) is already deployed on "
+            f"'{install_name}'. Skipping deploy "
+            f"(use --force-deploy to override).\n"
+        )
+        deploy_result = {"skipped": True, "reason": "PR already deployed"}
+    else:
+        deploy_body = {
+            "pr": int(pr),
+            "repo": f"https://github.com/{owner}/{repo}",
+            "start": True,
+        }
+        out(
+            f"Deploying PR #{pr} ({owner}/{repo}) to '{install_name}'...\n"
+        )
+        deploy_resp = runner._request(
+            "POST", f"/{install_name}/deploy", json=deploy_body,
+        )
+        deploy_job_id = deploy_resp.get("job_id")
+        if not deploy_job_id:
+            raise RuntimeError("Server did not return a job_id for deploy")
+        deploy_result = runner.poll_job(
+            deploy_job_id, timeout=poll_timeout, on_output=out,
+        )
+
+    # ── 2) Prepare review (manifest + workflows + models). ─────────────
+    review_body: dict[str, Any] = {
+        "install": install_name,
+        "owner": owner,
+        "repo": repo,
+        "pr": int(pr),
+        "allow_arbitrary_urls": bool(allow_arbitrary_urls),
+        "skip_provisioning": bool(skip_provisioning),
+    }
+    if github_token:
+        review_body["github_token"] = github_token
+    if download_token:
+        review_body["download_token"] = download_token
+    if extra_models:
+        review_body["extra_models"] = [m.to_dict() for m in extra_models]
+    if extra_workflows:
+        review_body["extra_workflows"] = list(extra_workflows)
+
+    out("\nPreparing review (manifest + workflows + models)...\n")
+    review_resp = runner._request(
+        "POST", "/reviews/local", json=review_body,
+    )
+    review_job_id = review_resp.get("job_id")
+    if not review_job_id:
+        raise RuntimeError("Server did not return a job_id for review")
+    inner = runner.poll_job(
+        review_job_id, timeout=poll_timeout, on_output=out,
+    )
+
+    result = dict(inner or {})
+    result["server_url"] = server_url
+    result["deploy_result"] = deploy_result
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -1054,25 +1054,6 @@ def _validate_pod_name(name: str) -> str | None:
     return None
 
 
-def _normalize_repo_url(value: str) -> str:
-    """Reduce a repo URL or ``owner/name`` slug to a canonical form.
-
-    Strips scheme, ``github.com/`` prefix, ``.git`` suffix, leading/
-    trailing slashes, and lower-cases. So ``https://github.com/Comfy-Org/ComfyUI.git``
-    and ``Comfy-Org/ComfyUI`` both reduce to ``comfy-org/comfyui``.
-    """
-    if not value:
-        return ""
-    s = value.strip().lower()
-    if "://" in s:
-        s = s.split("://", 1)[1]
-    if s.startswith("github.com/"):
-        s = s[len("github.com/"):]
-    if s.endswith(".git"):
-        s = s[: -len(".git")]
-    return s.strip("/")
-
-
 def _pod_already_at_pr(
     runner: Any,
     install_name: str,
@@ -1086,32 +1067,16 @@ def _pod_already_at_pr(
 
     Used to make ``POST /pods/{name}/review`` idempotent: re-reviewing a
     PR that's already deployed should be a no-op for the deploy step.
-    Returns False on any error so the caller falls back to a real deploy
-    rather than skipping incorrectly.
+    Thin wrapper around :func:`comfy_runner.review.remote_install_at_pr`
+    so the station and the direct ``--target server:`` CLI path share one
+    implementation. Returns False on any error so the caller falls back
+    to a real deploy rather than skipping incorrectly.
     """
-    out = send_output or (lambda _t: None)
-    try:
-        info = runner._request("GET", f"/{install_name}/info")
-    except Exception as e:
-        out(f"  (skipping idempotency check: {e})\n")
-        return False
+    from comfy_runner.review import remote_install_at_pr
 
-    deployed_pr = info.get("deployed_pr")
-    if deployed_pr is None:
-        return False
-    try:
-        if int(deployed_pr) != int(pr):
-            return False
-    except (TypeError, ValueError):
-        return False
-
-    deployed_repo = info.get("deployed_repo") or ""
-    requested_repo = f"{owner}/{repo}"
-    if _normalize_repo_url(deployed_repo) != _normalize_repo_url(
-        requested_repo
-    ):
-        return False
-    return True
+    return remote_install_at_pr(
+        runner, install_name, pr, owner, repo, send_output=send_output,
+    )
 
 
 _SUITES_DIR = Path("test-suites")
