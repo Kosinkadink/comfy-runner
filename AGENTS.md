@@ -7,6 +7,12 @@ See `README.md` for full CLI usage, HTTP API endpoints, code layout, and setup i
 - The running server exposes an OpenAPI spec at `GET /openapi.json` — fetch it to discover all available endpoints and parameters.
 - When connecting to a remote comfy-runner server via Tailscale, you **must** use the full MagicDNS FQDN (e.g. `https://mybox.tailnet-name.ts.net:9189`), not the short hostname. See the Tailscale section in `README.md` for details.
 
+## Git workflow
+
+**Never commit to the `main` branch.** All work goes onto a feature branch (e.g. `feat/<topic>`, `fix/<topic>`); `main` is only updated via merged PRs. If you find yourself on `main` with uncommitted changes, create a new branch first (`git checkout -b feat/...`) before staging anything.
+
+Pushing is fine on feature branches when the user asks for it; otherwise leave changes uncommitted and let the user drive commit timing.
+
 ## Path traversal prevention
 
 Any time user-supplied input or external API data is used as part of a file path, **always sanitize it** to prevent path traversal attacks:
