@@ -169,6 +169,54 @@ class TestDeviceHelpers:
     def test_is_online_missing_false(self):
         assert tn._is_device_online({}) is False
 
+    def test_is_online_string_false(self):
+        assert tn._is_device_online({"online": "false"}) is False
+
+    def test_is_online_falls_back_to_recent_lastseen(self):
+        # The Tailscale REST API often omits ``online`` and only
+        # populates ``lastSeen`` (RFC 3339 timestamp). A node seen
+        # seconds ago must be treated as online.
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tn._is_device_online({"lastSeen": recent}) is True
+
+    def test_is_online_lastseen_within_window(self):
+        # Inside the 5-minute window: still online.
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=4)) \
+            .strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        assert tn._is_device_online({"lastSeen": ts}) is True
+
+    def test_is_online_lastseen_stale_returns_false(self):
+        # Outside the 5-minute freshness window: offline.
+        from datetime import datetime, timezone, timedelta
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tn._is_device_online({"lastSeen": old}) is False
+
+    def test_is_online_explicit_false_wins_over_recent_lastseen(self):
+        # When the API explicitly says offline, trust it even if
+        # lastSeen looks fresh.
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=10)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tn._is_device_online(
+            {"online": False, "lastSeen": recent},
+        ) is False
+
+    def test_is_online_naive_lastseen_treated_as_utc(self):
+        # Some Tailscale plans omit the trailing 'Z' / offset.
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)) \
+            .strftime("%Y-%m-%dT%H:%M:%S")  # no offset
+        assert tn._is_device_online({"lastSeen": recent}) is True
+
+    def test_is_online_garbage_lastseen_returns_false(self):
+        assert tn._is_device_online({"lastSeen": "not-a-date"}) is False
+        assert tn._is_device_online({"lastSeen": ""}) is False
+        assert tn._is_device_online({"lastSeen": 12345}) is False
+
 
 # ---------------------------------------------------------------------------
 # probe_system_info
