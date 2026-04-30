@@ -202,32 +202,105 @@ def _is_device_online(device: dict[str, Any]) -> bool:
 # /system-info probing — confirms comfy-runner AND grabs hardware info
 # ---------------------------------------------------------------------------
 
+# Signature emitted by Go's net/http (and therefore Tailscale serve and
+# any caddy/nginx HTTPS-only proxy) when a plain HTTP request lands on
+# an HTTPS-only listener. The full body is::
+#
+#     Client sent an HTTP request to an HTTPS server.
+#
+# Detected case-insensitively so we don't depend on exact casing /
+# punctuation across server versions.
+_HTTPS_REQUIRED_HINT = "client sent an http request to an https server"
+
+
+def _looks_like_https_required(resp: Any) -> bool:
+    """True when *resp* matches the "HTTP probe hit HTTPS listener" signature.
+
+    Tailscale serve forces HTTPS on its published ports; a plain HTTP
+    request to such a port returns ``HTTP 400`` with the body shown
+    above. Use this signature (rather than blindly retrying every 400)
+    so we only pay for an HTTPS round-trip when there's good reason
+    to believe it'll help.
+    """
+    try:
+        if getattr(resp, "status_code", None) != 400:
+            return False
+        body = (getattr(resp, "text", "") or "").lower()
+        return _HTTPS_REQUIRED_HINT in body
+    except Exception:
+        return False
+
+
+def _parse_system_info_response(resp: Any) -> dict[str, Any] | None:
+    """Pull the inner ``system_info`` dict out of a /system-info response.
+
+    Returns ``None`` if the body isn't valid JSON, ``ok`` is missing
+    or false, or ``system_info`` isn't a dict.
+    """
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("ok"):
+        return None
+    info = data.get("system_info")
+    return info if isinstance(info, dict) else None
+
+
 def probe_system_info(
     host: str,
     port: int = 9189,
     *,
     timeout: float = 2.0,
     scheme: str = "http",
+    https_fqdn: str | None = None,
 ) -> dict[str, Any] | None:
     """Probe a single host's ``/system-info`` endpoint.
 
     Returns the parsed ``system_info`` payload on success, or ``None``
     on any failure (DNS, connection, non-2xx, malformed JSON, missing
     key). Never raises.
+
+    HTTPS fallback: many tailnet nodes (including the central station)
+    use ``tailscale serve`` which enforces HTTPS on the runner's port.
+    Probing such a node over plain HTTP returns ``HTTP 400`` with the
+    body "Client sent an HTTP request to an HTTPS server". When
+    *scheme* is ``"http"`` and *https_fqdn* is provided, this function
+    detects that exact signature and retries over
+    ``https://{https_fqdn}:{port}/system-info``.
+
+    The fallback uses the **FQDN**, not the IP, because the served
+    certificate's SAN list contains the MagicDNS name; an HTTPS
+    request to the IP would fail certificate validation. Callers
+    should still prefer probing by IP first to avoid hostname-collision
+    ambiguity (see :func:`_device_probe_host`).
     """
+    import requests
+
     url = f"{scheme}://{host}:{port}/system-info"
     try:
-        import requests
         resp = requests.get(url, timeout=timeout)
-        if not resp.ok:
-            return None
-        data = resp.json()
-        if not isinstance(data, dict) or not data.get("ok"):
-            return None
-        info = data.get("system_info")
-        return info if isinstance(info, dict) else None
     except Exception:
         return None
+
+    if resp.ok:
+        return _parse_system_info_response(resp)
+
+    # HTTPS fallback only applies to a plain-HTTP probe with a known
+    # FQDN and the specific HTTPS-required signature.
+    if scheme != "http" or not https_fqdn:
+        return None
+    if not _looks_like_https_required(resp):
+        return None
+
+    https_url = f"https://{https_fqdn}:{port}/system-info"
+    try:
+        resp = requests.get(https_url, timeout=timeout)
+    except Exception:
+        return None
+    if not resp.ok:
+        return None
+    return _parse_system_info_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +445,14 @@ def discover_comfy_runners(
             host = _device_probe_host(d)
             if not host:
                 continue
+            # Pass the MagicDNS FQDN so probe_system_info can fall back
+            # to HTTPS when the node is fronted by ``tailscale serve``.
+            # HTTPS requires the FQDN (not the IP) for cert validation.
+            fqdn = d.get("name") or None
             future_to_device[ex.submit(
                 probe_system_info, host, port,
                 timeout=probe_timeout, scheme=scheme,
+                https_fqdn=fqdn,
             )] = (d, host)
 
         for fut in as_completed(future_to_device):

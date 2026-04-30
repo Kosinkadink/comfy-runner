@@ -260,6 +260,123 @@ class TestProbeSystemInfo:
         assert get.call_args.kwargs["timeout"] == 5
 
 
+def _https_required_response() -> MagicMock:
+    """Mock response matching Go's HTTP-on-HTTPS-listener error: 400 with
+    the literal "Client sent an HTTP request to an HTTPS server" body
+    (Tailscale serve emits this on every plain-HTTP probe).
+    """
+    resp = MagicMock()
+    resp.ok = False
+    resp.status_code = 400
+    resp.text = "Client sent an HTTP request to an HTTPS server.\n\n"
+    return resp
+
+
+class TestProbeSystemInfoHttpsFallback:
+    """Tailscale serve forces HTTPS; HTTP probes get a 400 with a
+    distinctive body. probe_system_info must detect that and retry
+    via HTTPS using the FQDN (the IP would fail cert validation)."""
+
+    def test_https_fallback_succeeds(self):
+        good = _ok_response({"ok": True, "system_info": {"gpu_label": "X"}})
+        seq = [_https_required_response(), good]
+        with patch("requests.get", side_effect=seq) as get:
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info == {"gpu_label": "X"}
+        # First call: plain HTTP to the IP.
+        assert get.call_args_list[0].args[0] == \
+            "http://100.64.0.5:9189/system-info"
+        # Second call: HTTPS using the FQDN.
+        assert get.call_args_list[1].args[0] == \
+            "https://box.tail.ts.net:9189/system-info"
+        assert get.call_count == 2
+
+    def test_https_fallback_skipped_without_fqdn(self):
+        # Without a fqdn we can't safely retry over HTTPS (cert SAN
+        # would not include the IP), so the probe just fails.
+        with patch("requests.get", return_value=_https_required_response()) as get:
+            info = tn.probe_system_info("100.64.0.5")
+        assert info is None
+        assert get.call_count == 1
+
+    def test_400_without_https_hint_does_not_retry(self):
+        # A generic 400 (e.g. malformed query) must not trigger an
+        # HTTPS retry — only the specific "HTTP→HTTPS" body does.
+        resp = MagicMock()
+        resp.ok = False
+        resp.status_code = 400
+        resp.text = "bad request"
+        with patch("requests.get", return_value=resp) as get:
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+        assert get.call_count == 1
+
+    def test_other_status_does_not_retry(self):
+        # 401/403/500 etc. — never retried as HTTPS.
+        resp = MagicMock()
+        resp.ok = False
+        resp.status_code = 503
+        resp.text = "Client sent an HTTP request to an HTTPS server"
+        with patch("requests.get", return_value=resp) as get:
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+        assert get.call_count == 1
+
+    def test_https_retry_also_fails_returns_none(self):
+        bad_https = MagicMock()
+        bad_https.ok = False
+        bad_https.status_code = 502
+        bad_https.text = "bad gateway"
+        seq = [_https_required_response(), bad_https]
+        with patch("requests.get", side_effect=seq) as get:
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+        assert get.call_count == 2
+
+    def test_https_retry_transport_exception_returns_none(self):
+        seq = [_https_required_response(), ConnectionError("boom")]
+        with patch("requests.get", side_effect=seq) as get:
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+        assert get.call_count == 2
+
+    def test_https_retry_payload_ok_false_returns_none(self):
+        # Retry succeeds at the HTTP layer but the runner reports
+        # ok=false (e.g. system-info temporarily unavailable).
+        bad_payload = _ok_response({"ok": False, "error": "x"})
+        seq = [_https_required_response(), bad_payload]
+        with patch("requests.get", side_effect=seq):
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+
+    def test_explicit_https_scheme_does_not_double_retry(self):
+        # If the caller already requested HTTPS and got the same 400
+        # signature back (would be very unusual), we don't try to
+        # "fall back" again — that path is HTTP-only.
+        with patch(
+            "requests.get", return_value=_https_required_response(),
+        ) as get:
+            info = tn.probe_system_info(
+                "box.tail.ts.net",
+                scheme="https",
+                https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+        assert get.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # _summarise_gpu / _ram_gb
 # ---------------------------------------------------------------------------
@@ -565,6 +682,28 @@ class TestDiscoverComfyRunners:
         assert "error" in result
         assert result["error"] is None
         assert result["ok"] is True
+
+    def test_passes_fqdn_for_https_fallback(self):
+        # Each probe call must receive the device's MagicDNS FQDN as
+        # https_fqdn so probe_system_info can fall back to HTTPS when
+        # the node is fronted by ``tailscale serve``.
+        seen_kwargs: list[dict] = []
+        def _probe(host, *a, **kw):
+            seen_kwargs.append(dict(kw))
+            return None
+        with patch.object(tn, "list_devices", return_value=list(self._DEVICES)), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "probe_system_info", side_effect=_probe), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"):
+            tn.discover_comfy_runners()
+        # All three online devices probed; each call carries its FQDN.
+        fqdns = sorted(kw.get("https_fqdn") for kw in seen_kwargs)
+        assert fqdns == sorted([
+            "comfy-pr-1234.tn.ts.net",
+            "my-laptop.tn.ts.net",
+            "router.tn.ts.net",
+        ])
 
     def test_error_propagated_with_partial_devices(self):
         # If list_devices returns something but the cached error is
