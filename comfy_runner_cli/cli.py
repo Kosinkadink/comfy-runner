@@ -4093,6 +4093,79 @@ def _station_pods(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
 
+    elif pod_action == "self-update":
+        try:
+            names = list(getattr(args, "pod_names", []) or [])
+            if not names and not getattr(args, "all", False):
+                console.print(
+                    "[red]Error: pass at least one pod name or --all.[/red]",
+                )
+                sys.exit(2)
+            if names and getattr(args, "all", False):
+                console.print(
+                    "[red]Error: pod names and --all are mutually exclusive.[/red]",
+                )
+                sys.exit(2)
+            body = {"force": bool(getattr(args, "force", False))}
+            if names:
+                body["names"] = names
+            runner = RemoteRunner(_station_server(args))
+            data = runner._request("POST", "/pods/self-update", json=body)
+
+            if args.json:
+                print(json.dumps(data, indent=2))
+                if not data.get("ok", False):
+                    sys.exit(1)
+                return
+
+            results = data.get("results", []) or []
+            if not results:
+                console.print("[dim]No comfy-runners discovered on the tailnet.[/dim]")
+                return
+            table = Table(title="Self-update results")
+            table.add_column("Name", style="cyan")
+            table.add_column("Host", style="dim")
+            table.add_column("Status", style="bold")
+            table.add_column("Detail")
+            for r in results:
+                if r.get("ok"):
+                    if r.get("updated"):
+                        status = "[green]UPDATED[/green]"
+                        detail = "restarting"
+                    else:
+                        status = "[dim]up-to-date[/dim]"
+                        detail = (r.get("message") or "")[:60]
+                else:
+                    status = "[red]FAILED[/red]"
+                    detail = r.get("error") or f"HTTP {r.get('status')}"
+                table.add_row(
+                    str(r.get("name", "?")),
+                    str(r.get("host", "")),
+                    status,
+                    str(detail),
+                )
+            console.print(table)
+            ok_count = data.get("ok_count", 0)
+            updated_count = data.get("updated_count", 0)
+            failed_count = data.get("failed_count", 0)
+            console.print(
+                f"\nSummary: ok={ok_count} (updated={updated_count}, "
+                f"up-to-date={ok_count - updated_count}) failed={failed_count}",
+            )
+            if data.get("skipped_self"):
+                console.print(
+                    f"[dim](Excluded the central station "
+                    f"'{data['skipped_self']}' from the sweep.)[/dim]",
+                )
+            if failed_count > 0:
+                sys.exit(1)
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     else:
         args._parser_station_pods.print_help()
 
@@ -5217,6 +5290,35 @@ def main(argv: list[str] | None = None) -> None:
         help="Reset the idle timer on a pod (defers the auto-stop reaper)",
     )
     p_st_pod_touch.add_argument("pod_name", help="Pod name")
+
+    p_st_pod_self_update = st_pods_sub.add_parser(
+        "self-update",
+        help=(
+            "Fan out POST /self-update across one or all comfy-runners "
+            "discovered on the tailnet"
+        ),
+    )
+    p_st_pod_self_update.add_argument(
+        "pod_names",
+        nargs="*",
+        help=(
+            "One or more hostnames or pod_names to update. Mutually "
+            "exclusive with --all."
+        ),
+    )
+    p_st_pod_self_update.add_argument(
+        "--all",
+        action="store_true",
+        help="Update every comfy-runner discovered on the tailnet.",
+    )
+    p_st_pod_self_update.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Forwarded to each pod's /self-update — git reset --hard "
+            "to origin/main instead of git pull --ff-only."
+        ),
+    )
 
     p_st_pods.set_defaults(_parser_station_pods=p_st_pods)
 

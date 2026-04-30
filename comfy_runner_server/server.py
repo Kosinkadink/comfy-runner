@@ -4169,6 +4169,104 @@ def create_app() -> Any:
         except Exception as e:
             return _err(str(e))
 
+    # ------------------------------------------------------------------
+    # POST /pods/self-update — fan out /self-update across the tailnet
+    # ------------------------------------------------------------------
+    @app.route("/pods/self-update", methods=["POST"])
+    def route_pods_self_update() -> Any:
+        """Fan out ``POST /self-update`` to one, several, or all
+        comfy-runners auto-discovered on the tailnet.
+
+        Body (JSON, all fields optional)::
+
+            {
+                "names": ["pod-a", "pod-b"],   // null/empty = all online
+                "force":  false                 // forwarded to each pod
+            }
+
+        Names may match either a runner's hostname (e.g.
+        ``comfy-pr-1234``) or its pod_name (e.g. ``pr-1234``). Names
+        that don't resolve to a reachable runner are returned with
+        ``ok: false`` and an explanatory error in the per-target
+        result; they do not abort the rest of the sweep.
+
+        The central station's own hostname is always excluded from a
+        ``--all`` sweep (rebooting the station mid-fan-out would
+        orphan in-flight responses for the other pods); use the
+        station's own ``POST /self-update`` for that.
+        """
+        import socket
+        from safe_file import is_safe_path_component
+        from comfy_runner.hosted.fanout import fanout_self_update
+        from comfy_runner.hosted.tailnet import discover_comfy_runners
+
+        body = request.get_json(silent=True) or {}
+        names_raw = body.get("names") or []
+        force = bool(body.get("force", False))
+
+        if not isinstance(names_raw, list):
+            return _err("'names' must be a list of strings")
+        names: list[str] = []
+        for n in names_raw:
+            if not isinstance(n, str) or not is_safe_path_component(n):
+                return _err(f"Invalid pod name: {n!r}")
+            names.append(n)
+
+        try:
+            disc = discover_comfy_runners(force_refresh=True)
+        except Exception as e:
+            return _err(f"Tailnet discovery failed: {e}", 503)
+
+        runners: list[dict[str, Any]] = list(disc.get("runners", []) or [])
+
+        # Always exclude the station from a fleet sweep.
+        self_host = socket.gethostname() or ""
+        self_short = self_host.split(".", 1)[0].lower() if self_host else ""
+        if self_short:
+            runners = [
+                r for r in runners
+                if (r.get("hostname") or "").lower() != self_short
+            ]
+
+        targets: list[dict[str, Any]]
+        unresolved: list[str] = []
+        if names:
+            by_hostname = {r["hostname"]: r for r in runners}
+            by_pod_name = {r["pod_name"]: r for r in runners if r.get("pod_name")}
+            targets = []
+            for n in names:
+                hit = by_hostname.get(n) or by_pod_name.get(n)
+                if hit is None:
+                    unresolved.append(n)
+                else:
+                    targets.append(hit)
+        else:
+            targets = runners
+
+        results = fanout_self_update(targets, force=force)
+        # Surface unresolved names as failed results so the caller sees
+        # one row per requested name.
+        for n in unresolved:
+            results.append({
+                "name": n, "host": "", "ok": False, "status": 404,
+                "updated": False, "message": "",
+                "error": "no reachable comfy-runner found with that hostname or pod_name",
+            })
+
+        ok_count = sum(1 for r in results if r["ok"])
+        updated_count = sum(1 for r in results if r["ok"] and r.get("updated"))
+        failed_count = len(results) - ok_count
+
+        return jsonify({
+            "ok": failed_count == 0,
+            "results": results,
+            "total": len(results),
+            "ok_count": ok_count,
+            "updated_count": updated_count,
+            "failed_count": failed_count,
+            "skipped_self": self_short or None,
+        })
+
     # ==================================================================
     # Central Orchestration — Suite Management
     # ==================================================================
