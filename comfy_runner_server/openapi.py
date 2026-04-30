@@ -1704,6 +1704,82 @@ _ROUTES: list[dict[str, Any]] = [
             },
         }),
     },
+    {
+        "path": "/pods/self-update",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Fan out /self-update across discovered comfy-runners",
+        "description": (
+            "Auto-discover comfy-runners on the configured tailnet (via "
+            "GET /tailnet/runners) and POST /self-update to one, "
+            "several, or all of them in parallel. "
+            "Names may match either a runner's hostname (e.g. "
+            "'comfy-pr-1234') or its pod_name (e.g. 'pr-1234'). "
+            "Names that don't resolve to a reachable runner are "
+            "returned with ok=false in the per-target results — "
+            "they do not abort the rest of the sweep. "
+            "The central station's own hostname is always excluded "
+            "from a fleet sweep."
+        ),
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "names": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Hostnames or pod_names to update. "
+                                    "Empty/missing = all online comfy-runners."
+                                ),
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Forwarded to each pod's /self-update "
+                                    "as 'force-reset to origin/main'."
+                                ),
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _ok_response("Per-target self-update results", {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "host": {"type": "string"},
+                        "ok": {"type": "boolean"},
+                        "status": {
+                            "oneOf": [
+                                {"type": "integer"},
+                                {"type": "string", "enum": ["EXC"]},
+                            ],
+                        },
+                        "updated": {"type": "boolean"},
+                        "message": {"type": "string"},
+                        "error": {"type": "string", "nullable": True},
+                    },
+                },
+            },
+            "total": {"type": "integer"},
+            "ok_count": {"type": "integer"},
+            "updated_count": {"type": "integer"},
+            "failed_count": {"type": "integer"},
+            "skipped_self": {
+                "type": "string",
+                "nullable": True,
+                "description": "Hostname of the central station that was excluded.",
+            },
+        }),
+    },
 
     # ── Tests (Central Orchestration) ────────────────────────────────
     {

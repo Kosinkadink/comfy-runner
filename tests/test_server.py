@@ -1232,3 +1232,207 @@ class TestTailnetRunners:
         assert "RTX 4090" in body
         assert "runpod" in body
         assert "#1234" in body
+
+
+# =====================================================================
+# POST /pods/self-update — fan out to discovered comfy-runners
+# =====================================================================
+
+
+def _runner_entry(
+    hostname: str,
+    *,
+    pod_name: str | None = None,
+    server_url: str | None = None,
+    host: str = "100.64.0.10",
+) -> dict:
+    return {
+        "hostname": hostname,
+        "fqdn": f"{hostname}.tn.ts.net",
+        "host": host,
+        "server_url": server_url or f"http://{host}:9189",
+        "provider": "runpod" if pod_name else "local",
+        "pod_name": pod_name,
+        "purpose": "pr" if pod_name and pod_name.startswith("pr-") else None,
+        "pr_number": None,
+        "gpu": "", "ram_gb": None, "platform": "", "os": "",
+        "comfy_runner_detected": True,
+    }
+
+
+class TestPodsSelfUpdate:
+    def test_all_targets_when_names_omitted(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        runners = [
+            _runner_entry("comfy-pr-1", pod_name="pr-1", host="1.1.1.1"),
+            _runner_entry("comfy-dev", pod_name="dev", host="1.1.1.2"),
+        ]
+        fanout_results = [
+            {"name": "comfy-pr-1", "host": "http://1.1.1.1:9189", "ok": True,
+             "status": 200, "updated": True, "message": "pulled", "error": None},
+            {"name": "comfy-dev", "host": "http://1.1.1.2:9189", "ok": True,
+             "status": 200, "updated": False, "message": "Already up to date", "error": None},
+        ]
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True, "runners": runners, "tailnet_configured": True,
+                "device_count": 2, "online_count": 2, "error": None,
+            },
+        ), patch(
+            "comfy_runner.hosted.fanout.fanout_self_update",
+            return_value=fanout_results,
+        ) as fanout_mock, patch(
+            "socket.gethostname", return_value="some-other-host",
+        ):
+            resp = client.post("/pods/self-update", json={})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["total"] == 2
+        assert data["ok_count"] == 2
+        assert data["updated_count"] == 1
+        assert data["failed_count"] == 0
+        # Fanout was invoked with both discovered runners.
+        targets_arg = fanout_mock.call_args.args[0]
+        assert {t["hostname"] for t in targets_arg} == {"comfy-pr-1", "comfy-dev"}
+        assert fanout_mock.call_args.kwargs["force"] is False
+
+    def test_filters_by_hostname_or_pod_name(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        runners = [
+            _runner_entry("comfy-pr-1", pod_name="pr-1", host="1.1.1.1"),
+            _runner_entry("comfy-dev", pod_name="dev", host="1.1.1.2"),
+            _runner_entry("comfy-other", pod_name="other", host="1.1.1.3"),
+        ]
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True, "runners": runners, "tailnet_configured": True,
+                "device_count": 3, "online_count": 3, "error": None,
+            },
+        ), patch(
+            "comfy_runner.hosted.fanout.fanout_self_update",
+            return_value=[],
+        ) as fanout_mock, patch(
+            "socket.gethostname", return_value="some-other-host",
+        ):
+            resp = client.post(
+                "/pods/self-update",
+                json={"names": ["comfy-pr-1", "dev"]},  # one hostname + one pod_name
+            )
+        assert resp.status_code == 200
+        targets = fanout_mock.call_args.args[0]
+        assert {t["hostname"] for t in targets} == {"comfy-pr-1", "comfy-dev"}
+
+    def test_unresolved_names_appear_as_failed_results(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        runners = [
+            _runner_entry("comfy-pr-1", pod_name="pr-1", host="1.1.1.1"),
+        ]
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True, "runners": runners, "tailnet_configured": True,
+                "device_count": 1, "online_count": 1, "error": None,
+            },
+        ), patch(
+            "comfy_runner.hosted.fanout.fanout_self_update",
+            return_value=[
+                {"name": "comfy-pr-1", "host": "http://1.1.1.1:9189", "ok": True,
+                 "status": 200, "updated": False, "message": "", "error": None},
+            ],
+        ), patch("socket.gethostname", return_value="other"):
+            resp = client.post(
+                "/pods/self-update",
+                json={"names": ["comfy-pr-1", "ghost-pod"]},
+            )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        names = [r["name"] for r in data["results"]]
+        assert "comfy-pr-1" in names
+        assert "ghost-pod" in names
+        ghost = next(r for r in data["results"] if r["name"] == "ghost-pod")
+        assert ghost["ok"] is False
+        assert ghost["status"] == 404
+        assert "no reachable" in ghost["error"]
+        # Overall ok=False because at least one target failed.
+        assert data["ok"] is False
+        assert data["failed_count"] == 1
+
+    def test_force_propagates(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        runners = [_runner_entry("comfy-x", host="1.1.1.1")]
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={"ok": True, "runners": runners, "tailnet_configured": True,
+                          "device_count": 1, "online_count": 1, "error": None},
+        ), patch(
+            "comfy_runner.hosted.fanout.fanout_self_update",
+            return_value=[],
+        ) as fanout_mock, patch("socket.gethostname", return_value="other"):
+            resp = client.post("/pods/self-update", json={"force": True})
+        assert resp.status_code == 200
+        assert fanout_mock.call_args.kwargs["force"] is True
+
+    def test_excludes_central_station_from_fleet_sweep(self, client, tmp_config_dir):
+        # The station's own hostname must be filtered out of an --all sweep.
+        from unittest.mock import patch
+        runners = [
+            _runner_entry("station-host", host="1.1.1.1"),
+            _runner_entry("comfy-other", pod_name="other", host="1.1.1.2"),
+        ]
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={"ok": True, "runners": runners, "tailnet_configured": True,
+                          "device_count": 2, "online_count": 2, "error": None},
+        ), patch(
+            "comfy_runner.hosted.fanout.fanout_self_update",
+            return_value=[],
+        ) as fanout_mock, patch(
+            "socket.gethostname", return_value="station-host",
+        ):
+            resp = client.post("/pods/self-update", json={})
+        assert resp.status_code == 200
+        targets = fanout_mock.call_args.args[0]
+        assert [t["hostname"] for t in targets] == ["comfy-other"]
+        assert resp.get_json()["skipped_self"] == "station-host"
+
+    def test_invalid_pod_name_rejected(self, client, tmp_config_dir):
+        # Path-traversal-style names must be rejected before discovery.
+        from unittest.mock import patch
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+        ) as disc_mock:
+            resp = client.post(
+                "/pods/self-update", json={"names": ["../bad"]},
+            )
+        assert resp.status_code == 400
+        assert "Invalid pod name" in resp.get_json()["error"]
+        disc_mock.assert_not_called()
+
+    def test_names_must_be_a_list(self, client, tmp_config_dir):
+        resp = client.post(
+            "/pods/self-update", json={"names": "comfy-pr-1"},
+        )
+        assert resp.status_code == 400
+        assert "must be a list" in resp.get_json()["error"]
+
+    def test_discovery_failure_returns_503(self, client, tmp_config_dir):
+        from unittest.mock import patch
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            side_effect=RuntimeError("api down"),
+        ):
+            resp = client.post("/pods/self-update", json={})
+        assert resp.status_code == 503
+        assert "api down" in resp.get_json()["error"]
+
+
+class TestOpenAPIIncludesSelfUpdate:
+    def test_self_update_path_in_spec(self, client):
+        resp = client.get("/openapi.json")
+        assert resp.status_code == 200
+        spec = resp.get_json()
+        assert "/pods/self-update" in spec["paths"]
+        assert "post" in spec["paths"]["/pods/self-update"]
