@@ -16,7 +16,7 @@ pod doesn't sink the whole sweep.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -61,23 +61,16 @@ def fanout_self_update(
         return []
 
     max_workers = min(_MAX_WORKERS, max(1, len(targets)))
-    results: list[dict[str, Any] | None] = [None] * len(targets)
 
-    def _do_one(idx: int, target: dict[str, Any]) -> None:
-        results[idx] = _post_self_update(
+    def _one(target: dict[str, Any]) -> dict[str, Any]:
+        return _post_self_update(
             target, force=force, timeout=timeout, port=port, scheme=scheme,
         )
 
+    # `ThreadPoolExecutor.map` runs in parallel but yields results in
+    # input order — exactly what callers expect.
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_do_one, i, t) for i, t in enumerate(targets)]
-        for fut in as_completed(futures):
-            # _do_one populates `results` directly; we only need to
-            # surface unexpected exceptions (the post helper itself
-            # never raises).
-            fut.result()
-
-    # Every slot must be populated by now.
-    return [r for r in results if r is not None]
+        return list(ex.map(_one, targets))
 
 
 def _post_self_update(
