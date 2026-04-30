@@ -150,14 +150,52 @@ def _device_short_hostname(device: dict[str, Any]) -> str:
     return fqdn.split(".", 1)[0]
 
 
+# If the Tailscale REST API doesn't populate ``online`` (it doesn't,
+# on most plans / endpoints — only ``lastSeen`` is reliably present),
+# we fall back to "seen within the last LAST_SEEN_FRESH_SECS".
+# 5 minutes is intentionally generous: the coordination server's
+# lastSeen timestamp can lag by 1-2 minutes even for healthy nodes.
+_LAST_SEEN_FRESH_SECS = 300.0
+
+
 def _is_device_online(device: dict[str, Any]) -> bool:
-    """Tailscale's online flag — string or bool depending on plan."""
+    """Decide whether *device* is currently reachable.
+
+    Tailscale's REST API ``/tailnet/{tailnet}/devices`` endpoint does
+    NOT consistently populate the ``online`` field — it's only present
+    on some plans / API versions, and even then often returns stale
+    values. ``lastSeen`` (RFC 3339 timestamp) is always present and
+    is the canonical signal for "the coordination server has heard
+    from this node recently".
+
+    Match priority:
+
+    1. Explicit ``online: bool``  — trust it if present.
+    2. Explicit ``online: "true"|"false"`` — same, after lower-casing.
+    3. ``lastSeen`` within the last 5 minutes — treat as online.
+    4. Otherwise — offline.
+    """
     val = device.get("online")
     if isinstance(val, bool):
         return val
-    if isinstance(val, str):
-        return val.lower() == "true"
-    return False
+    if isinstance(val, str) and val:
+        s = val.strip().lower()
+        if s in ("true", "false"):
+            return s == "true"
+
+    last_seen = device.get("lastSeen") or ""
+    if not isinstance(last_seen, str) or not last_seen:
+        return False
+    try:
+        from datetime import datetime, timezone
+        # RFC 3339 / ISO 8601 — accept "Z" as +00:00 for fromisoformat.
+        ts = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age_secs = (datetime.now(timezone.utc) - ts).total_seconds()
+    return 0 <= age_secs <= _LAST_SEEN_FRESH_SECS
 
 
 # ---------------------------------------------------------------------------
