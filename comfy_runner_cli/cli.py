@@ -525,26 +525,36 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             send_output=out,
         )
 
-        # Check if requirements changed and install if so
+        # Check if requirements changed and install whichever files changed.
+        # Each requirements file is handled independently so that a
+        # manager_requirements.txt-only change is not silently skipped.
         changed_files = result.get("changed_files", [])
-        req_changed = any(
-            f in ("requirements.txt", "manager_requirements.txt")
-            for f in changed_files
-        )
+        changed_req_files = [
+            f for f in ("requirements.txt", "manager_requirements.txt")
+            if f in changed_files
+        ]
 
-        if req_changed:
+        if changed_req_files:
             if out:
                 out("\nRequirements changed — installing dependencies...\n")
             from pathlib import Path
 
-            req_path = Path(install_path) / "ComfyUI" / "requirements.txt"
-            rc = install_filtered_requirements(
-                install_path, req_path, send_output=out
-            )
-            if rc != 0:
-                if out:
-                    out(f"⚠ pip install exited with code {rc}\n")
-            result["requirements_installed"] = rc == 0
+            comfyui_dir = Path(install_path) / "ComfyUI"
+            installed_any = False
+            install_ok = True
+            for req_filename in changed_req_files:
+                req_path = comfyui_dir / req_filename
+                if not req_path.exists():
+                    continue
+                rc = install_filtered_requirements(
+                    install_path, req_path, send_output=out
+                )
+                installed_any = True
+                if rc != 0:
+                    install_ok = False
+                    if out:
+                        out(f"⚠ pip install for {req_filename} exited with code {rc}\n")
+            result["requirements_installed"] = installed_any and install_ok
         else:
             result["requirements_installed"] = False
             if out and changed_files:

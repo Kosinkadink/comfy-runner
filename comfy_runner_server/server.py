@@ -1606,20 +1606,26 @@ def create_app() -> Any:
                     send_output=out,
                 )
 
-                # Install requirements if changed
+                # Install requirements if changed (each file is installed
+                # independently so that a manager_requirements.txt-only change
+                # is not silently skipped).
                 changed_files = result.get("changed_files", [])
-                req_changed = any(
-                    f in ("requirements.txt", "manager_requirements.txt")
-                    for f in changed_files
-                )
-                if req_changed:
-                    req_path = Path(install_path) / "ComfyUI" / "requirements.txt"
+                comfyui_dir = Path(install_path) / "ComfyUI"
+                installed_any = False
+                install_ok = True
+                for req_filename in ("requirements.txt", "manager_requirements.txt"):
+                    if req_filename not in changed_files:
+                        continue
+                    req_path = comfyui_dir / req_filename
+                    if not req_path.exists():
+                        continue
                     rc = install_filtered_requirements(
                         install_path, req_path, send_output=out
                     )
-                    result["requirements_installed"] = rc == 0
-                else:
-                    result["requirements_installed"] = False
+                    installed_any = True
+                    if rc != 0:
+                        install_ok = False
+                result["requirements_installed"] = installed_any and install_ok
 
                 # Apply record updates from shared helper
                 for k, v in updates.items():
