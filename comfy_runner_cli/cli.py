@@ -472,7 +472,10 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     """Deploy a PR, branch, tag, commit, latest release, or pull current tracking."""
     from comfy_runner.config import get_installation, set_installation
     from comfy_runner.deployments import execute_deploy
-    from comfy_runner.pip_utils import install_filtered_requirements
+    from comfy_runner.pip_utils import (
+        DEPLOY_REQUIREMENT_FILES,
+        install_changed_requirements,
+    )
     from comfy_runner.process import get_status, start_installation, stop_installation
 
     name = args.name
@@ -525,30 +528,17 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             send_output=out,
         )
 
-        # Check if requirements changed and install if so
+        # Install any deploy-tracked requirements files that changed.
         changed_files = result.get("changed_files", [])
-        req_changed = any(
-            f in ("requirements.txt", "manager_requirements.txt")
-            for f in changed_files
+        result["requirements_installed"] = install_changed_requirements(
+            install_path, changed_files, send_output=out
         )
-
-        if req_changed:
-            if out:
-                out("\nRequirements changed — installing dependencies...\n")
-            from pathlib import Path
-
-            req_path = Path(install_path) / "ComfyUI" / "requirements.txt"
-            rc = install_filtered_requirements(
-                install_path, req_path, send_output=out
-            )
-            if rc != 0:
-                if out:
-                    out(f"⚠ pip install exited with code {rc}\n")
-            result["requirements_installed"] = rc == 0
-        else:
-            result["requirements_installed"] = False
-            if out and changed_files:
-                out("Requirements unchanged — skipping pip install.\n")
+        if (
+            out
+            and changed_files
+            and not any(f in DEPLOY_REQUIREMENT_FILES for f in changed_files)
+        ):
+            out("Requirements unchanged — skipping pip install.\n")
 
         # Apply record updates
         for k, v in updates.items():
