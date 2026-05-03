@@ -120,6 +120,55 @@ def install_filtered_requirements(
         tmp.unlink(missing_ok=True)
 
 
+# Files under ComfyUI/ that may pin runtime/manager dependencies and
+# whose changes should trigger a pip install on deploy.
+DEPLOY_REQUIREMENT_FILES: tuple[str, ...] = (
+    "requirements.txt",
+    "manager_requirements.txt",
+)
+
+
+def install_changed_requirements(
+    install_path: str | Path,
+    changed_files: list[str],
+    send_output: Callable[[str], None] | None = None,
+) -> bool:
+    """Install any of `DEPLOY_REQUIREMENT_FILES` that changed during deploy.
+
+    Each file is installed independently so a `manager_requirements.txt`-only
+    change is not silently skipped. Returns True iff at least one file was
+    installed and every install succeeded.
+    """
+    install_path = Path(install_path)
+    comfyui_dir = install_path / "ComfyUI"
+
+    changed_req_files = [f for f in DEPLOY_REQUIREMENT_FILES if f in changed_files]
+    if not changed_req_files:
+        return False
+
+    if send_output:
+        send_output("\nRequirements changed — installing dependencies...\n")
+
+    installed_any = False
+    install_ok = True
+    for req_filename in changed_req_files:
+        req_path = comfyui_dir / req_filename
+        if not req_path.exists():
+            continue
+        rc = install_filtered_requirements(
+            install_path, req_path, send_output=send_output
+        )
+        installed_any = True
+        if rc != 0:
+            install_ok = False
+            if send_output:
+                send_output(
+                    f"⚠ pip install for {req_filename} exited with code {rc}\n"
+                )
+
+    return installed_any and install_ok
+
+
 def pip_freeze(
     install_path: str | Path,
 ) -> dict[str, str]:

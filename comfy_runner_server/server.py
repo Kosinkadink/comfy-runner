@@ -1536,7 +1536,7 @@ def create_app() -> Any:
             from comfy_runner.config import get_installation, set_installation
             from comfy_runner.deployments import execute_deploy
             from comfy_runner.installations import init_installation
-            from comfy_runner.pip_utils import install_filtered_requirements
+            from comfy_runner.pip_utils import install_changed_requirements
             from comfy_runner.process import get_status, start_installation, stop_installation
 
             out, lines = _make_collector(job_id)
@@ -1606,26 +1606,11 @@ def create_app() -> Any:
                     send_output=out,
                 )
 
-                # Install requirements if changed (each file is installed
-                # independently so that a manager_requirements.txt-only change
-                # is not silently skipped).
+                # Install any deploy-tracked requirements files that changed.
                 changed_files = result.get("changed_files", [])
-                comfyui_dir = Path(install_path) / "ComfyUI"
-                installed_any = False
-                install_ok = True
-                for req_filename in ("requirements.txt", "manager_requirements.txt"):
-                    if req_filename not in changed_files:
-                        continue
-                    req_path = comfyui_dir / req_filename
-                    if not req_path.exists():
-                        continue
-                    rc = install_filtered_requirements(
-                        install_path, req_path, send_output=out
-                    )
-                    installed_any = True
-                    if rc != 0:
-                        install_ok = False
-                result["requirements_installed"] = installed_any and install_ok
+                result["requirements_installed"] = install_changed_requirements(
+                    install_path, changed_files, send_output=out
+                )
 
                 # Apply record updates from shared helper
                 for k, v in updates.items():
