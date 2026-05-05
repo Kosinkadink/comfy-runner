@@ -181,6 +181,55 @@ class TestParseWorkflowModels:
         # Workflow with definitions but no subgraphs.
         assert parse_workflow_models({"nodes": [], "definitions": {}}) == []
 
+    def test_tolerates_null_fields(self) -> None:
+        # JSON-deserialized workflows may have explicit nulls instead of
+        # missing keys; these must not crash.
+        assert parse_workflow_models({"nodes": None, "definitions": None}) == []
+        assert parse_workflow_models(
+            {"nodes": [], "definitions": {"subgraphs": None}}
+        ) == []
+        # Null entries within the lists are skipped.
+        workflow = {
+            "nodes": [None, {"properties": None}],
+            "definitions": {"subgraphs": [None]},
+        }
+        assert parse_workflow_models(workflow) == []
+
+    def test_recurses_into_deeply_nested_subgraphs(self) -> None:
+        # A subgraph may itself contain definitions.subgraphs[].
+        workflow = {
+            "nodes": [],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "nodes": [],
+                        "definitions": {
+                            "subgraphs": [
+                                {
+                                    "nodes": [
+                                        {
+                                            "properties": {
+                                                "models": [
+                                                    {
+                                                        "name": "deep.safetensors",
+                                                        "url": "https://example.com/deep.safetensors",
+                                                        "directory": "checkpoints",
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+        result = parse_workflow_models(workflow)
+        assert len(result) == 1
+        assert result[0]["name"] == "deep.safetensors"
+
 
 # ---------------------------------------------------------------------------
 # check_missing_models

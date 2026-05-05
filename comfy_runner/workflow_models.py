@@ -27,13 +27,21 @@ def parse_workflow_models(workflow: dict[str, Any]) -> list[dict[str, str]]:
     """Extract all model entries from workflow nodes, deduplicated by (name, directory).
 
     Each entry has keys: name, url, directory.
-    Recurses into definitions.subgraphs[].nodes[] for nested workflows.
+    Recurses into ``definitions.subgraphs[]`` (which may themselves contain
+    further nested subgraphs) so that models referenced anywhere in the
+    workflow tree are collected.
+
+    Tolerates explicit ``None`` values for any of ``nodes``, ``properties``,
+    ``definitions``, or ``subgraphs`` (e.g. workflows that serialize missing
+    fields as JSON ``null``).
     """
     seen: set[tuple[str, str]] = set()
     models: list[dict[str, str]] = []
 
-    def _collect_from_nodes(nodes: list[dict[str, Any]]) -> None:
-        for node in nodes:
+    def _collect(data: dict[str, Any]) -> None:
+        for node in data.get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
             node_models = (node.get("properties") or {}).get("models")
             if not isinstance(node_models, list):
                 continue
@@ -51,11 +59,14 @@ def parse_workflow_models(workflow: dict[str, Any]) -> list[dict[str, str]]:
                 seen.add(key)
                 models.append({"name": name, "url": url, "directory": directory})
 
-    _collect_from_nodes(workflow.get("nodes", []))
+        definitions = data.get("definitions") or {}
+        if not isinstance(definitions, dict):
+            return
+        for subgraph in definitions.get("subgraphs") or []:
+            if isinstance(subgraph, dict):
+                _collect(subgraph)
 
-    for subgraph in workflow.get("definitions", {}).get("subgraphs", []):
-        _collect_from_nodes(subgraph.get("nodes", []))
-
+    _collect(workflow)
     return models
 
 
