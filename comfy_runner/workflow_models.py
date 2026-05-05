@@ -27,27 +27,34 @@ def parse_workflow_models(workflow: dict[str, Any]) -> list[dict[str, str]]:
     """Extract all model entries from workflow nodes, deduplicated by (name, directory).
 
     Each entry has keys: name, url, directory.
+    Recurses into definitions.subgraphs[].nodes[] for nested workflows.
     """
     seen: set[tuple[str, str]] = set()
     models: list[dict[str, str]] = []
 
-    for node in workflow.get("nodes", []):
-        node_models = (node.get("properties") or {}).get("models")
-        if not isinstance(node_models, list):
-            continue
-        for entry in node_models:
-            if not isinstance(entry, dict):
+    def _collect_from_nodes(nodes: list[dict[str, Any]]) -> None:
+        for node in nodes:
+            node_models = (node.get("properties") or {}).get("models")
+            if not isinstance(node_models, list):
                 continue
-            name = entry.get("name", "")
-            url = entry.get("url", "")
-            directory = entry.get("directory", "")
-            if not name or not url or not directory:
-                continue
-            key = (name, directory)
-            if key in seen:
-                continue
-            seen.add(key)
-            models.append({"name": name, "url": url, "directory": directory})
+            for entry in node_models:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name", "")
+                url = entry.get("url", "")
+                directory = entry.get("directory", "")
+                if not name or not url or not directory:
+                    continue
+                key = (name, directory)
+                if key in seen:
+                    continue
+                seen.add(key)
+                models.append({"name": name, "url": url, "directory": directory})
+
+    _collect_from_nodes(workflow.get("nodes", []))
+
+    for subgraph in workflow.get("definitions", {}).get("subgraphs", []):
+        _collect_from_nodes(subgraph.get("nodes", []))
 
     return models
 

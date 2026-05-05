@@ -102,6 +102,85 @@ class TestParseWorkflowModels:
         }
         assert parse_workflow_models(workflow) == []
 
+    def test_recurses_into_subgraphs(self) -> None:
+        workflow = {
+            "nodes": [
+                {
+                    "properties": {
+                        "models": [
+                            {
+                                "name": "top.safetensors",
+                                "url": "https://example.com/top.safetensors",
+                                "directory": "checkpoints",
+                            }
+                        ]
+                    }
+                },
+            ],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "nodes": [
+                            {
+                                "properties": {
+                                    "models": [
+                                        {
+                                            "name": "nested.safetensors",
+                                            "url": "https://example.com/nested.safetensors",
+                                            "directory": "loras",
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "nodes": [
+                            {
+                                "properties": {
+                                    "models": [
+                                        {
+                                            "name": "other.bin",
+                                            "url": "https://example.com/other.bin",
+                                            "directory": "vae",
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                ]
+            },
+        }
+        result = parse_workflow_models(workflow)
+        names = sorted(m["name"] for m in result)
+        assert names == ["nested.safetensors", "other.bin", "top.safetensors"]
+
+    def test_dedupe_across_top_and_subgraphs(self) -> None:
+        entry = {
+            "name": "shared.safetensors",
+            "url": "https://example.com/shared.safetensors",
+            "directory": "checkpoints",
+        }
+        workflow = {
+            "nodes": [{"properties": {"models": [entry]}}],
+            "definitions": {
+                "subgraphs": [
+                    {"nodes": [{"properties": {"models": [entry]}}]},
+                ]
+            },
+        }
+        result = parse_workflow_models(workflow)
+        assert len(result) == 1
+        assert result[0]["name"] == "shared.safetensors"
+
+    def test_handles_missing_definitions(self) -> None:
+        # Workflow with no 'definitions' key at all should not raise.
+        workflow = {"nodes": []}
+        assert parse_workflow_models(workflow) == []
+        # Workflow with definitions but no subgraphs.
+        assert parse_workflow_models({"nodes": [], "definitions": {}}) == []
+
 
 # ---------------------------------------------------------------------------
 # check_missing_models
