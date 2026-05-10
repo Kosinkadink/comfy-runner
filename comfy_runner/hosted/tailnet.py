@@ -210,10 +210,13 @@ def _is_device_online(device: dict[str, Any]) -> bool:
 #
 # Detected case-insensitively so we don't depend on exact casing /
 # punctuation across server versions.
-_HTTPS_REQUIRED_HINT = "client sent an http request to an https server"
+HTTPS_REQUIRED_HINT = "client sent an http request to an https server"
+
+# Backwards-compatible alias (kept for any external import).
+_HTTPS_REQUIRED_HINT = HTTPS_REQUIRED_HINT
 
 
-def _looks_like_https_required(resp: Any) -> bool:
+def looks_like_https_required(resp: Any) -> bool:
     """True when *resp* matches the "HTTP probe hit HTTPS listener" signature.
 
     Tailscale serve forces HTTPS on its published ports; a plain HTTP
@@ -226,9 +229,13 @@ def _looks_like_https_required(resp: Any) -> bool:
         if getattr(resp, "status_code", None) != 400:
             return False
         body = (getattr(resp, "text", "") or "").lower()
-        return _HTTPS_REQUIRED_HINT in body
+        return HTTPS_REQUIRED_HINT in body
     except Exception:
         return False
+
+
+# Backwards-compatible alias (kept for any external import).
+_looks_like_https_required = looks_like_https_required
 
 
 def _parse_system_info_response(resp: Any) -> dict[str, Any] | None:
@@ -257,9 +264,22 @@ def probe_system_info(
 ) -> dict[str, Any] | None:
     """Probe a single host's ``/system-info`` endpoint.
 
-    Returns the parsed ``system_info`` payload on success, or ``None``
-    on any failure (DNS, connection, non-2xx, malformed JSON, missing
-    key). Never raises.
+    Returns a dict on success, or ``None`` on any failure (DNS,
+    connection, non-2xx, malformed JSON, missing key). Never raises.
+
+    Success shape::
+
+        {
+            "info":   <inner system_info dict>,
+            "scheme": "http" | "https",   # scheme that actually worked
+            "host":   "<host or fqdn>",   # address that actually worked
+        }
+
+    The ``scheme``/``host`` fields let callers build a canonical
+    follow-up URL (e.g. for fan-out POSTs) without re-discovering
+    whether the runner is fronted by ``tailscale serve``. When the
+    HTTPS fallback fires they reflect the FQDN+HTTPS pair that
+    succeeded; otherwise they echo the input ``scheme``/``host``.
 
     HTTPS fallback: many tailnet nodes (including the central station)
     use ``tailscale serve`` which enforces HTTPS on the runner's port.
@@ -284,13 +304,16 @@ def probe_system_info(
         return None
 
     if resp.ok:
-        return _parse_system_info_response(resp)
+        info = _parse_system_info_response(resp)
+        if info is None:
+            return None
+        return {"info": info, "scheme": scheme, "host": host}
 
     # HTTPS fallback only applies to a plain-HTTP probe with a known
     # FQDN and the specific HTTPS-required signature.
     if scheme != "http" or not https_fqdn:
         return None
-    if not _looks_like_https_required(resp):
+    if not looks_like_https_required(resp):
         return None
 
     https_url = f"https://{https_fqdn}:{port}/system-info"
@@ -300,7 +323,10 @@ def probe_system_info(
         return None
     if not resp.ok:
         return None
-    return _parse_system_info_response(resp)
+    info = _parse_system_info_response(resp)
+    if info is None:
+        return None
+    return {"info": info, "scheme": "https", "host": https_fqdn}
 
 
 # ---------------------------------------------------------------------------
@@ -458,11 +484,19 @@ def discover_comfy_runners(
         for fut in as_completed(future_to_device):
             d, host = future_to_device[fut]
             try:
-                info = fut.result()
+                probe = fut.result()
             except Exception:
-                info = None
-            if info is None:
+                probe = None
+            if probe is None:
                 continue
+
+            info = probe["info"]
+            # Use the scheme/host that actually answered so downstream
+            # callers (fan-out, dashboard links) hit the right listener
+            # — critical when the runner is fronted by tailscale serve
+            # and only HTTPS+FQDN works.
+            effective_scheme = probe.get("scheme") or scheme
+            effective_host = probe.get("host") or host
 
             short = _device_short_hostname(d)
             fqdn = d.get("name") or ""
@@ -470,7 +504,7 @@ def discover_comfy_runners(
                 "hostname": short,
                 "fqdn": fqdn,
                 "host": host,
-                "server_url": f"{scheme}://{host}:{port}",
+                "server_url": f"{effective_scheme}://{effective_host}:{port}",
                 "provider": "local",
                 "pod_name": None,
                 "purpose": None,

@@ -101,19 +101,59 @@ def _post_self_update(
         url = f"{scheme}://{host}:{port}/self-update"
         host_label = host
 
-    try:
-        import requests
-        resp = requests.post(url, json={"force": bool(force)}, timeout=timeout)
+    import requests
+
+    # The HTTPS-required signature is shared with discovery; reuse the
+    # detector so both code paths upgrade on the same condition.
+    from .tailnet import looks_like_https_required
+
+    payload = {"force": bool(force)}
+
+    def _do_post(post_url: str) -> tuple[Any, dict[str, Any] | None, str | None]:
+        """Returns (response, parsed_body_or_None, transport_error_or_None)."""
         try:
-            body = resp.json() if resp.content else {}
+            r = requests.post(post_url, json=payload, timeout=timeout)
+        except Exception as e:
+            return None, None, str(e)
+        try:
+            b = r.json() if r.content else {}
         except Exception:
-            body = {"raw": (resp.text or "")[:200]}
-    except Exception as e:
-        log.warning("self-update fan-out to %s failed: %s", name, e)
+            b = {"raw": (r.text or "")[:200]}
+        return r, b, None
+
+    resp, body, transport_err = _do_post(url)
+    if transport_err is not None:
+        log.warning("self-update fan-out to %s failed: %s", name, transport_err)
         return {
             "name": name, "host": host_label, "ok": False, "status": "EXC",
-            "updated": False, "message": "", "error": str(e),
+            "updated": False, "message": "", "error": transport_err,
         }
+
+    # HTTPS-fronted runner served us the Go "client sent an HTTP request
+    # to an HTTPS server" 400. Retry over HTTPS+FQDN if we know one — the
+    # cert SAN list contains the MagicDNS name, not the IP.
+    if (
+        url.startswith("http://")
+        and looks_like_https_required(resp)
+        and (target.get("fqdn") or "")
+    ):
+        fqdn = target["fqdn"]
+        retry_url = f"https://{fqdn}:{port}/self-update"
+        log.info(
+            "self-update %s: HTTP listener requires HTTPS; retrying %s",
+            name, retry_url,
+        )
+        retry_resp, retry_body, retry_err = _do_post(retry_url)
+        if retry_err is not None:
+            log.warning(
+                "self-update fan-out HTTPS retry to %s failed: %s",
+                name, retry_err,
+            )
+            return {
+                "name": name, "host": retry_url, "ok": False, "status": "EXC",
+                "updated": False, "message": "", "error": retry_err,
+            }
+        resp, body, host_label = retry_resp, retry_body, retry_url
 
     ok = bool(resp.ok and body.get("ok", False))
     return {
