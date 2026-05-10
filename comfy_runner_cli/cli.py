@@ -525,6 +525,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             latest=getattr(args, "latest", False),
             pull=getattr(args, "pull", False),
             repo_url=getattr(args, "repo_url", None),
+            force=getattr(args, "force", False),
             send_output=out,
         )
 
@@ -4785,6 +4786,11 @@ def main(argv: list[str] | None = None) -> None:
         "--repo", dest="repo_url",
         help="Repo URL or owner/name to fetch from (overrides install's "
              "origin for this deploy; mainly used for fork PRs).",
+    )
+    p_deploy.add_argument(
+        "--force", action="store_true",
+        help="Drop any non-runtime local changes via 'git reset --hard' "
+             "+ 'git clean' instead of stashing them. Destructive.",
     )
     p_deploy.set_defaults(func=cmd_deploy)
 

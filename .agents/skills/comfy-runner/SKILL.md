@@ -193,7 +193,9 @@ $body = @{ latest = $true; build = $false; python_version = "3.12" } | ConvertTo
      -H "Content-Type: application/json" -d '{"pr": 1234}'
    ```
 
-   The deploy body accepts: `pr`, `branch`, `tag`, `commit`, `latest` (bool), `pull` (bool), `reset` (bool), `launch_args`, `github_token`. For auto-init: `cuda_compat` (bool), `variant`, `comfyui_ref`, `build` (bool), and the build-trigger params `python_version`, `pbs_release`, `gpu`, `cuda_tag`, `torch_version`, `torch_spec`, `torch_index_url` (any of the build-trigger params implicitly sets `build: true` — see "Prebuilt vs ad-hoc build flow" above).
+   The deploy body accepts: `pr`, `branch`, `tag`, `commit`, `latest` (bool), `pull` (bool), `reset` (bool), `force` (bool), `launch_args`, `github_token`. For auto-init: `cuda_compat` (bool), `variant`, `comfyui_ref`, `build` (bool), and the build-trigger params `python_version`, `pbs_release`, `gpu`, `cuda_tag`, `torch_version`, `torch_spec`, `torch_index_url` (any of the build-trigger params implicitly sets `build: true` — see "Prebuilt vs ad-hoc build flow" above).
+
+   The deploy auto-handles a dirty working tree: untracked changes under runtime dirs (`styles/`, `output/`, `input/`, `temp/`, `user/`, `models/`, `custom_nodes/`) are silently ignored; anything else is stashed before the checkout (recover via `git stash list` / `pop` inside the install's `ComfyUI/` clone). If stash itself fails, it falls back to `git reset --hard` + `git clean -fd` (runtime dirs preserved) so the deploy still completes. Pass `force: true` to skip stashing and go straight to the destructive clean.
 
 4. **Poll the job until complete:**
 
@@ -299,6 +301,7 @@ All ComfyUI API endpoints are accessible via the `/{name}/comfyui/{path}` proxy 
 | `deploy [name] --latest` | Update to latest release's ComfyUI ref |
 | `deploy [name] --pull` | Re-fetch currently tracked branch/PR |
 | `deploy [name] --reset` | Reset to original release ref |
+| `deploy [name] ... --force` | Drop non-runtime local changes (`reset --hard` + `clean -fd`) instead of stashing |
 
 Deploy auto-stops the instance, installs changed requirements, restarts if it was running, and captures a snapshot.
 

@@ -1603,6 +1603,7 @@ def create_app() -> Any:
                     latest=latest,
                     pull=pull,
                     repo_url=body.get("repo"),
+                    force=bool(body.get("force", False)),
                     send_output=out,
                 )
 
@@ -3467,6 +3468,8 @@ def create_app() -> Any:
                     deploy_body["launch_args"] = body["launch_args"]
                 if body.get("cuda_compat"):
                     deploy_body["cuda_compat"] = True
+                if body.get("force"):
+                    deploy_body["force"] = True
                 deploy_body.update(_extract_build_kwargs(body))
                 if "comfyui_ref" in body:
                     deploy_body["comfyui_ref"] = body["comfyui_ref"]

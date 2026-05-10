@@ -423,6 +423,18 @@ _ROUTES: list[dict[str, Any]] = [
                                 ),
                             },
                             "start": {"type": "boolean", "description": "Start after deploy (auto-starts if was running)"},
+                            "force": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Drop any non-runtime local changes in the ComfyUI "
+                                    "repo via 'git reset --hard HEAD' + 'git clean -fd' "
+                                    "(runtime dirs like styles/, output/, input/, temp/, "
+                                    "user/, models/ are preserved). Destructive — "
+                                    "without this, comfy-runner stashes the changes "
+                                    "instead so they remain recoverable via 'git stash'."
+                                ),
+                            },
                             "launch_args": {"type": "string", "description": "Override launch args for this deploy"},
                             "cuda_compat": {
                                 "type": "boolean",
@@ -1399,6 +1411,15 @@ _ROUTES: list[dict[str, Any]] = [
                             "title": {"type": "string", "description": "PR title for display"},
                             "launch_args": {"type": "string", "description": "ComfyUI launch arguments"},
                             "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility"},
+                            "force": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Forwarded to the pod's POST /{install}/deploy: drop "
+                                    "non-runtime local changes via 'git reset --hard' + "
+                                    "'git clean -fd' instead of stashing them. Destructive."
+                                ),
+                            },
                             "build": {"type": "boolean", "description": "Build standalone env instead of downloading"},
                         },
                     }
