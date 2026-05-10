@@ -1411,6 +1411,15 @@ _ROUTES: list[dict[str, Any]] = [
                             "title": {"type": "string", "description": "PR title for display"},
                             "launch_args": {"type": "string", "description": "ComfyUI launch arguments"},
                             "cuda_compat": {"type": "boolean", "description": "Auto-detect CUDA compatibility"},
+                            "force": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Forwarded to the pod's POST /{install}/deploy: drop "
+                                    "non-runtime local changes via 'git reset --hard' + "
+                                    "'git clean -fd' instead of stashing them. Destructive."
+                                ),
+                            },
                             "build": {"type": "boolean", "description": "Build standalone env instead of downloading"},
                         },
                     }

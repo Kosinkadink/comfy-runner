@@ -174,6 +174,12 @@ comfy_runner.py deploy [name] --pull
 
 Using `--branch` persists the branch name so `--pull` can re-fetch it later. The deploy command automatically stops the instance before deploying, installs changed requirements, restarts if it was running, and captures a post-update snapshot.
 
+#### Dirty working tree
+
+ComfyUI normally writes runtime artefacts back into its repo (`styles/`, `output/`, `input/`, `temp/`, `user/`, `models/`, `custom_nodes/`). Untracked changes under those paths are silently ignored — they never block a deploy. Anything else (tracked modifications, deletions, renames, untracked files outside the runtime allowlist) is automatically stashed before the checkout with a tagged message (`comfy-runner pre-deploy <ts>`); recover via `git stash list` / `git stash pop` inside the install's `ComfyUI/` clone. If `git stash` itself fails for any reason, the deploy falls back to `git reset --hard HEAD` + `git clean -fd` (runtime dirs preserved) so the deploy still completes — the priority is a successful deploy, not preserving every byte of local state.
+
+Pass `--force` (or `force: true` in the HTTP API body) to skip the stash entirely and go straight to the destructive reset+clean.
+
 ### PR Review
 
 End-to-end preparation of a PR for review: deploy the PR, parse a `comfyrunner` manifest block from the PR description, fetch any declared workflow URLs into `user/default/workflows/`, and download any missing models. See [docs/manifest-spec.md](docs/manifest-spec.md) for the manifest format.
