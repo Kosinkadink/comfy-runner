@@ -423,6 +423,18 @@ _ROUTES: list[dict[str, Any]] = [
                                 ),
                             },
                             "start": {"type": "boolean", "description": "Start after deploy (auto-starts if was running)"},
+                            "force": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Drop any non-runtime local changes in the ComfyUI "
+                                    "repo via 'git reset --hard HEAD' + 'git clean -fd' "
+                                    "(runtime dirs like styles/, output/, input/, temp/, "
+                                    "user/, models/ are preserved). Destructive — "
+                                    "without this, comfy-runner stashes the changes "
+                                    "instead so they remain recoverable via 'git stash'."
+                                ),
+                            },
                             "launch_args": {"type": "string", "description": "Override launch args for this deploy"},
                             "cuda_compat": {
                                 "type": "boolean",

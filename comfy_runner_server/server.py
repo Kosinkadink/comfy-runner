@@ -1603,6 +1603,7 @@ def create_app() -> Any:
                     latest=latest,
                     pull=pull,
                     repo_url=body.get("repo"),
+                    force=bool(body.get("force", False)),
                     send_output=out,
                 )
 

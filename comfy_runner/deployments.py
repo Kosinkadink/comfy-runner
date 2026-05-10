@@ -15,6 +15,7 @@ from .comfyui import deploy_pr, deploy_ref, deploy_reset
 def deploy_latest(
     install_path: str | Path,
     record: dict[str, Any],
+    force: bool = False,
     send_output: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Update ComfyUI to the ref specified by the latest standalone release.
@@ -76,7 +77,10 @@ def deploy_latest(
     if send_output:
         send_output(f"ComfyUI ref: {comfyui_ref}\n")
 
-    result = deploy_ref(install_path, comfyui_ref, fetch_first=True, send_output=send_output)
+    result = deploy_ref(
+        install_path, comfyui_ref,
+        fetch_first=True, force=force, send_output=send_output,
+    )
     result["release_tag"] = tag
     result["comfyui_ref"] = comfyui_ref
     return result
@@ -85,6 +89,7 @@ def deploy_latest(
 def deploy_pull(
     install_path: str | Path,
     record: dict[str, Any],
+    force: bool = False,
     send_output: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Re-fetch the currently tracked PR or branch.
@@ -97,11 +102,17 @@ def deploy_pull(
     if deployed_pr:
         if send_output:
             send_output(f"Pulling latest for PR #{deployed_pr}...\n")
-        return deploy_pr(install_path, int(deployed_pr), send_output=send_output)
+        return deploy_pr(
+            install_path, int(deployed_pr),
+            force=force, send_output=send_output,
+        )
     elif deployed_branch:
         if send_output:
             send_output(f"Pulling latest for branch '{deployed_branch}'...\n")
-        return deploy_ref(install_path, deployed_branch, send_output=send_output)
+        return deploy_ref(
+            install_path, deployed_branch,
+            force=force, send_output=send_output,
+        )
     else:
         raise RuntimeError(
             "No tracked PR or branch for --pull. "
@@ -121,18 +132,23 @@ def execute_deploy(
     latest: bool = False,
     pull: bool = False,
     repo_url: str | None = None,
+    force: bool = False,
     send_output: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the appropriate deploy action and return (result, record_updates).
 
     *record_updates* contains only the fields that should be merged into
     the persisted installation record.
+
+    *force* propagates to ``_prepare_clean_tree``. When false (default),
+    non-runtime local changes are stashed; when true, they are dropped via
+    ``git reset --hard`` + ``git clean``.
     """
     # --- execute the deploy mode ---
     if latest:
-        result = deploy_latest(install_path, record, send_output=send_output)
+        result = deploy_latest(install_path, record, force=force, send_output=send_output)
     elif pull:
-        result = deploy_pull(install_path, record, send_output=send_output)
+        result = deploy_pull(install_path, record, force=force, send_output=send_output)
     elif reset:
         original_ref = record.get("comfyui_ref")
         if not original_ref:
@@ -140,21 +156,27 @@ def execute_deploy(
                 "No original comfyui_ref recorded for this installation. "
                 "Cannot reset."
             )
-        result = deploy_reset(install_path, original_ref, send_output=send_output)
+        result = deploy_reset(
+            install_path, original_ref, force=force, send_output=send_output,
+        )
     elif pr:
         result = deploy_pr(
             install_path, int(pr),
-            repo_url=repo_url, send_output=send_output,
+            repo_url=repo_url, force=force, send_output=send_output,
         )
     elif branch:
         result = deploy_ref(
-            install_path, branch, repo_url=repo_url, send_output=send_output
+            install_path, branch, repo_url=repo_url,
+            force=force, send_output=send_output,
         )
     elif tag:
-        result = deploy_ref(install_path, tag, send_output=send_output)
+        result = deploy_ref(
+            install_path, tag, force=force, send_output=send_output,
+        )
     elif commit:
         result = deploy_ref(
-            install_path, commit, fetch_first=False, send_output=send_output
+            install_path, commit, fetch_first=False,
+            force=force, send_output=send_output,
         )
     else:
         raise RuntimeError(
