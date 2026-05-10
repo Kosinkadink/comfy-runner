@@ -1,5 +1,5 @@
 """Tests for comfy_runner.comfyui — _comfyui_dir, _changed_files,
-_parse_porcelain, _is_runtime_ignored, _prepare_clean_tree.
+_parse_porcelain_z, _is_runtime_ignored, _prepare_clean_tree.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from comfy_runner.comfyui import (
     _changed_files,
     _comfyui_dir,
     _is_runtime_ignored,
-    _parse_porcelain,
+    _parse_porcelain_z,
     _prepare_clean_tree,
 )
 
@@ -37,32 +37,41 @@ class TestChangedFiles:
 
 
 # ---------------------------------------------------------------------------
-# _parse_porcelain
+# _parse_porcelain_z
 # ---------------------------------------------------------------------------
 
-class TestParsePorcelain:
+class TestParsePorcelainZ:
     def test_empty_input_yields_empty_list(self):
-        assert _parse_porcelain("") == []
+        assert _parse_porcelain_z("") == []
 
     def test_modified_and_untracked(self):
-        out = " M comfy.py\n?? styles/foo.json\n"
-        assert _parse_porcelain(out) == [
-            (" M", "comfy.py"),
-            ("??", "styles/foo.json"),
+        # -z output: each entry "XY path\0", trailing \0 after last entry.
+        out = " M comfy.py\0?? styles/foo.json\0"
+        assert _parse_porcelain_z(out) == [
+            (" M", ["comfy.py"]),
+            ("??", ["styles/foo.json"]),
         ]
 
-    def test_rename_uses_destination_path(self):
-        out = "R  old.py -> new.py\n"
-        assert _parse_porcelain(out) == [("R ", "new.py")]
+    def test_rename_captures_dst_and_src(self):
+        # -z rename format: "R  new\0old\0".
+        out = "R  new.py\0old.py\0"
+        assert _parse_porcelain_z(out) == [("R ", ["new.py", "old.py"])]
 
-    def test_skips_lines_too_short(self):
-        # Real porcelain lines are at least 4 chars ("XY p"); shorter
-        # lines indicate a malformed status and are dropped.
-        assert _parse_porcelain("ab\n") == []
+    def test_copy_captures_dst_and_src(self):
+        out = "C  copy.py\0orig.py\0"
+        assert _parse_porcelain_z(out) == [("C ", ["copy.py", "orig.py"])]
+
+    def test_path_with_space_passes_through_verbatim(self):
+        # Without -z, git would quote this as ``"my file.txt"``. With -z
+        # the path comes through raw and is never wrapped in quotes.
+        out = "?? my file.txt\0"
+        assert _parse_porcelain_z(out) == [("??", ["my file.txt"])]
+
+    def test_skips_fields_too_short(self):
+        assert _parse_porcelain_z("ab\0") == []
 
     def test_staged_then_modified(self):
-        out = "MM tracked.py\n"
-        assert _parse_porcelain(out) == [("MM", "tracked.py")]
+        assert _parse_porcelain_z("MM tracked.py\0") == [("MM", ["tracked.py"])]
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +86,8 @@ class TestIsRuntimeIgnored:
         "temp/scratch.bin",
         "user/default/workflows/wf.json",
         "models/checkpoints/sd.safetensors",
+        "custom_nodes/ComfyUI-Manager/__init__.py",
+        "custom_nodes/",
     ])
     def test_runtime_paths_are_ignored(self, path: str):
         assert _is_runtime_ignored(path) is True
@@ -84,8 +95,9 @@ class TestIsRuntimeIgnored:
     @pytest.mark.parametrize("path", [
         "main.py",
         "comfy/cli_args.py",
-        "stylesheets/foo.css",  # not 'styles/'
-        "outputs.json",          # not 'output/'
+        "stylesheets/foo.css",     # not 'styles/'
+        "outputs.json",            # not 'output/'
+        "custom_nodes_helper.py",  # not 'custom_nodes/'
     ])
     def test_non_runtime_paths_not_ignored(self, path: str):
         assert _is_runtime_ignored(path) is False
@@ -240,3 +252,147 @@ class TestPrepareCleanTree:
         assert result.get("ignored_runtime") in (["styles/"], ["styles/x.json"])
         # Runtime file still there even though we stashed the tracked one.
         assert (repo / "styles" / "x.json").exists()
+
+    def test_custom_nodes_preserved_under_force(self, tmp_path: Path):
+        """force=True must NOT delete user-installed custom nodes."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        # Pretend the user manually cloned a custom node.
+        (repo / "custom_nodes" / "ComfyUI-Manager").mkdir(parents=True)
+        (repo / "custom_nodes" / "ComfyUI-Manager" / "__init__.py").write_text("# manager\n")
+        # Also have a real change so we exercise the force path.
+        (repo / "tracked.py").write_text("edit\n")
+
+        result = _prepare_clean_tree(str(repo), force=True)
+        assert "tracked.py" in result.get("force_cleaned_paths", [])
+        # Custom node directory survives the clean.
+        assert (repo / "custom_nodes" / "ComfyUI-Manager" / "__init__.py").exists()
+
+    def test_rename_leaves_clean_tree(self, tmp_path: Path):
+        """A staged rename must leave the working tree clean afterwards.
+
+        Pathspec-stash of a rename is fragile (the source path is gone
+        from the worktree, so ``git stash push -- src dst`` fails). The
+        important invariant for the deploy is just that the subsequent
+        ``git checkout`` won't abort — which the hard-clean fallback
+        guarantees.
+        """
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        # git mv stages a rename of the tracked file.
+        subprocess.run(
+            ["git", "mv", "tracked.py", "renamed.py"],
+            cwd=repo, check=True,
+        )
+
+        result = _prepare_clean_tree(str(repo))
+        # Either path may be reported via stash or via the force-clean
+        # fallback — what matters is the tree ends clean.
+        touched = (
+            result.get("stashed_paths", [])
+            + result.get("force_cleaned_paths", [])
+        )
+        assert "tracked.py" in touched
+        assert "renamed.py" in touched
+        status_after = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repo,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert status_after == ""
+
+    def test_path_with_space_is_handled(self, tmp_path: Path):
+        """A new untracked file whose name contains a space must stash cleanly.
+
+        Regression test for the old line-based porcelain parser, which
+        passed git's C-style ``"my file.txt"`` quoted form straight to
+        ``git stash`` and crashed.
+        """
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / "my file.txt").write_text("hi\n")
+
+        result = _prepare_clean_tree(str(repo))
+        assert result.get("stashed_paths") == ["my file.txt"]
+        assert not (repo / "my file.txt").exists()
+        # Stash entry exists.
+        stash_list = subprocess.run(
+            ["git", "stash", "list"], cwd=repo,
+            capture_output=True, text=True, check=True,
+        ).stdout
+        assert "comfy-runner pre-deploy" in stash_list
+
+    def test_stash_failure_falls_back_to_hard_clean(self, tmp_path: Path, monkeypatch):
+        """If git stash fails, we must hard-clean rather than abort the deploy."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / "tracked.py").write_text("edit\n")
+
+        import subprocess as real_sp
+
+        from comfy_runner import comfyui as comfyui_mod
+
+        original_run = real_sp.run
+
+        def fake_run(cmd, *args, **kwargs):
+            # Make ``git stash push ...`` always fail; let everything
+            # else (status, reset, clean, rev-parse, ...) run normally.
+            if (
+                isinstance(cmd, list)
+                and len(cmd) >= 3
+                and cmd[0] == "git"
+                and cmd[1] == "stash"
+                and cmd[2] == "push"
+            ):
+                raise real_sp.CalledProcessError(
+                    1, cmd, output="", stderr="simulated stash failure",
+                )
+            return original_run(cmd, *args, **kwargs)
+
+        # _prepare_clean_tree imports subprocess as ``_sp`` inside the
+        # function body, so patching the top-level module attribute is
+        # enough — the import resolves to the same module object.
+        monkeypatch.setattr(comfyui_mod, "_sp", real_sp, raising=False)
+        monkeypatch.setattr(real_sp, "run", fake_run)
+
+        captured: list[str] = []
+        result = _prepare_clean_tree(
+            str(repo), send_output=lambda s: captured.append(s),
+        )
+        # Stash failure recorded but deploy continues.
+        assert "stash_failed" in result
+        assert "simulated stash failure" in result["stash_failed"]
+        # And the hard-clean fallback ran.
+        assert result.get("force_cleaned_paths") == ["tracked.py"]
+        # Working tree must be clean afterwards.
+        status_after = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repo,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert status_after == ""
+        # Operator gets a warning line.
+        assert any("falling back to reset+clean" in line for line in captured)
+
+    def test_status_failure_returns_status_error(self, tmp_path: Path, monkeypatch):
+        """If git status itself fails, return a status_error and let the caller proceed."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+
+        import subprocess as real_sp
+
+        original_run = real_sp.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if (
+                isinstance(cmd, list)
+                and len(cmd) >= 2
+                and cmd[0] == "git"
+                and cmd[1] == "status"
+            ):
+                raise OSError("simulated status crash")
+            return original_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(real_sp, "run", fake_run)
+
+        result = _prepare_clean_tree(str(repo))
+        assert "status_error" in result
+        assert "simulated status crash" in result["status_error"]
