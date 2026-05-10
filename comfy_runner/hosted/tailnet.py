@@ -212,9 +212,6 @@ def _is_device_online(device: dict[str, Any]) -> bool:
 # punctuation across server versions.
 HTTPS_REQUIRED_HINT = "client sent an http request to an https server"
 
-# Backwards-compatible alias (kept for any external import).
-_HTTPS_REQUIRED_HINT = HTTPS_REQUIRED_HINT
-
 
 def looks_like_https_required(resp: Any) -> bool:
     """True when *resp* matches the "HTTP probe hit HTTPS listener" signature.
@@ -232,10 +229,6 @@ def looks_like_https_required(resp: Any) -> bool:
         return HTTPS_REQUIRED_HINT in body
     except Exception:
         return False
-
-
-# Backwards-compatible alias (kept for any external import).
-_looks_like_https_required = looks_like_https_required
 
 
 def _parse_system_info_response(resp: Any) -> dict[str, Any] | None:

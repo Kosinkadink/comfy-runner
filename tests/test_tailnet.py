@@ -376,6 +376,23 @@ class TestProbeSystemInfoHttpsFallback:
             )
         assert info is None
 
+    def test_https_retry_unparseable_body_returns_none(self):
+        # Retry succeeds at the transport layer but the body isn't
+        # JSON (e.g. an HTML error page from a misbehaving proxy).
+        # _parse_system_info_response handles ValueError → returns
+        # None and the probe must not crash.
+        garbled = MagicMock()
+        garbled.ok = True
+        garbled.status_code = 200
+        garbled.text = "<html>nope</html>"
+        garbled.json.side_effect = ValueError("not json")
+        seq = [_https_required_response(), garbled]
+        with patch("requests.get", side_effect=seq):
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+
     def test_explicit_https_scheme_does_not_double_retry(self):
         # If the caller already requested HTTPS and got the same 400
         # signature back (would be very unusual), we don't try to

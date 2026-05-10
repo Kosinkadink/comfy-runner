@@ -138,7 +138,12 @@ def _post_self_update(
         and (target.get("fqdn") or "")
     ):
         fqdn = target["fqdn"]
-        retry_url = f"https://{fqdn}:{port}/self-update"
+        # Preserve the port the original URL was using so a runner on a
+        # non-default port (rare, but possible via explicit server_url)
+        # gets retried on the same port — not the function's default.
+        from urllib.parse import urlsplit
+        original_port = urlsplit(url).port or port
+        retry_url = f"https://{fqdn}:{original_port}/self-update"
         log.info(
             "self-update %s: HTTP listener requires HTTPS; retrying %s",
             name, retry_url,

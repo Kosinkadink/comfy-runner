@@ -289,3 +289,63 @@ class TestFanoutHttpsRetry:
         assert post.call_args_list[1].args[0] == \
             "https://h.tail.ts.net:9189/self-update"
         assert results[0]["ok"] is True
+
+    def test_retry_preserves_custom_port_from_server_url(self):
+        # If the original server_url uses a non-default port, the
+        # HTTPS retry must keep that port — not silently reset to 9189.
+        target = {
+            "hostname": "h",
+            "server_url": "http://1.2.3.4:8000",
+            "fqdn": "h.tail.ts.net",
+        }
+        good = _ok_response({"ok": True, "updated": False, "message": ""})
+        with patch("requests.post", side_effect=[_https_required_response(), good]) as post:
+            results = fo.fanout_self_update([target])
+        assert post.call_count == 2
+        assert post.call_args_list[1].args[0] == \
+            "https://h.tail.ts.net:8000/self-update"
+        assert results[0]["ok"] is True
+
+    def test_retry_5xx_response_recorded(self):
+        # HTTPS retry succeeds at the transport layer but the runner
+        # itself returns 502 — surface it as a per-target failure with
+        # the retry URL as the host label.
+        target = {
+            "hostname": "h",
+            "server_url": "http://1.2.3.4:9189",
+            "fqdn": "h.tail.ts.net",
+        }
+        bad_5xx = _error_response(502, {"ok": False, "error": "bad gateway"})
+        with patch("requests.post", side_effect=[_https_required_response(), bad_5xx]) as post:
+            results = fo.fanout_self_update([target])
+        assert post.call_count == 2
+        r = results[0]
+        assert r["ok"] is False
+        assert r["status"] == 502
+        assert r["host"] == "https://h.tail.ts.net:9189/self-update"
+
+    def test_retry_unparseable_body_uses_raw(self):
+        # HTTPS retry returns 200 OK but the body isn't valid JSON
+        # (e.g. an HTML error page from a misbehaving proxy). The
+        # raw text must surface so operators see *something* useful.
+        target = {
+            "hostname": "h",
+            "server_url": "http://1.2.3.4:9189",
+            "fqdn": "h.tail.ts.net",
+        }
+        garbled = MagicMock()
+        # 200 OK at the transport layer, but body isn't JSON — the
+        # ok-check (`resp.ok and body.get("ok", False)`) still fails
+        # because body falls back to {"raw": ...} which has no "ok" key.
+        garbled.ok = True
+        garbled.status_code = 200
+        garbled.content = b"<html>nope</html>"
+        garbled.text = "<html>nope</html>"
+        garbled.json.side_effect = ValueError("not json")
+        with patch("requests.post", side_effect=[_https_required_response(), garbled]) as post:
+            results = fo.fanout_self_update([target])
+        assert post.call_count == 2
+        r = results[0]
+        assert r["ok"] is False
+        # raw fallback bubbles up via the error-resolution chain.
+        assert "<html>" in r["error"]
