@@ -1740,7 +1740,13 @@ _ROUTES: list[dict[str, Any]] = [
             "returned with ok=false in the per-target results — "
             "they do not abort the rest of the sweep. "
             "The central station's own hostname is always excluded "
-            "from a fleet sweep."
+            "from a fleet sweep. "
+            "Runners fronted by ``tailscale serve`` (HTTPS-only) are "
+            "handled transparently: discovery records the canonical "
+            "HTTPS+FQDN ``server_url``, and if a fan-out POST somehow "
+            "lands on a plain-HTTP URL that returns the Go ``net/http`` "
+            "'Client sent an HTTP request to an HTTPS server' 400, "
+            "fan-out automatically retries against ``https://{fqdn}:{port}``."
         ),
         "requestBody": {
             "content": {
@@ -2042,7 +2048,16 @@ _ROUTES: list[dict[str, Any]] = [
                         "hostname": {"type": "string"},
                         "fqdn": {"type": "string"},
                         "host": {"type": "string", "description": "IP/FQDN used for probing"},
-                        "server_url": {"type": "string"},
+                        "server_url": {
+                            "type": "string",
+                            "description": (
+                                "Canonical URL the runner is reachable on. "
+                                "Reflects the scheme/host that actually answered "
+                                "the /system-info probe, so it switches to "
+                                "https://{fqdn}:{port} for nodes fronted by "
+                                "tailscale serve."
+                            ),
+                        },
                         "provider": {"type": "string", "enum": ["runpod", "local"]},
                         "pod_name": {"type": "string", "nullable": True},
                         "purpose": {"type": "string", "nullable": True, "enum": ["pr", "persistent", "test", None]},

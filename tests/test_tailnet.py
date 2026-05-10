@@ -226,8 +226,14 @@ class TestProbeSystemInfo:
     def test_happy_path_returns_inner_dict(self):
         resp = _ok_response({"ok": True, "system_info": {"gpu_label": "NVIDIA"}})
         with patch("requests.get", return_value=resp) as get:
-            info = tn.probe_system_info("100.64.0.5")
-        assert info == {"gpu_label": "NVIDIA"}
+            probe = tn.probe_system_info("100.64.0.5")
+        # New return shape: dict carrying info + effective scheme/host
+        # so callers can build a canonical follow-up URL.
+        assert probe == {
+            "info": {"gpu_label": "NVIDIA"},
+            "scheme": "http",
+            "host": "100.64.0.5",
+        }
         assert get.call_args.args[0] == "http://100.64.0.5:9189/system-info"
 
     def test_non_ok_response_returns_none(self):
@@ -253,11 +259,13 @@ class TestProbeSystemInfo:
     def test_custom_port_and_scheme(self):
         resp = _ok_response({"ok": True, "system_info": {}})
         with patch("requests.get", return_value=resp) as get:
-            tn.probe_system_info(
+            probe = tn.probe_system_info(
                 "h.ts.net", port=8000, scheme="https", timeout=5,
             )
         assert get.call_args.args[0] == "https://h.ts.net:8000/system-info"
         assert get.call_args.kwargs["timeout"] == 5
+        # Effective scheme/host echo the inputs when no fallback fires.
+        assert probe == {"info": {}, "scheme": "https", "host": "h.ts.net"}
 
 
 def _https_required_response() -> MagicMock:
@@ -281,10 +289,17 @@ class TestProbeSystemInfoHttpsFallback:
         good = _ok_response({"ok": True, "system_info": {"gpu_label": "X"}})
         seq = [_https_required_response(), good]
         with patch("requests.get", side_effect=seq) as get:
-            info = tn.probe_system_info(
+            probe = tn.probe_system_info(
                 "100.64.0.5", https_fqdn="box.tail.ts.net",
             )
-        assert info == {"gpu_label": "X"}
+        # Effective scheme/host reflect the HTTPS+FQDN pair that worked,
+        # not the original HTTP+IP probe — this is what lets fan-out
+        # aim at the correct listener without re-discovering.
+        assert probe == {
+            "info": {"gpu_label": "X"},
+            "scheme": "https",
+            "host": "box.tail.ts.net",
+        }
         # First call: plain HTTP to the IP.
         assert get.call_args_list[0].args[0] == \
             "http://100.64.0.5:9189/system-info"
@@ -355,6 +370,23 @@ class TestProbeSystemInfoHttpsFallback:
         # ok=false (e.g. system-info temporarily unavailable).
         bad_payload = _ok_response({"ok": False, "error": "x"})
         seq = [_https_required_response(), bad_payload]
+        with patch("requests.get", side_effect=seq):
+            info = tn.probe_system_info(
+                "100.64.0.5", https_fqdn="box.tail.ts.net",
+            )
+        assert info is None
+
+    def test_https_retry_unparseable_body_returns_none(self):
+        # Retry succeeds at the transport layer but the body isn't
+        # JSON (e.g. an HTML error page from a misbehaving proxy).
+        # _parse_system_info_response handles ValueError → returns
+        # None and the probe must not crash.
+        garbled = MagicMock()
+        garbled.ok = True
+        garbled.status_code = 200
+        garbled.text = "<html>nope</html>"
+        garbled.json.side_effect = ValueError("not json")
+        seq = [_https_required_response(), garbled]
         with patch("requests.get", side_effect=seq):
             info = tn.probe_system_info(
                 "100.64.0.5", https_fqdn="box.tail.ts.net",
@@ -518,26 +550,37 @@ class TestDiscoverComfyRunners:
         },
     }
 
+    # probe_system_info now returns {"info": ..., "scheme": ..., "host": ...}
+    # so callers can build a canonical follow-up URL. None still means
+    # "unreachable / not a comfy-runner".
     _DEFAULT_PROBES = {
         "100.64.0.10": {
-            "platform": "linux",
-            "os_release": "Ubuntu 22.04",
-            "gpu_label": "NVIDIA",
-            "gpus": [{
-                "vendor": "nvidia", "model": "RTX 4090",
-                "vram_mb": 24576,
-            }],
-            "total_memory_gb": 64,
+            "info": {
+                "platform": "linux",
+                "os_release": "Ubuntu 22.04",
+                "gpu_label": "NVIDIA",
+                "gpus": [{
+                    "vendor": "nvidia", "model": "RTX 4090",
+                    "vram_mb": 24576,
+                }],
+                "total_memory_gb": 64,
+            },
+            "scheme": "http",
+            "host": "100.64.0.10",
         },
         "100.64.0.20": {
-            "platform": "darwin",
-            "os_release": "macOS 14.5",
-            "gpu_label": "Apple Silicon",
-            "gpus": [{
-                "vendor": "mps", "model": "Apple M2 Max",
-                "vram_mb": None,
-            }],
-            "total_memory_gb": 32,
+            "info": {
+                "platform": "darwin",
+                "os_release": "macOS 14.5",
+                "gpu_label": "Apple Silicon",
+                "gpus": [{
+                    "vendor": "mps", "model": "Apple M2 Max",
+                    "vram_mb": None,
+                }],
+                "total_memory_gb": 32,
+            },
+            "scheme": "http",
+            "host": "100.64.0.20",
         },
         "100.64.0.30": None,
     }
@@ -704,6 +747,35 @@ class TestDiscoverComfyRunners:
             "my-laptop.tn.ts.net",
             "router.tn.ts.net",
         ])
+
+    def test_server_url_uses_effective_scheme_and_host(self):
+        # When the probe falls back to HTTPS+FQDN (tailscale serve), the
+        # discovery payload's server_url must reflect the working pair —
+        # not the original HTTP+IP probe — so fan-out callers don't try
+        # to POST plain HTTP to an HTTPS-only listener.
+        probes = {
+            "100.64.0.10": {
+                "info": {"platform": "linux", "gpu_label": "X"},
+                "scheme": "https",
+                "host": "comfy-pr-1234.tn.ts.net",
+            },
+            "100.64.0.20": {
+                "info": {"platform": "darwin", "gpu_label": "Y"},
+                "scheme": "http",
+                "host": "100.64.0.20",
+            },
+        }
+        with self._patches(probe_returns=probes):
+            result = tn.discover_comfy_runners()
+        by_name = {r["hostname"]: r for r in result["runners"]}
+        # tailscale-serve runner: server_url is HTTPS+FQDN
+        assert by_name["comfy-pr-1234"]["server_url"] == \
+            "https://comfy-pr-1234.tn.ts.net:9189"
+        # `host` still records the original probe IP (useful for ops).
+        assert by_name["comfy-pr-1234"]["host"] == "100.64.0.10"
+        # Plain runner: server_url is HTTP+IP as before.
+        assert by_name["my-laptop"]["server_url"] == "http://100.64.0.20:9189"
+        assert by_name["my-laptop"]["host"] == "100.64.0.20"
 
     def test_error_propagated_with_partial_devices(self):
         # If list_devices returns something but the cached error is
