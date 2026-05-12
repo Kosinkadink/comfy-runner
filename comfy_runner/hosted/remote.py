@@ -223,6 +223,31 @@ class RemoteRunner:
         return self._request("POST", f"/job/{job_id}/cancel")
 
     # ------------------------------------------------------------------
+    # Model download
+    # ------------------------------------------------------------------
+
+    def download_model(
+        self,
+        name: str,
+        url: str,
+        directory: str,
+        filename: str = "",
+        token: str = "",
+    ) -> dict[str, Any]:
+        """POST /{name}/download-model — async (returns ``job_id``).
+
+        If the file already exists on disk the server short-circuits and
+        returns ``{"ok": True, "skipped": True}`` synchronously (no
+        ``job_id`` field).
+        """
+        body: dict[str, Any] = {"url": url, "directory": directory}
+        if filename:
+            body["name"] = filename
+        if token:
+            body["token"] = token
+        return self._request("POST", f"/{name}/download-model", json=body)
+
+    # ------------------------------------------------------------------
     # Upload
     # ------------------------------------------------------------------
 

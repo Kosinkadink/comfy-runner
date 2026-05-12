@@ -238,6 +238,14 @@ class RemoteTarget:
             except RuntimeError:
                 pass
 
+            # Pre-flight: ensure declared models exist on the target.
+            if suite.models:
+                from .preflight import ensure_suite_models
+                ensure_suite_models(
+                    runner, self._install_name, suite,
+                    send_output=send_output,
+                )
+
             comfy_url = self._resolve_comfy_url()
             out(f"Running tests against {comfy_url}\n")
 

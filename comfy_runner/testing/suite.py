@@ -17,8 +17,25 @@ A test suite is a directory with the following structure::
     {
         "name": "Basic Regression",
         "description": "Core txt2img/img2img smoke tests",
-        "required_models": ["v1-5-pruned-emaonly.safetensors"]
+        "required_models": ["v1-5-pruned-emaonly.safetensors"],
+        "models": [
+            {
+                "name": "v1-5-pruned-emaonly.safetensors",
+                "directory": "checkpoints",
+                "url": "https://huggingface.co/.../v1-5-pruned-emaonly.safetensors"
+            }
+        ],
+        "max_runtime_s": 120
     }
+
+The ``models`` array (optional) is a download manifest used by the test
+runner to ensure required model files are present on the target before
+running the suite. Each entry must have ``name``, ``directory``, and
+``url``; ``token`` is optional (overrides the server's HF/ModelScope
+token). Entries that already exist on disk are skipped.
+
+The ``required_models`` array (legacy) is a flat list of filenames used
+only for display.
 
 ``config.json`` schema::
 
@@ -53,6 +70,10 @@ class Suite:
     required_models: list[str]
     workflows: list[Path]
     baselines_dir: Path
+    # Download manifest of model files (each entry: ``{name, directory,
+    # url, [token]}``). Pre-flight downloaded onto the target by the test
+    # runner before running workflows.
+    models: list[dict[str, str]] = field(default_factory=list)
     config: dict[str, Any] = field(default_factory=dict)
     # Optional wall-clock budget for one target's run of this suite, in
     # seconds. If exceeded, the watchdog (in the server worker thread or
@@ -139,6 +160,39 @@ def load_suite(suite_path: str | Path) -> TestSuite:
     if not workflows:
         raise ValueError(f"No workflow JSON files in {workflows_dir}")
 
+    # Optional download manifest (each entry must be a dict with at
+    # least ``name``, ``directory``, and ``url`` string fields).
+    raw_models = meta.get("models", [])
+    if not isinstance(raw_models, list):
+        raise ValueError(
+            f"'models' in suite.json must be a list, got {type(raw_models).__name__}"
+        )
+    models: list[dict[str, str]] = []
+    for i, entry in enumerate(raw_models):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"models[{i}] in suite.json must be an object, got {type(entry).__name__}"
+            )
+        for key in ("name", "directory", "url"):
+            value = entry.get(key)
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"models[{i}].{key} in suite.json is missing or not a non-empty string"
+                )
+        normalized = {
+            "name": entry["name"],
+            "directory": entry["directory"],
+            "url": entry["url"],
+        }
+        token = entry.get("token")
+        if token:
+            if not isinstance(token, str):
+                raise ValueError(
+                    f"models[{i}].token in suite.json must be a string"
+                )
+            normalized["token"] = token
+        models.append(normalized)
+
     # Baselines dir (may not exist yet)
     baselines_dir = suite_path / "baselines"
 
@@ -159,6 +213,7 @@ def load_suite(suite_path: str | Path) -> TestSuite:
         required_models=required_models,
         workflows=workflows,
         baselines_dir=baselines_dir,
+        models=models,
         config=config,
         max_runtime_s=max_runtime_s,
     )

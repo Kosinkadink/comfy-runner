@@ -359,6 +359,14 @@ Target spec formats: `local:<url>`, `remote:<server_url>`, `runpod:<gpu_type>`.
 
 A test suite is a directory containing `suite.json`, `workflows/` (API-format JSON), optional `baselines/` and `config.json`. See `test-suites/smoke/` for an example.
 
+**Pre-flight model downloads.** A suite may declare a `models` array in
+`suite.json` with `{name, directory, url, [token]}` entries. Before
+running workflows the test runner POSTs each entry to the target's
+`/<install>/download-model` endpoint. Files already on disk are skipped
+server-side, so warm pods (or pods backed by a persistent network
+volume) only download missing models. Pre-flight runs for `remote:` and
+`runpod:` targets; `local:` targets are presumed pre-provisioned.
+
 ### Hosted GPU Deployments (RunPod)
 
 Manage cloud GPU pods and network volumes via the RunPod REST API.
