@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Callable
 
+import requests
+
 from comfy_runner.hosted.remote import RemoteRunner
 
 from .suite import Suite
@@ -22,6 +24,7 @@ def ensure_suite_models(
     suite: Suite,
     timeout: int = 1800,
     send_output: Callable[[str], None] | None = None,
+    comfy_url: str | None = None,
 ) -> dict[str, int]:
     """Download every model declared in *suite* onto the target.
 
@@ -74,4 +77,16 @@ def ensure_suite_models(
         f"Pre-flight complete: {summary['skipped']} already present, "
         f"{summary['downloaded']} downloaded.\n"
     )
+
+    # If we downloaded any new files, refresh ComfyUI's folder_paths cache
+    # by hitting /object_info.  ComfyUI rebuilds INPUT_TYPES (and thus the
+    # filename dropdowns for UNETLoader/CLIPLoader/etc.) on each call, so
+    # newly downloaded models become visible without a server restart.
+    if summary["downloaded"] > 0 and comfy_url:
+        try:
+            requests.get(f"{comfy_url.rstrip('/')}/object_info", timeout=60)
+            out("Refreshed ComfyUI model lists via /object_info.\n")
+        except requests.RequestException as exc:
+            out(f"Warning: failed to refresh /object_info: {exc}\n")
+
     return summary

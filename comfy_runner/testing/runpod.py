@@ -230,16 +230,17 @@ def run_on_runpod(
         # ── Step 4: Run tests locally against remote ComfyUI ───────
         suite = load_suite(config.suite_path)
 
+        # Resolve remote ComfyUI URL (port 8188) via Tailscale.
+        comfy_url = ts_url.rsplit(":", 1)[0] + ":8188"
+
         # Pre-flight: ensure declared models exist on the pod before
         # we start submitting workflows.  Existing files are skipped.
         if suite.models:
             ensure_suite_models(
                 runner, config.install_name, suite,
                 send_output=send_output,
+                comfy_url=comfy_url,
             )
-
-        # Resolve remote ComfyUI URL (port 8188) via Tailscale.
-        comfy_url = ts_url.rsplit(":", 1)[0] + ":8188"
         out(f"Running test suite '{suite.name}' against {comfy_url}\n")
 
         client = ComfyTestClient(comfy_url, timeout=config.http_timeout)
