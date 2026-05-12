@@ -367,6 +367,25 @@ server-side, so warm pods (or pods backed by a persistent network
 volume) only download missing models. Pre-flight runs for `remote:` and
 `runpod:` targets; `local:` targets are presumed pre-provisioned.
 
+**Parked-pod workflow (auto-stop).** For long-lived test pods
+(e.g. one `e2e-5090` pod that runs the full model coverage suite on
+demand and is paused between runs to save GPU cost), pass `auto_stop:
+true` to `POST /tests/run` or `POST /tests/fleet`. After a non-overrun
+run completes, the central server stops (not terminates) the target's
+pod via the RunPod API. The pod's container disk — including the
+deployed ComfyUI install and all downloaded models — survives, so the
+next run starts in ~10–30s with zero re-download.
+
+`auto_stop` only stops, never terminates: untracked pods, stopped
+pods, or pod-API failures result in a "skipped" action and the pod is
+left alone. On overrun, `on_overrun` wins (defaults: `terminate` for
+runpod, `stop` for remote).
+
+The station CLI exposes this as `--auto-stop`:
+```bash
+station tests run all-models --target remote:e2e-5090 --auto-stop
+```
+
 ### Hosted GPU Deployments (RunPod)
 
 Manage cloud GPU pods and network volumes via the RunPod REST API.

@@ -743,3 +743,118 @@ class TestDispatchOnOverrun:
         body = {"kind": "runpod"}  # default would be terminate
         assert srv._resolve_on_overrun(body, "stop") == "stop"
         assert srv._resolve_on_overrun(body, None) == "terminate"
+
+
+# =====================================================================
+# Auto-stop dispatcher (_dispatch_auto_stop)
+# =====================================================================
+
+class TestDispatchAutoStop:
+    def test_no_pod_name_skips(self, tmp_config_dir):
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_auto_stop({"kind": "local", "url": "http://x"})
+        assert summary["action"] == "skipped"
+        assert summary["reason"] == "no_pod_name"
+        provider.stop_pod.assert_not_called()
+
+    def test_invalid_pod_name_skips(self, tmp_config_dir):
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_auto_stop(
+                {"kind": "remote", "pod_name": "../bad"},
+            )
+        assert summary["action"] == "skipped"
+        assert "Invalid pod name" in summary["reason"]
+        provider.stop_pod.assert_not_called()
+
+    def test_untracked_pod_skips_no_terminate_fallback(self, tmp_config_dir):
+        # Distinguishes auto_stop from on_overrun=stop, which falls back
+        # to terminate. Auto-stop must never destroy.
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_auto_stop(
+                {"kind": "remote", "pod_name": "untracked-pod"},
+            )
+        assert summary["action"] == "skipped"
+        assert summary["reason"] == "untracked"
+        provider.stop_pod.assert_not_called()
+        provider.terminate_pod.assert_not_called()
+
+    def test_stops_running_pod(self, tmp_config_dir):
+        set_pod_record("runpod", "e2e-5090", {
+            "id": "epod1", "purpose": "persistent",
+            "gpu_type": "NVIDIA GeForce RTX 5090",
+        })
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(id="epod1", status="RUNNING")
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_auto_stop(
+                {"kind": "remote", "pod_name": "e2e-5090"},
+            )
+        assert summary["action"] == "stopped"
+        provider.stop_pod.assert_called_once_with("epod1")
+        rec = get_pod_record("runpod", "e2e-5090")
+        assert rec["status_hint"] == "stopped_post_test"
+        assert "stopped_at" in rec
+
+    def test_skips_when_already_stopped(self, tmp_config_dir):
+        set_pod_record("runpod", "already-stopped", {
+            "id": "as1", "purpose": "persistent",
+        })
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(id="as1", status="EXITED")
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_auto_stop(
+                {"kind": "remote", "pod_name": "already-stopped"},
+            )
+        assert summary["action"] == "skipped"
+        assert "not_running" in summary["reason"]
+        provider.stop_pod.assert_not_called()
+
+    def test_skips_when_pod_busy(self, tmp_config_dir):
+        set_pod_record("runpod", "busy-pod", {
+            "id": "bp1", "purpose": "persistent",
+        })
+        provider = MagicMock()
+        lock = srv._get_pod_lock("busy-pod")
+        lock.acquire()
+        try:
+            with patch.object(srv, "_get_runpod_provider", return_value=provider):
+                summary = srv._dispatch_auto_stop(
+                    {"kind": "remote", "pod_name": "busy-pod"},
+                )
+        finally:
+            lock.release()
+        assert summary["action"] == "skipped"
+        assert summary["reason"] == "pod_busy"
+        provider.stop_pod.assert_not_called()
+
+    def test_provider_unavailable_skips(self, tmp_config_dir):
+        set_pod_record("runpod", "p", {"id": "x", "purpose": "persistent"})
+        with patch.object(
+            srv, "_get_runpod_provider",
+            side_effect=RuntimeError("no key"),
+        ):
+            summary = srv._dispatch_auto_stop(
+                {"kind": "remote", "pod_name": "p"},
+            )
+        assert summary["action"] == "skipped"
+        assert "provider unavailable" in summary["reason"]
+
+    def test_stop_pod_failure_skips(self, tmp_config_dir):
+        set_pod_record("runpod", "stop-fail", {
+            "id": "sf1", "purpose": "persistent",
+        })
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(id="sf1", status="RUNNING")
+        provider.stop_pod.side_effect = RuntimeError("api down")
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_auto_stop(
+                {"kind": "remote", "pod_name": "stop-fail"},
+            )
+        assert summary["action"] == "skipped"
+        assert "stop_failed" in summary["reason"]
+        # Record's status_hint not stamped on failure.
+        rec = get_pod_record("runpod", "stop-fail")
+        assert "status_hint" not in rec

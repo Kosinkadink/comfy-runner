@@ -1001,6 +1001,103 @@ def _dispatch_on_overrun(
     return summary
 
 
+def _dispatch_auto_stop(
+    target_body: dict[str, Any],
+    send_output: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Stop the pod referenced by *target_body* after a successful run.
+
+    Used by ``/tests/run`` and ``/tests/fleet`` when the request includes
+    ``auto_stop: true``. Unlike ``_dispatch_on_overrun``, this never
+    falls back to terminate -- if the pod can't be stopped (untracked,
+    busy, already stopped, etc.) the action is skipped and the pod is
+    left running. The caller's idle reaper is the safety net.
+
+    Returns a dict for inclusion in the test-run summary.
+    """
+    out = send_output or (lambda _: None)
+    pod_name = target_body.get("pod_name")
+    summary: dict[str, Any] = {"auto_stop": True, "pod_name": pod_name}
+
+    if not pod_name:
+        summary["action"] = "skipped"
+        summary["reason"] = "no_pod_name"
+        return summary
+
+    name_err = _validate_pod_name(pod_name)
+    if name_err:
+        summary["action"] = "skipped"
+        summary["reason"] = name_err
+        return summary
+
+    from comfy_runner.hosted.config import get_pod_record, update_pod_record
+
+    try:
+        provider = _get_runpod_provider()
+    except Exception as e:
+        summary["action"] = "skipped"
+        summary["reason"] = f"provider unavailable: {e}"
+        return summary
+
+    rec = get_pod_record("runpod", pod_name)
+    if not rec:
+        out(f"auto_stop: '{pod_name}' is untracked, skipping\n")
+        summary["action"] = "skipped"
+        summary["reason"] = "untracked"
+        return summary
+
+    lock = _get_pod_lock(pod_name)
+    if not lock.acquire(timeout=10):
+        out(f"auto_stop: pod '{pod_name}' busy, skipping stop\n")
+        summary["action"] = "skipped"
+        summary["reason"] = "pod_busy"
+        return summary
+    try:
+        pod_id = rec.get("id")
+        if not pod_id:
+            summary["action"] = "skipped"
+            summary["reason"] = "no_pod_id"
+            return summary
+        try:
+            pod = provider.get_pod(pod_id)
+        except Exception as e:
+            summary["action"] = "skipped"
+            summary["reason"] = f"get_pod_failed: {e}"
+            return summary
+        if not pod or pod.status != "RUNNING":
+            out(
+                f"auto_stop: pod '{pod_name}' is "
+                f"{pod.status if pod else 'gone'}, skipping stop\n"
+            )
+            summary["action"] = "skipped"
+            summary["reason"] = (
+                f"not_running:{pod.status if pod else 'gone'}"
+            )
+            return summary
+        try:
+            provider.stop_pod(pod_id)
+        except Exception as e:
+            summary["action"] = "skipped"
+            summary["reason"] = f"stop_failed: {e}"
+            return summary
+
+        def _mark_auto_stopped(
+            r: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            if r is None:
+                return None
+            r["status_hint"] = "stopped_post_test"
+            r["stopped_at"] = int(time.time())
+            return r
+
+        update_pod_record("runpod", pod_name, _mark_auto_stopped)
+        out(f"auto_stop: pod '{pod_name}' stopped\n")
+        summary["action"] = "stopped"
+        return summary
+    finally:
+        lock.release()
+
+
 def _build_test_target(target_body: dict[str, Any]):
     """Build a fleet TestTarget from a request body target dict."""
     from comfy_runner.testing.fleet import LocalTarget, RemoteTarget, EphemeralTarget
@@ -4485,6 +4582,7 @@ def create_app() -> Any:
                 "'on_overrun' must be one of: "
                 f"{', '.join(_VALID_ON_OVERRUN)}"
             )
+        body_auto_stop = bool(body.get("auto_stop", False))
 
         job_id = _jobs.create(label=f"test run {target.name}")
         _register_test_run(job_id, {
@@ -4547,6 +4645,12 @@ def create_app() -> Any:
                         target_body, on_overrun, send_output=out,
                     )
                     summary["on_overrun_action"] = pod_action
+                elif body_auto_stop:
+                    # Park the pod after a successful (or just-failed
+                    # but not timed-out) run.
+                    summary["auto_stop_action"] = _dispatch_auto_stop(
+                        target_body, send_output=out,
+                    )
 
                 run_status = "timed_out" if aborted else "done"
                 _finish_test_run(job_id, {
@@ -4602,6 +4706,7 @@ def create_app() -> Any:
                 "'on_overrun' must be one of: "
                 f"{', '.join(_VALID_ON_OVERRUN)}"
             )
+        body_auto_stop = bool(body.get("auto_stop", False))
 
         target_names = [t.name for t in targets]
         job_id = _jobs.create(label=f"fleet test ({len(targets)} targets)")
@@ -4656,6 +4761,11 @@ def create_app() -> Any:
                             tb, on_overrun, send_output=out,
                         ))
                     summary["on_overrun_actions"] = actions
+                elif body_auto_stop:
+                    summary["auto_stop_actions"] = [
+                        _dispatch_auto_stop(tb, send_output=out)
+                        for tb in target_bodies
+                    ]
 
                 run_status = "timed_out" if aborted else "done"
                 _finish_test_run(job_id, {

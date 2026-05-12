@@ -4217,6 +4217,8 @@ def _station_tests(args: argparse.Namespace) -> None:
                 body["max_runtime_s"] = args.max_runtime
             if getattr(args, "on_overrun", None) is not None:
                 body["on_overrun"] = args.on_overrun
+            if getattr(args, "auto_stop", False):
+                body["auto_stop"] = True
 
             data = runner._request("POST", "/tests/run", json=body)
             job_id = data.get("job_id")
@@ -4275,6 +4277,8 @@ def _station_tests(args: argparse.Namespace) -> None:
                 body["max_runtime_s"] = args.max_runtime
             if getattr(args, "on_overrun", None) is not None:
                 body["on_overrun"] = args.on_overrun
+            if getattr(args, "auto_stop", False):
+                body["auto_stop"] = True
 
             data = runner._request("POST", "/tests/fleet", json=body)
             job_id = data.get("job_id")
@@ -5346,6 +5350,16 @@ def main(argv: list[str] | None = None) -> None:
             "kind: terminate (runpod), stop (remote), none (local)."
         ),
     )
+    p_st_test_run.add_argument(
+        "--auto-stop", action="store_true",
+        help=(
+            "Stop (not terminate) the target's pod after the run "
+            "completes. Use for parked-pod e2e workflows where a "
+            "long-lived pod is paused between runs to save GPU cost. "
+            "Has no effect on local targets or on overrun "
+            "(--on-overrun wins)."
+        ),
+    )
 
     p_st_test_fleet = st_tests_sub.add_parser("fleet", help="Run a test suite across multiple targets")
     p_st_test_fleet.add_argument("suite", help="Suite name or path")
@@ -5367,6 +5381,13 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Pod action when the watchdog aborts. Defaults per target "
             "kind: terminate (runpod), stop (remote), none (local)."
+        ),
+    )
+    p_st_test_fleet.add_argument(
+        "--auto-stop", action="store_true",
+        help=(
+            "Stop (not terminate) every target's pod after the fleet "
+            "run completes. Same semantics as on `tests run`."
         ),
     )
 
