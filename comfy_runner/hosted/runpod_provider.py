@@ -74,6 +74,7 @@ class RunPodProvider:
         image: str | None = None,
         volume_id: str | None = None,
         volume_size_gb: int | None = None,
+        container_disk_gb: int | None = None,
         ports: list[str] | None = None,
         env: dict[str, str] | None = None,
         datacenter: str | None = None,
@@ -81,14 +82,20 @@ class RunPodProvider:
         allowed_cuda_versions: list[str] | None = None,
         gpu_count: int = 1,
     ) -> PodInfo:
-        """Create a pod with sensible defaults from config."""
+        """Create a pod with sensible defaults from config.
+
+        ``container_disk_gb`` sizes the *ephemeral* container disk (where the
+        runner's installations and downloaded models live). Defaults to 50 GB.
+        ``volume_size_gb`` sizes the *persistent* network volume mounted at
+        ``/workspace`` and is independent of the container disk.
+        """
         params: dict[str, Any] = {
             "name": name,
             "gpuTypeIds": [gpu_type or self.default_gpu],
             "gpuCount": gpu_count,
             "imageName": image or self.default_image,
             "ports": ports or DEFAULT_PORTS,
-            "containerDiskInGb": 50,
+            "containerDiskInGb": container_disk_gb if container_disk_gb is not None else 50,
             "volumeMountPath": "/workspace",
             "cloudType": cloud_type or self.default_cloud_type,
         }
