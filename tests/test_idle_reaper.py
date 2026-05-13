@@ -1152,3 +1152,208 @@ class TestEnsurePodRunningWithRetries:
             )
         assert url == "http://x:9189"
         assert provider.start_pod.call_count == 2
+
+
+# =====================================================================
+# _dispatch_on_overrun — registry record must NOT be removed on a
+# failed terminate (Bug A: orphan-without-record incident, ~$50 leak)
+# =====================================================================
+
+class TestDispatchOnOverrunTerminateAtomicity:
+    """Regression tests for the orphan-without-record incident.
+
+    Before the fix, ``_dispatch_on_overrun`` with
+    ``on_overrun="terminate"`` blindly removed the registry record
+    even when ``terminate_pod`` had raised an exception. The pod
+    survived on RunPod with no central record and bled GPU forever.
+    Verify that:
+
+    * a successful terminate DOES remove the record
+    * a failed terminate KEEPS the record (so the reaper can retry)
+    """
+
+    def test_successful_terminate_removes_record(self, tmp_config_dir):
+        set_pod_record("runpod", "term-ok", {
+            "id": "po1", "purpose": "test", "gpu_type": "NVIDIA L40S",
+        })
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_on_overrun(
+                {"kind": "remote", "pod_name": "term-ok"},
+                on_overrun="terminate",
+            )
+        assert summary["action"] == "terminated"
+        provider.terminate_pod.assert_called_once_with("po1")
+        # Record was removed — pod is gone, no orphan to track.
+        assert get_pod_record("runpod", "term-ok") is None
+
+    def test_failed_terminate_keeps_record(self, tmp_config_dir):
+        """The bug: previously the record was removed even on failure,
+        producing an orphan invisible to the reaper. Must keep the
+        record so the reaper picks it up next iteration.
+        """
+        set_pod_record("runpod", "term-fail", {
+            "id": "po2", "purpose": "test", "gpu_type": "NVIDIA L40S",
+            "created_at": int(time.time()),
+        })
+        provider = MagicMock()
+        provider.terminate_pod.side_effect = RuntimeError(
+            "RunPod API error 500: connection reset"
+        )
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_on_overrun(
+                {"kind": "remote", "pod_name": "term-fail"},
+                on_overrun="terminate",
+            )
+        assert summary["action"] == "skipped"
+        assert "terminate_failed" in summary["reason"]
+        # CRITICAL: record MUST still exist so the reaper can see and
+        # eventually terminate the orphan.
+        rec = get_pod_record("runpod", "term-fail")
+        assert rec is not None
+        assert rec["id"] == "po2"
+        assert rec["purpose"] == "test"
+
+    def test_no_record_skips_cleanly(self, tmp_config_dir):
+        """No-op when the pod isn't tracked at all (matches old behavior)."""
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._dispatch_on_overrun(
+                {"kind": "remote", "pod_name": "no-such-pod"},
+                on_overrun="terminate",
+            )
+        assert summary["action"] == "skipped"
+        assert summary["reason"] == "no_record"
+        provider.terminate_pod.assert_not_called()
+
+
+# =====================================================================
+# Orphan reconciler — the safety net for registry-less RunPod pods
+# (Bug B: ensures Bug-A-style failures cannot leak indefinitely)
+# =====================================================================
+
+class TestOrphanPodReconciliation:
+    """Verify ``_orphan_pod_reconciliation`` finds and terminates pods
+    that exist on RunPod but have NO entry in the registry.
+
+    Conservative by design: only auto-generated ``test-<unix_ts>``
+    names, only if old enough, only if not already tracked.
+    """
+
+    def test_terminates_old_orphan_test_pod(self, tmp_config_dir):
+        """A ``test-<old_ts>`` pod with no record gets terminated."""
+        old_ts = int(time.time()) - srv.DEFAULT_TEST_POD_TTL_S - 100
+        provider = MagicMock()
+        provider.list_pods.return_value = [
+            _make_pod(id="orph1", name=f"test-{old_ts}", status="RUNNING"),
+        ]
+        summary = {"checked": 0, "stopped": [], "terminated": [], "skipped": []}
+        srv._orphan_pod_reconciliation(provider, records={}, summary=summary)
+        provider.terminate_pod.assert_called_once_with("orph1")
+        assert len(summary["terminated"]) == 1
+        assert summary["terminated"][0]["reason"] == "orphan_no_record"
+        assert summary["terminated"][0]["name"] == f"test-{old_ts}"
+
+    def test_skips_young_orphan(self, tmp_config_dir):
+        """A young ``test-<ts>`` pod might still be in mid-registration;
+        leave it alone for a future iteration.
+        """
+        young_ts = int(time.time()) - 60  # 1 min old
+        provider = MagicMock()
+        provider.list_pods.return_value = [
+            _make_pod(id="young1", name=f"test-{young_ts}", status="RUNNING"),
+        ]
+        summary = {"checked": 0, "stopped": [], "terminated": [], "skipped": []}
+        srv._orphan_pod_reconciliation(provider, records={}, summary=summary)
+        provider.terminate_pod.assert_not_called()
+        assert summary["terminated"] == []
+        assert any("orphan_too_young" in s["reason"] for s in summary["skipped"])
+
+    def test_skips_tracked_pod(self, tmp_config_dir):
+        """A pod with a name matching the orphan pattern but that has
+        a registry record is handled by the per-purpose loop, not the
+        reconciler.
+        """
+        old_ts = int(time.time()) - srv.DEFAULT_TEST_POD_TTL_S - 100
+        name = f"test-{old_ts}"
+        provider = MagicMock()
+        provider.list_pods.return_value = [
+            _make_pod(id="tr1", name=name, status="RUNNING"),
+        ]
+        records = {name: {"id": "tr1", "purpose": "test"}}
+        summary = {"checked": 0, "stopped": [], "terminated": [], "skipped": []}
+        srv._orphan_pod_reconciliation(provider, records=records, summary=summary)
+        provider.terminate_pod.assert_not_called()
+
+    def test_skips_non_test_pattern(self, tmp_config_dir):
+        """Hand-named pods (``my-dev``, ``persistent-foo``, etc.) are
+        NEVER touched by the reconciler -- only the auto-generated
+        ``test-<digits>`` pattern matches.
+        """
+        old_ts = int(time.time()) - srv.DEFAULT_TEST_POD_TTL_S - 100
+        provider = MagicMock()
+        provider.list_pods.return_value = [
+            _make_pod(id="dev1", name="my-dev-pod", status="RUNNING"),
+            _make_pod(id="dev2", name="persistent-foo", status="RUNNING"),
+            _make_pod(id="dev3", name="test-foo", status="RUNNING"),  # not all digits
+            _make_pod(id="dev4", name="ci-runner-1", status="RUNNING"),
+            _make_pod(id="dev5", name=f"sd-runner-{old_ts}", status="RUNNING"),
+        ]
+        summary = {"checked": 0, "stopped": [], "terminated": [], "skipped": []}
+        srv._orphan_pod_reconciliation(provider, records={}, summary=summary)
+        provider.terminate_pod.assert_not_called()
+        assert summary["terminated"] == []
+
+    def test_continues_on_terminate_failure(self, tmp_config_dir):
+        """A failed terminate is logged but does not stop the sweep;
+        the next reaper iteration will retry.
+        """
+        old_ts1 = int(time.time()) - srv.DEFAULT_TEST_POD_TTL_S - 100
+        old_ts2 = old_ts1 - 100
+        provider = MagicMock()
+        provider.list_pods.return_value = [
+            _make_pod(id="fail1", name=f"test-{old_ts1}", status="RUNNING"),
+            _make_pod(id="ok2",   name=f"test-{old_ts2}", status="RUNNING"),
+        ]
+        provider.terminate_pod.side_effect = [
+            RuntimeError("RunPod 500: down"),
+            None,  # second succeeds
+        ]
+        summary = {"checked": 0, "stopped": [], "terminated": [], "skipped": []}
+        srv._orphan_pod_reconciliation(provider, records={}, summary=summary)
+        assert provider.terminate_pod.call_count == 2
+        terminated_ids = {t["id"] for t in summary["terminated"]}
+        assert terminated_ids == {"ok2"}
+        skipped_reasons = [s["reason"] for s in summary["skipped"]]
+        assert any("orphan_terminate_failed" in r for r in skipped_reasons)
+
+    def test_provider_list_pods_failure_is_swallowed(self, tmp_config_dir):
+        """If the provider can't list pods at all, log and move on; do
+        not raise out of the reaper iteration.
+        """
+        provider = MagicMock()
+        provider.list_pods.side_effect = RuntimeError("API down")
+        summary = {"checked": 0, "stopped": [], "terminated": [], "skipped": []}
+        # Must not raise.
+        srv._orphan_pod_reconciliation(provider, records={}, summary=summary)
+        provider.terminate_pod.assert_not_called()
+        assert summary["terminated"] == []
+
+    def test_reaper_iteration_invokes_reconciler(self, tmp_config_dir):
+        """End-to-end: ``_idle_reaper_iteration`` calls the orphan
+        reconciler and surfaces its terminations in the returned
+        summary alongside the registry-driven ones.
+        """
+        old_ts = int(time.time()) - srv.DEFAULT_TEST_POD_TTL_S - 100
+        provider = MagicMock()
+        provider.list_pods.return_value = [
+            _make_pod(id="orph1", name=f"test-{old_ts}", status="RUNNING"),
+        ]
+        provider.get_pod.return_value = None
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._idle_reaper_iteration()
+        # Orphan was terminated by the reconciler pass.
+        assert any(
+            t.get("reason") == "orphan_no_record" for t in summary["terminated"]
+        )
+        provider.terminate_pod.assert_called_once_with("orph1")

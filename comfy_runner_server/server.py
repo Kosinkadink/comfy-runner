@@ -16,6 +16,7 @@ GET /job/<job_id> to check status and retrieve results.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 import uuid
@@ -440,6 +441,30 @@ _TRANSIENT_START_ERROR_SUBSTRINGS = (
 DEFAULT_START_RETRIES = 2
 DEFAULT_START_RETRY_DELAY_S = 30
 
+# Orphan reconciliation -- safety net for pods that exist on RunPod but
+# have NO entry in the central pod registry. Without reconciliation
+# these pods are invisible to the existing reaper (which iterates the
+# registry only) and bill indefinitely. Real incident: 5 5090 pods
+# leaked for ~10h ($50) because ``_dispatch_auto_stop`` removed their
+# registry records on a transient ``terminate_pod`` failure, then no
+# one could see them anymore.
+#
+# To avoid blast-radius the reconciler is deliberately conservative:
+#   * Only touches pods whose name matches the auto-generated
+#     ``test-<unix_ts>`` pattern produced by ``run_on_runpod``. This
+#     deliberately excludes ``persistent``, ``pr``, ``ci-runner``, or
+#     hand-named pods -- if a user named their dev pod ``test-foo`` it
+#     won't match (digits-only suffix).
+#   * Only acts on pods older than ``DEFAULT_TEST_POD_TTL_S``. The
+#     in-name timestamp is the source of truth (it's how the test
+#     runner names them); RunPod's ``createdAt`` is a fallback for
+#     defense-in-depth.
+#   * Skips any pod that *does* have a registry record -- that pod is
+#     handled by the per-purpose branches above.
+#   * Logs every reconciler-triggered termination at WARNING so the
+#     operator can audit any auto-cleanup after the fact.
+_ORPHAN_TEST_POD_PATTERN = re.compile(r"^test-(\d{9,11})$")
+
 
 def _is_transient_start_error(exc: BaseException) -> bool:
     """Return True if *exc* matches a known transient RunPod resume error."""
@@ -742,7 +767,111 @@ def _idle_reaper_iteration() -> dict[str, Any]:
                 )
             finally:
                 lock.release()
+
+    # ── Orphan reconciliation pass ──────────────────────────────────
+    # Belt-and-suspenders defense against pods that escaped the
+    # registry (Bug A symptom in this incident, but any future bug of
+    # the same shape is also caught). See ``_ORPHAN_TEST_POD_PATTERN``
+    # docstring above for the safety constraints.
+    _orphan_pod_reconciliation(provider, records, summary)
     return summary
+
+
+def _orphan_pod_reconciliation(
+    provider: Any,
+    records: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    """Find and terminate test pods on RunPod that have no registry record.
+
+    Iterates ``provider.list_pods()`` and matches any pod whose name
+    fits ``_ORPHAN_TEST_POD_PATTERN`` (``test-<unix_ts>``) and that:
+
+    * is NOT already in *records* (the per-purpose loop above handles
+      tracked pods), and
+    * has an in-name timestamp older than ``now - DEFAULT_TEST_POD_TTL_S``
+
+    Such a pod is a recoverable orphan: the test runner that created
+    it crashed/leaked before its auto-terminate hook could run, OR a
+    bug elsewhere stripped the registry record. Either way, no human
+    is going to discover it -- the existing reaper iterates the
+    registry only and would never see it. This function calls
+    ``provider.terminate_pod`` and logs at WARNING so the operator
+    can audit.
+
+    Mutates *summary* in place: appends entries to
+    ``summary["terminated"]`` with ``"reason": "orphan_no_record"``,
+    or to ``summary["skipped"]`` on transient API errors. Counts
+    every checked candidate in ``summary["checked"]``.
+    """
+    try:
+        actual_pods = provider.list_pods()
+    except Exception as e:
+        log.warning(
+            "orphan reconciler: provider.list_pods failed: %s "
+            "(skipping orphan sweep this iteration)",
+            e,
+        )
+        return
+
+    now = int(time.time())
+    cutoff_age_s = DEFAULT_TEST_POD_TTL_S
+    for pod in actual_pods:
+        name = getattr(pod, "name", "") or ""
+        m = _ORPHAN_TEST_POD_PATTERN.match(name)
+        if not m:
+            continue  # not an auto-generated test pod name -- ignore
+        if name in records:
+            continue  # tracked; the per-purpose loop already handled it
+        try:
+            ts = int(m.group(1))
+        except ValueError:
+            continue
+        age_s = now - ts
+        if age_s < cutoff_age_s:
+            # Young enough that an in-flight test runner might still
+            # be racing to register it. Wait it out.
+            summary["skipped"].append({
+                "name": name,
+                "reason": f"orphan_too_young (age {age_s}s < {cutoff_age_s}s)",
+            })
+            continue
+
+        summary["checked"] += 1
+        pod_id = getattr(pod, "id", "") or ""
+        if not pod_id:
+            log.warning(
+                "orphan reconciler: candidate '%s' has no id; skipping",
+                name,
+            )
+            continue
+        try:
+            provider.terminate_pod(pod_id)
+        except Exception as e:
+            log.warning(
+                "orphan reconciler: terminate_pod %s (id=%s) failed: %s "
+                "(will retry next iteration)",
+                name, pod_id, e,
+            )
+            summary["skipped"].append({
+                "name": name,
+                "reason": f"orphan_terminate_failed: {e}",
+            })
+            continue
+
+        summary["terminated"].append({
+            "name": name,
+            "id": pod_id,
+            "reason": "orphan_no_record",
+            "age_s": age_s,
+        })
+        log.warning(
+            "orphan reconciler: terminated registry-less test pod "
+            "'%s' (id=%s, age %ss). The pod was created by a test "
+            "runner whose auto-terminate hook failed AND whose "
+            "registry record was lost; investigate the upstream bug.",
+            name, pod_id, age_s,
+        )
 
 
 def _idle_reaper_loop(stop_event: threading.Event) -> None:
@@ -1224,14 +1353,35 @@ def _dispatch_on_overrun(
 
     if on_overrun == "terminate":
         if rec and rec.get("id"):
+            # CRITICAL: only drop the registry record AFTER
+            # ``terminate_pod`` returns without raising. The previous
+            # version blindly removed the record even when terminate
+            # failed, which produced registry-less RunPod pods that
+            # were invisible to the orphan reaper and billed
+            # indefinitely (real incident: 5 5090 pods leaked for
+            # ~10h, ~$50). The orphan reconciler in
+            # ``_orphan_pod_reconciliation`` is the safety net for any
+            # future regression of this same shape, but the right fix
+            # is to never remove the record on a failed terminate in
+            # the first place.
             try:
                 provider.terminate_pod(rec["id"])
             except Exception as e:
-                out(f"on_overrun=terminate: terminate_pod failed: {e}\n")
+                out(
+                    f"on_overrun=terminate: terminate_pod failed: {e} "
+                    f"(record kept for the orphan reaper)\n"
+                )
+                summary["action"] = "skipped"
+                summary["reason"] = f"terminate_failed: {e}"
+                return summary
             try:
                 remove_pod_record("runpod", pod_name)
-            except Exception:
-                pass
+            except Exception as e:
+                out(
+                    f"on_overrun=terminate: remove_pod_record failed: "
+                    f"{e} (pod was terminated; stale record will be "
+                    f"GC'd by reaper)\n"
+                )
             out(f"on_overrun=terminate: pod '{pod_name}' terminated\n")
             summary["action"] = "terminated"
             return summary
