@@ -73,6 +73,7 @@ class TestIdleSecondsRemaining:
     def test_non_pr_pod_returns_none(self):
         assert srv._idle_seconds_remaining({"id": "x"}) is None
         assert srv._idle_seconds_remaining({"purpose": "persistent"}) is None
+        assert srv._idle_seconds_remaining({"purpose": "test"}) is None
 
     def test_no_last_active_returns_full_timeout(self):
         rec = {"purpose": "pr", "idle_timeout_s": 300}
@@ -92,6 +93,130 @@ class TestIdleSecondsRemaining:
         rec = {"purpose": "pr", "idle_timeout_s": 60,
                "last_active_at": int(time.time()) - 600}
         assert srv._idle_seconds_remaining(rec) == 0
+
+    def test_ci_runner_pod_uses_idle_timeout(self):
+        rec = {"purpose": "ci-runner", "idle_timeout_s": 120,
+               "last_active_at": int(time.time()) - 10}
+        remaining = srv._idle_seconds_remaining(rec)
+        assert 100 <= remaining <= 120
+
+    def test_ci_runner_stale_returns_zero(self):
+        rec = {"purpose": "ci-runner", "idle_timeout_s": 60,
+               "last_active_at": int(time.time()) - 9999}
+        assert srv._idle_seconds_remaining(rec) == 0
+
+
+class TestTestPodTtlRemaining:
+    def test_non_test_pod_returns_none(self):
+        assert srv._test_pod_ttl_remaining({"id": "x"}) is None
+        assert srv._test_pod_ttl_remaining({"purpose": "persistent"}) is None
+        assert srv._test_pod_ttl_remaining({"purpose": "pr"}) is None
+        assert srv._test_pod_ttl_remaining({"purpose": "ci-runner"}) is None
+
+    def test_default_ttl(self):
+        rec = {"purpose": "test"}
+        assert srv._test_pod_ttl_remaining(rec) == srv.DEFAULT_TEST_POD_TTL_S
+
+    def test_uses_created_at_when_no_last_active(self):
+        rec = {"purpose": "test", "ttl_s": 60,
+               "created_at": int(time.time()) - 30}
+        remaining = srv._test_pod_ttl_remaining(rec)
+        assert 25 <= remaining <= 35
+
+    def test_uses_last_active_at_when_present(self):
+        rec = {"purpose": "test", "ttl_s": 60,
+               "created_at": int(time.time()) - 9999,
+               "last_active_at": int(time.time()) - 5}
+        remaining = srv._test_pod_ttl_remaining(rec)
+        assert 50 <= remaining <= 60
+
+    def test_stale_returns_zero(self):
+        rec = {"purpose": "test", "ttl_s": 60,
+               "created_at": int(time.time()) - 9999}
+        assert srv._test_pod_ttl_remaining(rec) == 0
+
+
+class TestReaperCiRunnerAndTest:
+    def test_stops_idle_ci_runner_pod(self, tmp_config_dir):
+        set_pod_record("runpod", "ci-1", {
+            "id": "ci1", "purpose": "ci-runner",
+            "idle_timeout_s": 60,
+            "last_active_at": int(time.time()) - 9999,
+        })
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(
+            id="ci1", status="RUNNING",
+        )
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._idle_reaper_iteration()
+        assert summary["stopped"] == [
+            {"name": "ci-1", "id": "ci1", "purpose": "ci-runner"},
+        ]
+        # ci-runner pods are NEVER terminated by the reaper.
+        provider.terminate_pod.assert_not_called()
+        provider.stop_pod.assert_called_once_with("ci1")
+
+    def test_skips_active_ci_runner_pod(self, tmp_config_dir):
+        set_pod_record("runpod", "ci-2", {
+            "id": "ci2", "purpose": "ci-runner",
+            "idle_timeout_s": 600,
+            "last_active_at": int(time.time()),
+        })
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._idle_reaper_iteration()
+        assert summary["stopped"] == []
+        assert summary["terminated"] == []
+        provider.stop_pod.assert_not_called()
+        provider.terminate_pod.assert_not_called()
+
+    def test_terminates_orphan_test_pod_past_ttl(self, tmp_config_dir):
+        set_pod_record("runpod", "test-orphan", {
+            "id": "to1", "purpose": "test", "ttl_s": 60,
+            "created_at": int(time.time()) - 9999,
+        })
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._idle_reaper_iteration()
+        assert summary["terminated"] == [
+            {"name": "test-orphan", "id": "to1", "purpose": "test"},
+        ]
+        # Test-pod reaping NEVER stops, only terminates.
+        provider.stop_pod.assert_not_called()
+        provider.terminate_pod.assert_called_once_with("to1")
+        # Record was removed.
+        assert get_pod_record("runpod", "test-orphan") is None
+
+    def test_does_not_terminate_fresh_test_pod(self, tmp_config_dir):
+        set_pod_record("runpod", "test-fresh", {
+            "id": "tf1", "purpose": "test", "ttl_s": 60,
+            "created_at": int(time.time()),
+        })
+        provider = MagicMock()
+        with patch.object(srv, "_get_runpod_provider", return_value=provider):
+            summary = srv._idle_reaper_iteration()
+        assert summary["terminated"] == []
+        provider.terminate_pod.assert_not_called()
+        # Record preserved.
+        assert get_pod_record("runpod", "test-fresh") is not None
+
+    def test_skips_busy_test_pod(self, tmp_config_dir):
+        set_pod_record("runpod", "test-busy", {
+            "id": "tb1", "purpose": "test", "ttl_s": 60,
+            "created_at": int(time.time()) - 9999,
+        })
+        provider = MagicMock()
+        lock = srv._get_pod_lock("test-busy")
+        lock.acquire()
+        try:
+            with patch.object(srv, "_get_runpod_provider",
+                              return_value=provider):
+                summary = srv._idle_reaper_iteration()
+        finally:
+            lock.release()
+        assert summary["terminated"] == []
+        assert any(s["reason"] == "busy" for s in summary["skipped"])
+        provider.terminate_pod.assert_not_called()
 
 
 # =====================================================================
@@ -153,7 +278,9 @@ class TestIdleReaperIteration:
         provider.get_pod.return_value = _make_pod(id="p2", status="RUNNING")
         with patch.object(srv, "_get_runpod_provider", return_value=provider):
             summary = srv._idle_reaper_iteration()
-        assert summary["stopped"] == [{"name": "pr-2", "id": "p2"}]
+        assert summary["stopped"] == [
+            {"name": "pr-2", "id": "p2", "purpose": "pr"}
+        ]
         provider.stop_pod.assert_called_once_with("p2")
         rec = get_pod_record("runpod", "pr-2")
         assert rec["status_hint"] == "stopped_idle"

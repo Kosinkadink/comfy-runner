@@ -166,6 +166,11 @@ def run_on_runpod(
                 "datacenter": pod.datacenter,
                 "image": pod.image,
                 "purpose": "test",
+                # Stamp the creation time so the central server's
+                # orphan reaper can apply its TTL even if our
+                # auto-terminate hook later silently fails.
+                "created_at": int(time.time()),
+                "last_active_at": int(time.time()),
             })
             out(f"Pod created (id: {pod_id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
         elif pod and pod.status != "RUNNING":

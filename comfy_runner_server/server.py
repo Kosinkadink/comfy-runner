@@ -410,6 +410,12 @@ def _get_runpod_provider():
 # ---------------------------------------------------------------------------
 
 DEFAULT_IDLE_TIMEOUT_S = 600
+# TTL for ``purpose='test'`` ephemeral pods. Anything older than this
+# is force-terminated by the reaper, since these pods are meant to be
+# torn down at the end of ``run_on_runpod`` -- if one is still around
+# past the TTL, the auto-terminate hook silently failed and we don't
+# want a forgotten pod to keep burning GPU.
+DEFAULT_TEST_POD_TTL_S = 7200
 _REAPER_INTERVAL_S = 60
 
 _reaper_lock = threading.Lock()
@@ -436,15 +442,39 @@ def _touch_pod_activity(name: str) -> None:
 
 def _idle_seconds_remaining(rec: dict[str, Any]) -> int | None:
     """Return seconds remaining before *rec* is eligible for idle-stop, or
-    ``None`` if the pod is not subject to the idle reaper.
+    ``None`` if the pod is not subject to the idle-stop reaper.
+
+    Applies to ``purpose='pr'`` (PR-review pods) and ``purpose='ci-runner'``
+    (long-lived test runners that suspend between CI invocations). Both
+    are *stopped*, never terminated, by the reaper.
     """
-    if rec.get("purpose") != "pr":
+    if rec.get("purpose") not in ("pr", "ci-runner"):
         return None
     timeout = int(rec.get("idle_timeout_s") or DEFAULT_IDLE_TIMEOUT_S)
     last = rec.get("last_active_at")
     if not last:
         return timeout
     return max(0, timeout - int(time.time() - int(last)))
+
+
+def _test_pod_ttl_remaining(rec: dict[str, Any]) -> int | None:
+    """Return seconds remaining before *rec* is eligible for force-terminate,
+    or ``None`` if the pod is not a ``purpose='test'`` ephemeral pod.
+
+    ``purpose='test'`` pods are meant to be terminated by ``run_on_runpod``
+    when the suite finishes. If one survives past ``ttl_s`` (default
+    ``DEFAULT_TEST_POD_TTL_S``) it's an orphan -- the auto-terminate hook
+    failed -- and the reaper destroys it. We use ``last_active_at`` if
+    present (set when the pod is touched/created), else ``created_at``,
+    else assume "now" so a pod with no timestamps gets a fresh TTL.
+    """
+    if rec.get("purpose") != "test":
+        return None
+    ttl = int(rec.get("ttl_s") or DEFAULT_TEST_POD_TTL_S)
+    last = rec.get("last_active_at") or rec.get("created_at")
+    if not last:
+        return ttl
+    return max(0, ttl - int(time.time() - int(last)))
 
 
 def _ensure_pod_running(
@@ -481,16 +511,32 @@ def _ensure_pod_running(
 def _idle_reaper_iteration() -> dict[str, Any]:
     """Run a single reaper sweep. Returns a summary dict (also useful in tests).
 
-    Stops any pod whose record has ``purpose == "pr"``, status RUNNING,
-    and is past its idle timeout. Skips pods whose lock is currently
-    held (i.e. an operation is in flight).
+    Three behaviors based on the pod's ``purpose`` tag:
+
+    * ``purpose='pr'`` -- stop the pod if it's RUNNING and past its
+      idle timeout. Never terminates.
+    * ``purpose='ci-runner'`` -- same as ``'pr'`` (stop only). These are
+      long-lived test runners that suspend between CI invocations to
+      preserve the cached models on their container disk.
+    * ``purpose='test'`` -- terminate the pod (regardless of status) if
+      its TTL has elapsed. These are ephemeral pods spawned by
+      ``run_on_runpod`` whose auto-terminate hook silently failed.
+
+    Skips pods whose lock is currently held (i.e. an operation is in
+    flight).
     """
     from comfy_runner.hosted.config import (
         list_pod_records,
+        remove_pod_record,
         update_pod_record,
     )
 
-    summary: dict[str, Any] = {"checked": 0, "stopped": [], "skipped": []}
+    summary: dict[str, Any] = {
+        "checked": 0,
+        "stopped": [],
+        "terminated": [],
+        "skipped": [],
+    }
 
     try:
         provider = _get_runpod_provider()
@@ -500,66 +546,118 @@ def _idle_reaper_iteration() -> dict[str, Any]:
 
     records = list_pod_records("runpod")
     for name, rec in records.items():
-        if rec.get("purpose") != "pr":
-            continue
-        summary["checked"] += 1
-        remaining = _idle_seconds_remaining(rec)
-        if remaining is None or remaining > 0:
-            summary["skipped"].append({"name": name, "reason": "active",
-                                        "remaining_s": remaining})
-            continue
-        # Skip if there's an active operation on this pod.
-        lock = _get_pod_lock(name)
-        if not lock.acquire(blocking=False):
-            summary["skipped"].append({"name": name, "reason": "busy"})
-            continue
-        try:
-            pod_id = rec.get("id")
-            if not pod_id:
+        purpose = rec.get("purpose")
+        if purpose in ("pr", "ci-runner"):
+            summary["checked"] += 1
+            remaining = _idle_seconds_remaining(rec)
+            if remaining is None or remaining > 0:
+                summary["skipped"].append({"name": name, "reason": "active",
+                                            "remaining_s": remaining})
+                continue
+            lock = _get_pod_lock(name)
+            if not lock.acquire(blocking=False):
+                summary["skipped"].append({"name": name, "reason": "busy"})
                 continue
             try:
-                pod = provider.get_pod(pod_id)
-            except Exception as e:
-                log.warning("idle reaper: get_pod %s failed: %s", name, e)
-                summary["skipped"].append({"name": name, "reason": f"api: {e}"})
-                continue
-            if not pod or pod.status != "RUNNING":
-                # Already not running — sync the hint without an API call.
-                if pod:
-                    pod_status_lower = pod.status.lower()
+                pod_id = rec.get("id")
+                if not pod_id:
+                    continue
+                try:
+                    pod = provider.get_pod(pod_id)
+                except Exception as e:
+                    log.warning("idle reaper: get_pod %s failed: %s", name, e)
+                    summary["skipped"].append({"name": name, "reason": f"api: {e}"})
+                    continue
+                if not pod or pod.status != "RUNNING":
+                    if pod:
+                        pod_status_lower = pod.status.lower()
 
-                    def _sync_hint(r: dict[str, Any] | None,
-                                   _hint: str = pod_status_lower) -> dict[str, Any] | None:
-                        if r is None:
-                            return None
-                        if r.get("status_hint") != "stopped_idle":
-                            r["status_hint"] = _hint
-                        return r
-                    update_pod_record("runpod", name, _sync_hint)
-                summary["skipped"].append({
-                    "name": name,
-                    "reason": f"not running ({pod.status if pod else 'gone'})",
+                        def _sync_hint(r: dict[str, Any] | None,
+                                       _hint: str = pod_status_lower) -> dict[str, Any] | None:
+                            if r is None:
+                                return None
+                            if r.get("status_hint") != "stopped_idle":
+                                r["status_hint"] = _hint
+                            return r
+                        update_pod_record("runpod", name, _sync_hint)
+                    summary["skipped"].append({
+                        "name": name,
+                        "reason": f"not running ({pod.status if pod else 'gone'})",
+                    })
+                    continue
+                try:
+                    provider.stop_pod(pod_id)
+                except Exception as e:
+                    log.warning("idle reaper: stop_pod %s failed: %s", name, e)
+                    summary["skipped"].append({"name": name, "reason": f"stop: {e}"})
+                    continue
+
+                def _mark_idle(r: dict[str, Any] | None) -> dict[str, Any] | None:
+                    if r is None:
+                        return None
+                    r["status_hint"] = "stopped_idle"
+                    r["stopped_at"] = int(time.time())
+                    return r
+                update_pod_record("runpod", name, _mark_idle)
+                summary["stopped"].append({
+                    "name": name, "id": pod_id, "purpose": purpose,
                 })
+                log.info(
+                    "idle reaper: stopped %s pod '%s' (idle > %ss)",
+                    purpose, name,
+                    rec.get("idle_timeout_s") or DEFAULT_IDLE_TIMEOUT_S,
+                )
+            finally:
+                lock.release()
+        elif purpose == "test":
+            summary["checked"] += 1
+            remaining = _test_pod_ttl_remaining(rec)
+            if remaining is None or remaining > 0:
+                summary["skipped"].append({"name": name, "reason": "active",
+                                            "remaining_s": remaining})
+                continue
+            lock = _get_pod_lock(name)
+            if not lock.acquire(blocking=False):
+                summary["skipped"].append({"name": name, "reason": "busy"})
                 continue
             try:
-                provider.stop_pod(pod_id)
-            except Exception as e:
-                log.warning("idle reaper: stop_pod %s failed: %s", name, e)
-                summary["skipped"].append({"name": name, "reason": f"stop: {e}"})
-                continue
-
-            def _mark_idle(r: dict[str, Any] | None) -> dict[str, Any] | None:
-                if r is None:
-                    return None
-                r["status_hint"] = "stopped_idle"
-                r["stopped_at"] = int(time.time())
-                return r
-            update_pod_record("runpod", name, _mark_idle)
-            summary["stopped"].append({"name": name, "id": pod_id})
-            log.info("idle reaper: stopped pod '%s' (idle > %ss)",
-                     name, rec.get("idle_timeout_s") or DEFAULT_IDLE_TIMEOUT_S)
-        finally:
-            lock.release()
+                pod_id = rec.get("id")
+                if not pod_id:
+                    # No id -- just drop the stale record.
+                    try:
+                        remove_pod_record("runpod", name)
+                    except Exception:
+                        pass
+                    summary["terminated"].append({"name": name, "id": None})
+                    continue
+                try:
+                    provider.terminate_pod(pod_id)
+                except Exception as e:
+                    log.warning(
+                        "idle reaper: terminate_pod %s failed: %s",
+                        name, e,
+                    )
+                    summary["skipped"].append({
+                        "name": name, "reason": f"terminate: {e}",
+                    })
+                    continue
+                try:
+                    remove_pod_record("runpod", name)
+                except Exception as e:
+                    log.warning(
+                        "idle reaper: remove_pod_record %s failed: %s",
+                        name, e,
+                    )
+                summary["terminated"].append({
+                    "name": name, "id": pod_id, "purpose": "test",
+                })
+                log.info(
+                    "idle reaper: terminated orphan test pod '%s' "
+                    "(ttl > %ss, auto-terminate hook failed)",
+                    name, rec.get("ttl_s") or DEFAULT_TEST_POD_TTL_S,
+                )
+            finally:
+                lock.release()
     return summary
 
 
@@ -814,7 +912,73 @@ def _wait_for_pod_server(
 
 
 _VALID_ON_OVERRUN = ("none", "stop", "terminate")
-_VALID_PURPOSES = ("pr", "persistent", "test")
+_VALID_PURPOSES = ("pr", "persistent", "test", "ci-runner")
+
+
+def _safe_rel(base: Path, target: Path) -> str | None:
+    """Return *target*'s POSIX-style relative path under *base*, or None
+    if it doesn't lie under base. Used by the artifact endpoint to
+    construct URL prefixes for nested fleet output dirs.
+    """
+    try:
+        rel = target.resolve().relative_to(base.resolve())
+    except ValueError:
+        return None
+    return str(rel).replace("\\", "/")
+
+
+def _suite_report_from_dict(data: dict[str, Any]) -> Any:
+    """Reconstruct a ``SuiteReport`` from its ``to_dict()`` payload.
+
+    Used by the HTML report renderer to materialize a previously
+    persisted ``report.json`` (or a fleet's nested per-target report).
+    Comparison entries are reconstructed so the renderer's image-grid
+    code can find ``diff_artifact`` paths.
+    """
+    from comfy_runner.testing.compare.registry import CompareResult
+    from comfy_runner.testing.report import SuiteReport, WorkflowReport
+    from comfy_runner.testing.runner import ComparisonEntry
+
+    workflows = []
+    for wf in data.get("workflows", []) or []:
+        comparisons: list[ComparisonEntry] = []
+        for comp in wf.get("comparisons", []) or []:
+            res = comp.get("result", {}) or {}
+            diff_artifact = res.get("diff_artifact")
+            cr = CompareResult(
+                method=res.get("method", "existence"),
+                passed=bool(res.get("passed", False)),
+                score=res.get("score"),
+                threshold=res.get("threshold"),
+                diff_artifact=Path(diff_artifact) if diff_artifact else None,
+                details=res.get("details") or {},
+            )
+            comparisons.append(ComparisonEntry(
+                baseline_file=comp.get("baseline_file", ""),
+                test_file=comp.get("test_file", ""),
+                result=cr,
+            ))
+        workflows.append(WorkflowReport(
+            name=wf.get("name", ""),
+            passed=bool(wf.get("passed", False)),
+            error=wf.get("error"),
+            execution_time=wf.get("execution_time"),
+            output_count=int(wf.get("output_count", 0) or 0),
+            has_baseline=bool(wf.get("has_baseline", False)),
+            comparisons=comparisons,
+        ))
+    return SuiteReport(
+        suite_name=data.get("suite_name", ""),
+        timestamp=data.get("timestamp", ""),
+        duration=float(data.get("duration", 0) or 0),
+        total=int(data.get("total", 0) or 0),
+        passed=int(data.get("passed", 0) or 0),
+        failed=int(data.get("failed", 0) or 0),
+        workflows=workflows,
+        target_info=data.get("target_info") or {},
+        timed_out=bool(data.get("timed_out", False)),
+        aborted_reason=data.get("aborted_reason"),
+    )
 
 
 def _comfy_url_for_target(target_body: dict[str, Any]) -> str | None:
@@ -3447,13 +3611,20 @@ def create_app() -> Any:
                     gpu_count=gpu_count,
                     env=env,
                 )
-                set_pod_record("runpod", name, {
+                rec_payload: dict[str, Any] = {
                     "id": pod.id,
                     "gpu_type": pod.gpu_type,
                     "datacenter": pod.datacenter,
                     "image": pod.image,
                     "purpose": purpose,
-                })
+                }
+                # Stamp creation/activity time on purposes that are
+                # subject to time-based reaping (test TTL, ci-runner /
+                # pr idle timeout). Persistent pods don't need this.
+                if purpose in ("test", "ci-runner", "pr"):
+                    rec_payload["created_at"] = int(time.time())
+                    rec_payload["last_active_at"] = int(time.time())
+                set_pod_record("runpod", name, rec_payload)
                 out(f"Pod created (id: {pod.id}, {pod.gpu_type}, ${pod.cost_per_hr}/hr)\n")
 
                 if wait_ready:
@@ -3688,11 +3859,14 @@ def create_app() -> Any:
         #   * "test"        → e2e test pods have curated install state we
         #                     shouldn't trample; refuse unless the caller
         #                     opts in with ``force_purpose: true``.
+        #   * "ci-runner"   → long-lived test runner with cached models +
+        #                     pinned ComfyUI commit; refuse like "test".
         force_purpose = bool(body.get("force_purpose", False))
         pod_purpose = rec.get("purpose", "persistent")
-        if pod_purpose == "test" and not force_purpose:
+        if pod_purpose in ("test", "ci-runner") and not force_purpose:
             return _err(
-                f"Pod '{name}' has purpose='test' (e2e test pod). "
+                f"Pod '{name}' has purpose='{pod_purpose}' "
+                f"({'e2e test pod' if pod_purpose == 'test' else 'CI test runner'}). "
                 f"Reviews would clobber its curated install state. "
                 f"Pass force_purpose=true to override.",
                 409,
@@ -3736,9 +3910,9 @@ def create_app() -> Any:
                         f"(general-dev). Review will deploy over its "
                         f"current install state.\n"
                     )
-                elif pod_purpose == "test" and force_purpose:
+                elif pod_purpose in ("test", "ci-runner") and force_purpose:
                     out(
-                        f"⚠ Pod '{name}' is purpose='test' but "
+                        f"⚠ Pod '{name}' is purpose='{pod_purpose}' but "
                         f"force_purpose=true — proceeding.\n"
                     )
 
@@ -4205,6 +4379,232 @@ def create_app() -> Any:
         return jsonify({
             "ok": True, "job_id": job_id, "async": True,
             "name": name, "pr": pr,
+        })
+
+    # ------------------------------------------------------------------
+    # POST /pods/create-ci-runner — provision a long-lived CI test pod
+    #
+    # Composed action: create pod (purpose='ci-runner') → wait → deploy
+    # ``main`` (--latest) → preflight-download every model declared by
+    # the named suites → stop the pod. Container disk persists models
+    # across suspend/resume so subsequent CI invocations skip the
+    # downloads. Idempotent: if the pod already exists with cached
+    # models, the suites' preflight is a no-op and the pod is left
+    # stopped.
+    # ------------------------------------------------------------------
+    @app.route("/pods/create-ci-runner", methods=["POST"])
+    def route_pods_create_ci_runner() -> Any:
+        body = request.get_json(silent=True) or {}
+        name = body.get("name", "")
+        name_err = _validate_pod_name(name)
+        if name_err:
+            return _err(name_err)
+
+        suites = body.get("suites", [])
+        if not isinstance(suites, list) or not suites:
+            return _err("'suites' is required (non-empty list of suite names)")
+        for s in suites:
+            if not isinstance(s, str) or not s:
+                return _err("each entry in 'suites' must be a non-empty string")
+
+        # Resolve every suite up-front so we fail fast on missing ones.
+        resolved_suites: list[tuple[str, Path]] = []
+        for s in suites:
+            sp, serr = _resolve_suite(s)
+            if serr:
+                return _err(f"suite '{s}': {serr}")
+            resolved_suites.append((s, sp))
+
+        gpu_type = body.get("gpu_type")
+        image = body.get("image")
+        datacenter = body.get("datacenter")
+        cloud_type = body.get("cloud_type")
+        container_disk_gb = body.get("container_disk_gb")
+        gpu_count = body.get("gpu_count", 1)
+        env = body.get("env")
+        install_name = body.get("install", "main")
+        install_err = _validate_pod_name(install_name)
+        if install_err:
+            return _err(f"invalid install name: {install_err}")
+        raw_timeout = body.get("idle_timeout_s")
+        if raw_timeout is None:
+            idle_timeout_s = DEFAULT_IDLE_TIMEOUT_S
+        else:
+            try:
+                idle_timeout_s = int(raw_timeout)
+            except (TypeError, ValueError):
+                return _err("'idle_timeout_s' must be an integer")
+            if idle_timeout_s <= 0:
+                return _err("'idle_timeout_s' must be > 0")
+
+        # Whether to leave the pod stopped at the end (default True --
+        # this is the whole point of pre-warmed CI runners). Tests can
+        # disable it.
+        leave_stopped = bool(body.get("leave_stopped", True))
+
+        job_id = _jobs.create(label=f"create ci-runner {name}")
+
+        def _run() -> None:
+            from comfy_runner.hosted.config import (
+                get_pod_record, set_pod_record, update_pod_record,
+            )
+            from comfy_runner.hosted.remote import RemoteRunner
+            from comfy_runner.testing.preflight import ensure_suite_models
+            from comfy_runner.testing.suite import load_suite
+
+            out, lines = _make_collector(job_id)
+            lock = _get_pod_lock(name)
+            if not lock.acquire(timeout=60):
+                _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
+                return
+            try:
+                provider = _get_runpod_provider()
+                rec = get_pod_record("runpod", name)
+
+                pod = None
+                created_new = False
+                if rec:
+                    try:
+                        pod = provider.get_pod(rec["id"])
+                    except Exception:
+                        pod = None
+                    if not pod or pod.status == "TERMINATED":
+                        out(
+                            f"Pod '{name}' record exists but pod is gone; "
+                            f"recreating...\n"
+                        )
+                        rec = None
+
+                if not rec:
+                    out(f"Creating ci-runner pod '{name}'...\n")
+                    pod = provider.create_pod(
+                        name=name,
+                        gpu_type=gpu_type,
+                        image=image,
+                        container_disk_gb=container_disk_gb,
+                        datacenter=datacenter,
+                        cloud_type=cloud_type,
+                        gpu_count=gpu_count,
+                        env=env,
+                    )
+                    created_new = True
+                    set_pod_record("runpod", name, {
+                        "id": pod.id,
+                        "gpu_type": pod.gpu_type,
+                        "datacenter": pod.datacenter,
+                        "image": pod.image,
+                        "purpose": "ci-runner",
+                        "suites": list(suites),
+                        "container_disk_gb": container_disk_gb,
+                        "idle_timeout_s": idle_timeout_s,
+                        "created_at": int(time.time()),
+                        "last_active_at": int(time.time()),
+                    })
+                    out(
+                        f"Pod created (id: {pod.id}, {pod.gpu_type}, "
+                        f"${pod.cost_per_hr}/hr)\n"
+                    )
+                else:
+                    # Existing ci-runner -- refresh metadata and wake.
+                    def _refresh(r: dict[str, Any] | None) -> dict[str, Any] | None:
+                        if r is None:
+                            return None
+                        r.setdefault("purpose", "ci-runner")
+                        # Merge the suite list rather than replace, so
+                        # repeat invocations with overlapping suites
+                        # accumulate the union.
+                        existing = list(r.get("suites") or [])
+                        for s in suites:
+                            if s not in existing:
+                                existing.append(s)
+                        r["suites"] = existing
+                        if container_disk_gb is not None:
+                            r["container_disk_gb"] = container_disk_gb
+                        r["idle_timeout_s"] = idle_timeout_s
+                        r["last_active_at"] = int(time.time())
+                        r.pop("status_hint", None)
+                        return r
+                    update_pod_record("runpod", name, _refresh)
+                    if pod and pod.status != "RUNNING":
+                        out(f"Pod '{name}' is {pod.status}, starting...\n")
+                        provider.start_pod(rec["id"])
+                    else:
+                        out(f"Pod '{name}' is already RUNNING.\n")
+
+                # Wait for comfy-runner server.
+                server_url = _wait_for_pod_server(name, send_output=out)
+
+                runner = RemoteRunner(server_url)
+
+                # Deploy main at --latest.
+                out(f"Deploying '{install_name}' at --latest...\n")
+                deploy_data = runner._request(
+                    "POST", f"/{install_name}/deploy",
+                    json={"latest": True, "start": True},
+                )
+                remote_job_id = deploy_data.get("job_id")
+                if remote_job_id:
+                    runner.poll_job(
+                        remote_job_id, timeout=1800, on_output=out,
+                    )
+                _touch_pod_activity(name)
+
+                # Resolve ComfyUI URL for /object_info refresh.
+                comfy_url = server_url.rsplit(":", 1)[0] + ":8188"
+
+                # Preflight every suite's models.
+                preflight_summary: list[dict[str, Any]] = []
+                for sname, spath in resolved_suites:
+                    out(f"Preflight: suite '{sname}'\n")
+                    suite = load_suite(str(spath))
+                    summary = ensure_suite_models(
+                        runner, install_name, suite,
+                        send_output=out, comfy_url=comfy_url,
+                    )
+                    preflight_summary.append({
+                        "suite": sname,
+                        **summary,
+                    })
+
+                # Stop the pod (optional).
+                stop_action: dict[str, Any] = {"stopped": False}
+                if leave_stopped:
+                    out(f"Stopping pod '{name}' (cached, ready for CI)...\n")
+                    try:
+                        provider.stop_pod(rec["id"] if rec else pod.id)
+                        stop_action = {"stopped": True}
+
+                        def _mark_stopped(
+                            r: dict[str, Any] | None,
+                        ) -> dict[str, Any] | None:
+                            if r is None:
+                                return None
+                            r["status_hint"] = "stopped_post_ci_warmup"
+                            r["stopped_at"] = int(time.time())
+                            return r
+
+                        update_pod_record("runpod", name, _mark_stopped)
+                    except Exception as e:
+                        out(f"Warning: failed to stop pod: {e}\n")
+                        stop_action = {"stopped": False, "error": str(e)}
+
+                _jobs.finish(job_id, {
+                    "name": name,
+                    "created": created_new,
+                    "server_url": server_url,
+                    "suites": list(suites),
+                    "idle_timeout_s": idle_timeout_s,
+                    "preflight": preflight_summary,
+                    "stopped": stop_action.get("stopped", False),
+                }, lines)
+            except Exception as e:
+                _jobs.fail(job_id, str(e), lines)
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({
+            "ok": True, "job_id": job_id, "async": True, "name": name,
         })
 
     # ------------------------------------------------------------------
@@ -4790,6 +5190,221 @@ def create_app() -> Any:
         return jsonify({"ok": True, "job_id": job_id, "async": True, "targets": target_names})
 
     # ------------------------------------------------------------------
+    # POST /tests/fleet-ci — run multiple suites across pre-warmed CI
+    # runner pods. Each pod is started, runs all its assigned suites
+    # sequentially via the remote target path (with preflight), then
+    # is auto-stopped (default) to preserve cached models. Pods run in
+    # parallel. The aggregate result is recorded as a single fleet
+    # test-run so a single browsable HTML report covers everything.
+    # ------------------------------------------------------------------
+    @app.route("/tests/fleet-ci", methods=["POST"])
+    def route_tests_fleet_ci() -> Any:
+        from comfy_runner.hosted.config import get_pod_record
+
+        body = request.get_json(silent=True) or {}
+        assignments = body.get("assignments", [])
+        if not isinstance(assignments, list) or not assignments:
+            return _err(
+                "'assignments' is required (list of "
+                "{pod_name, suites} objects)"
+            )
+
+        # Validate every assignment up-front and resolve each suite
+        # path. We refuse to start a fleet-ci run if any pod or suite
+        # is bad, since the cost of a partial provision is high.
+        validated: list[dict[str, Any]] = []
+        for idx, a in enumerate(assignments):
+            if not isinstance(a, dict):
+                return _err(
+                    f"assignments[{idx}] must be an object"
+                )
+            pod_name = a.get("pod_name", "")
+            name_err = _validate_pod_name(pod_name)
+            if name_err:
+                return _err(f"assignments[{idx}].pod_name: {name_err}")
+            rec = get_pod_record("runpod", pod_name)
+            if not rec:
+                return _err(
+                    f"assignments[{idx}]: pod '{pod_name}' not "
+                    f"found in registry",
+                )
+            suites_in = a.get("suites", [])
+            if not isinstance(suites_in, list) or not suites_in:
+                return _err(
+                    f"assignments[{idx}].suites: must be a non-empty list"
+                )
+            resolved: list[tuple[str, Path]] = []
+            for s in suites_in:
+                sp, serr = _resolve_suite(s)
+                if serr:
+                    return _err(
+                        f"assignments[{idx}] suite '{s}': {serr}",
+                    )
+                resolved.append((s, sp))
+            validated.append({
+                "pod_name": pod_name,
+                "suites": resolved,
+            })
+
+        timeout = body.get("timeout", 600)
+        body_max_runtime = body.get("max_runtime_s")
+        if body_max_runtime is not None:
+            if not isinstance(body_max_runtime, int) or body_max_runtime <= 0:
+                return _err("'max_runtime_s' must be a positive integer")
+        body_on_overrun = body.get("on_overrun")
+        if (
+            body_on_overrun is not None
+            and body_on_overrun not in _VALID_ON_OVERRUN
+        ):
+            return _err(
+                "'on_overrun' must be one of: "
+                f"{', '.join(_VALID_ON_OVERRUN)}"
+            )
+        auto_stop = bool(body.get("auto_stop", True))
+
+        job_id = _jobs.create(
+            label=f"fleet-ci ({len(validated)} pods)"
+        )
+        # Treat fleet-ci as a fleet kind so the report endpoint
+        # correctly aggregates per-target outputs into a single HTML
+        # page.
+        _register_test_run(job_id, {
+            "kind": "fleet",
+            "suite": ",".join(
+                sorted({s for a in validated for s, _ in a["suites"]}),
+            ),
+            "targets": [
+                {"kind": "remote", "pod_name": a["pod_name"]}
+                for a in validated
+            ],
+        })
+
+        def _run() -> None:
+            from comfy_runner.testing.fleet import (
+                FleetResult, RemoteTarget, TargetResult,
+                _make_safe_dirname, _write_fleet_summary,
+            )
+            from comfy_runner.testing.suite import load_suite
+
+            out, lines = _make_collector(job_id)
+
+            run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            out_dir = _get_suites_dir().parent / "fleet-ci-runs" / f"fleet-{run_id}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            t0 = time.monotonic()
+
+            target_results: list[TargetResult] = []
+            results_lock = threading.Lock()
+
+            def _run_pod(idx: int, assignment: dict[str, Any]) -> None:
+                pod_name = assignment["pod_name"]
+                suites = assignment["suites"]  # list of (name, path)
+                pod_dir = out_dir / f"{idx}-{_make_safe_dirname(pod_name)}"
+                pod_dir.mkdir(parents=True, exist_ok=True)
+
+                def pod_out(text: str) -> None:
+                    with results_lock:
+                        out(f"[{pod_name}] {text}")
+
+                try:
+                    pod_out("Waking pod...\n")
+                    server_url = _ensure_pod_running(
+                        pod_name, send_output=pod_out, wait_ready=True,
+                    )
+
+                    for sname, spath in suites:
+                        suite_dir = pod_dir / sname
+                        suite_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            target = RemoteTarget(
+                                server_url=server_url,
+                                install_name="main",
+                                label=f"{pod_name}/{sname}",
+                            )
+                            suite = load_suite(str(spath))
+                            tres = target.run(
+                                suite=suite,
+                                output_dir=suite_dir,
+                                timeout=timeout,
+                                send_output=pod_out,
+                            )
+                            with results_lock:
+                                target_results.append(tres)
+                        except Exception as exc:
+                            pod_out(f"Suite '{sname}' errored: {exc}\n")
+                            with results_lock:
+                                target_results.append(TargetResult(
+                                    target_name=f"{pod_name}/{sname}",
+                                    target_kind="remote",
+                                    output_dir=suite_dir,
+                                    error=str(exc),
+                                ))
+
+                    # Auto-stop the pod (default).
+                    if auto_stop:
+                        _dispatch_auto_stop(
+                            {"kind": "remote", "pod_name": pod_name},
+                            send_output=pod_out,
+                        )
+                except Exception as exc:
+                    pod_out(f"Pod errored: {exc}\n")
+                    with results_lock:
+                        target_results.append(TargetResult(
+                            target_name=pod_name,
+                            target_kind="remote",
+                            output_dir=pod_dir,
+                            error=str(exc),
+                        ))
+
+            try:
+                # Fan out one thread per pod. Pods are independent.
+                threads = [
+                    threading.Thread(
+                        target=_run_pod, args=(i, a), daemon=True,
+                        name=f"fleet-ci-{a['pod_name']}",
+                    )
+                    for i, a in enumerate(validated)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+                fleet_result = FleetResult(
+                    suite_name=f"fleet-ci ({len(validated)} pods)",
+                    results=target_results,
+                    total_duration=time.monotonic() - t0,
+                )
+                _write_fleet_summary(fleet_result, out_dir, formats="json")
+
+                summary = fleet_result.to_dict()
+                summary["assignments"] = [
+                    {"pod_name": a["pod_name"],
+                     "suites": [s for s, _ in a["suites"]]}
+                    for a in validated
+                ]
+                _finish_test_run(job_id, {
+                    "output_dir": str(out_dir),
+                    "summary": summary,
+                    "test_id": job_id,
+                }, status="done")
+                _jobs.finish(job_id, {
+                    "run_id": run_id,
+                    "test_id": job_id,
+                    "output_dir": str(out_dir),
+                    **summary,
+                }, lines)
+            except Exception as e:
+                _finish_test_run(job_id, {"error": str(e)}, status="error")
+                _jobs.fail(job_id, str(e), lines)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({
+            "ok": True, "job_id": job_id, "async": True,
+            "pods": [a["pod_name"] for a in validated],
+        })
+
+    # ------------------------------------------------------------------
     # GET /tests — list recent/active test runs
     # ------------------------------------------------------------------
     @app.route("/tests", methods=["GET"])
@@ -4859,8 +5474,72 @@ def create_app() -> Any:
 
         # For html/markdown, look for the file
         is_fleet = run.get("kind") == "fleet"
+
+        if fmt == "html":
+            # Render on-the-fly with an artifact URL prefix so the
+            # ``<img>`` srcs resolve through GET /tests/{id}/artifact/.
+            from flask import Response
+
+            from comfy_runner.testing.report import (
+                SuiteReport, WorkflowReport, render_html,
+            )
+            from comfy_runner.testing.compare.registry import CompareResult
+            from comfy_runner.testing.runner import ComparisonEntry
+
+            if is_fleet:
+                # Fleet HTML: aggregate per-target reports, each
+                # rooted at its own subdir under the run.
+                fleet_file = out_path / "fleet-report.json"
+                if not fleet_file.is_file():
+                    return _err("fleet-report.json not found")
+                import json as _json
+
+                fleet_data = _json.loads(fleet_file.read_text(encoding="utf-8"))
+                parts: list[str] = []
+                for tgt in fleet_data.get("results", []):
+                    rdata = tgt.get("report")
+                    out_sub = tgt.get("output_dir")
+                    if not rdata or not out_sub:
+                        continue
+                    rel_subdir = _safe_rel(out_path, Path(out_sub))
+                    if rel_subdir is None:
+                        continue
+                    artifact_prefix = (
+                        f"/tests/{test_id}/artifact/{rel_subdir}"
+                    )
+                    sub_report = _suite_report_from_dict(rdata)
+                    parts.append(
+                        f"<h2 style='margin-top:2rem'>"
+                        f"Target: {sub_report.target_info.get('name', '?')} "
+                        f"({tgt.get('target_kind', '?')})</h2>"
+                    )
+                    parts.append(render_html(
+                        sub_report,
+                        artifact_url_prefix=artifact_prefix,
+                    ))
+                html_doc = (
+                    "<!DOCTYPE html><html><head>"
+                    "<meta charset='utf-8'>"
+                    f"<title>Fleet test report {test_id}</title>"
+                    "</head><body>"
+                    f"<h1>Fleet test {test_id}</h1>"
+                    + "\n".join(parts)
+                    + "</body></html>"
+                )
+                return Response(html_doc, mimetype="text/html")
+
+            single_file = out_path / "report.json"
+            if not single_file.is_file():
+                return _err("report.json not found")
+            import json as _json
+
+            data = _json.loads(single_file.read_text(encoding="utf-8"))
+            report_obj = _suite_report_from_dict(data)
+            artifact_prefix = f"/tests/{test_id}/artifact"
+            html = render_html(report_obj, artifact_url_prefix=artifact_prefix)
+            return Response(html, mimetype="text/html")
+
         ext_map = {
-            "html": "fleet-report.html" if is_fleet else "report.html",
             "markdown": "fleet-report.md" if is_fleet else "report.md",
         }
         filename = ext_map.get(fmt)
@@ -4873,6 +5552,55 @@ def create_app() -> Any:
 
         from flask import send_file
         return send_file(str(report_path))
+
+    # ------------------------------------------------------------------
+    # GET /tests/<test_id>/artifact/<path:rel_path> — serve an artifact
+    # file (output image, baseline, *_ssim_diff.png, etc.) referenced
+    # by the HTML report. Path is resolved relative to the run's
+    # output_dir and confined within it (path-traversal-safe).
+    # ------------------------------------------------------------------
+    @app.route(
+        "/tests/<test_id>/artifact/<path:rel_path>",
+        methods=["GET"],
+    )
+    def route_tests_artifact(test_id: str, rel_path: str) -> Any:
+        from flask import send_file
+
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
+
+        output_dir = run.get("output_dir")
+        if not output_dir:
+            return _err("Test run has no output directory yet (still running?)")
+
+        base = Path(output_dir).resolve()
+        # Reject any segment that escapes the base directory. We do
+        # this both by rejecting absolute paths and ``..`` components
+        # before joining, and by re-checking the resolved path is
+        # contained in *base* afterwards.
+        from safe_file import is_safe_path_component
+
+        if rel_path.startswith("/") or rel_path.startswith("\\"):
+            return _err("Invalid artifact path", 400)
+        parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
+        if not parts:
+            return _err("Invalid artifact path", 400)
+        for p in parts:
+            if not is_safe_path_component(p):
+                return _err(f"Invalid artifact path component: {p!r}", 400)
+
+        target = (base.joinpath(*parts)).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            return _err("Path escapes test-run output dir", 400)
+
+        if not target.is_file():
+            return _err(f"Artifact not found: {rel_path}", 404)
+
+        return send_file(str(target))
 
     # ==================================================================
     # Tailnet — auto-discovery of comfy-runners on the configured tailnet
