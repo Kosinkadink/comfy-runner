@@ -3281,6 +3281,7 @@ def create_app() -> Any:
         image = body.get("image")
         volume_id = body.get("volume_id")
         volume_size_gb = body.get("volume_size_gb")
+        container_disk_gb = body.get("container_disk_gb")
         datacenter = body.get("datacenter")
         cloud_type = body.get("cloud_type")
         gpu_count = body.get("gpu_count", 1)
@@ -3343,6 +3344,7 @@ def create_app() -> Any:
                     image=image,
                     volume_id=volume_id,
                     volume_size_gb=volume_size_gb,
+                    container_disk_gb=container_disk_gb,
                     datacenter=datacenter,
                     cloud_type=cloud_type,
                     gpu_count=gpu_count,
@@ -3957,6 +3959,7 @@ def create_app() -> Any:
         image = body.get("image")
         volume_id = body.get("volume_id")
         volume_size_gb = body.get("volume_size_gb")
+        container_disk_gb = body.get("container_disk_gb")
         datacenter = body.get("datacenter")
         cloud_type = body.get("cloud_type")
         gpu_count = body.get("gpu_count", 1)
@@ -4015,6 +4018,7 @@ def create_app() -> Any:
                         image=image,
                         volume_id=volume_id,
                         volume_size_gb=volume_size_gb,
+                        container_disk_gb=container_disk_gb,
                         datacenter=datacenter,
                         cloud_type=cloud_type,
                         gpu_count=gpu_count,

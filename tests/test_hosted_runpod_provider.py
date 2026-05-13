@@ -168,6 +168,38 @@ class TestRunPodProviderCreatePod:
         assert call_kwargs["volumeInGb"] == 100
         assert "networkVolumeId" not in call_kwargs
 
+    def test_container_disk_default(self):
+        prov = self._make_provider()
+        prov.api = MagicMock()
+        prov.api.create_pod.return_value = {"id": "p5", "desiredStatus": "RUNNING"}
+
+        prov.create_pod("test5")
+
+        call_kwargs = prov.api.create_pod.call_args[1]
+        assert call_kwargs["containerDiskInGb"] == 50
+
+    def test_container_disk_override(self):
+        prov = self._make_provider()
+        prov.api = MagicMock()
+        prov.api.create_pod.return_value = {"id": "p6", "desiredStatus": "RUNNING"}
+
+        prov.create_pod("test6", container_disk_gb=200)
+
+        call_kwargs = prov.api.create_pod.call_args[1]
+        assert call_kwargs["containerDiskInGb"] == 200
+
+    def test_container_disk_independent_of_volume_size(self):
+        """container_disk_gb (ephemeral) and volume_size_gb (persistent) are separate."""
+        prov = self._make_provider()
+        prov.api = MagicMock()
+        prov.api.create_pod.return_value = {"id": "p7", "desiredStatus": "RUNNING"}
+
+        prov.create_pod("test7", container_disk_gb=150, volume_size_gb=100)
+
+        call_kwargs = prov.api.create_pod.call_args[1]
+        assert call_kwargs["containerDiskInGb"] == 150
+        assert call_kwargs["volumeInGb"] == 100
+
 
 # ---------------------------------------------------------------------------
 # RunPodProvider — get_pod_url

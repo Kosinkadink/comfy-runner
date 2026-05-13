@@ -3157,6 +3157,7 @@ def _hosted_pod(args: argparse.Namespace) -> None:
                 gpu_type=args.gpu,
                 image=args.image,
                 volume_id=volume_id,
+                container_disk_gb=getattr(args, "container_disk", None),
                 datacenter=args.region,
                 cloud_type=args.cloud_type,
                 allowed_cuda_versions=cuda_versions,
@@ -3401,6 +3402,7 @@ def _hosted_init(args: argparse.Namespace) -> None:
             gpu_type=args.gpu,
             image=args.image,
             volume_id=volume_id,
+            container_disk_gb=getattr(args, "container_disk", None),
             datacenter=args.region,
             cloud_type=args.cloud_type,
             allowed_cuda_versions=cuda_versions,
@@ -3879,6 +3881,8 @@ def _station_pods(args: argparse.Namespace) -> None:
                 body["datacenter"] = args.datacenter
             elif defaults.get("datacenter"):
                 body["datacenter"] = defaults["datacenter"]
+            if getattr(args, "container_disk", None) is not None:
+                body["container_disk_gb"] = args.container_disk
             if getattr(args, "no_wait", False):
                 body["wait_ready"] = False
 
@@ -5117,6 +5121,8 @@ def main(argv: list[str] | None = None) -> None:
                              help="Cloud type (default: from config)")
     p_hp_create.add_argument("--gpu-count", type=int, default=1,
                              help="Number of GPUs (default: 1)")
+    p_hp_create.add_argument("--container-disk", type=int,
+                             help="Container disk size in GB (default: 50). Sizes the ephemeral disk where installations and models live.")
     p_hp_create.add_argument("--cuda-versions",
                              help="Comma-separated CUDA versions to allow (default: 12.4,12.6,12.8,13.0)")
 
@@ -5147,6 +5153,8 @@ def main(argv: list[str] | None = None) -> None:
     p_hosted_init.add_argument("--image", "-i", help="Docker image (default: from config)")
     p_hosted_init.add_argument("--volume", "-v", help="Volume name (reuse existing or create new)")
     p_hosted_init.add_argument("--volume-size", type=int, help="Volume size in GB if creating new (default: 50)")
+    p_hosted_init.add_argument("--container-disk", type=int,
+                               help="Container disk size in GB (default: 50). Sizes the ephemeral disk where installations and models live.")
     p_hosted_init.add_argument("--region", "-r", help="Datacenter ID (default: from config)")
     p_hosted_init.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY", "ALL"],
                                help="Cloud type (default: from config)")
@@ -5240,6 +5248,8 @@ def main(argv: list[str] | None = None) -> None:
     p_st_pod_create.add_argument("--gpu", "-g", help="GPU type (default: from station config)")
     p_st_pod_create.add_argument("--image", "-i", help="Docker image")
     p_st_pod_create.add_argument("--datacenter", help="Datacenter ID")
+    p_st_pod_create.add_argument("--container-disk", type=int,
+                                 help="Container disk size in GB (default: 50). Sizes the ephemeral disk where installations and models live.")
     p_st_pod_create.add_argument("--no-wait", action="store_true", help="Don't wait for server readiness")
 
     p_st_pod_deploy = st_pods_sub.add_parser("deploy", help="Deploy a PR/branch/commit to a pod")
