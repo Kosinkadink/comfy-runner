@@ -4126,6 +4126,8 @@ def _station_pods(args: argparse.Namespace) -> None:
                 body["install"] = args.install
             if getattr(args, "idle_timeout", None) is not None:
                 body["idle_timeout_s"] = args.idle_timeout
+            if getattr(args, "pod_ready_timeout", None) is not None:
+                body["pod_ready_timeout_s"] = args.pod_ready_timeout
             if getattr(args, "no_stop", False):
                 body["leave_stopped"] = False
 
@@ -4457,6 +4459,8 @@ def _station_tests(args: argparse.Namespace) -> None:
                 body["max_runtime_s"] = args.max_runtime
             if getattr(args, "on_overrun", None) is not None:
                 body["on_overrun"] = args.on_overrun
+            if getattr(args, "pod_ready_timeout", None) is not None:
+                body["pod_ready_timeout_s"] = args.pod_ready_timeout
 
             data = runner._request("POST", "/tests/fleet-ci", json=body)
             job_id = data.get("job_id")
@@ -5535,6 +5539,15 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     p_st_pod_create_ci.add_argument(
+        "--pod-ready-timeout", type=int, dest="pod_ready_timeout",
+        help=(
+            "Seconds to wait for the pod's comfy-runner server to "
+            "become reachable after start. Default 600. Bump if you "
+            "see 'did not become ready within Ns' errors on a slow "
+            "secure-cloud GPU."
+        ),
+    )
+    p_st_pod_create_ci.add_argument(
         "--no-stop", action="store_true",
         help=(
             "Do NOT stop the pod after preflight. Useful when chaining "
@@ -5686,6 +5699,15 @@ def main(argv: list[str] | None = None) -> None:
             "Leave pods running after their suites finish. Default is "
             "to stop each pod, preserving cached models on its container "
             "disk for the next CI invocation."
+        ),
+    )
+    p_st_test_fleet_ci.add_argument(
+        "--pod-ready-timeout", type=int, dest="pod_ready_timeout",
+        help=(
+            "Seconds to wait for each pod's comfy-runner server to "
+            "become reachable after wake. Default 600. Bump if pods "
+            "fail with 'did not become ready within Ns' on a slow "
+            "secure-cloud GPU."
         ),
     )
 

@@ -1732,6 +1732,17 @@ _ROUTES: list[dict[str, Any]] = [
                                 "type": "integer",
                                 "description": "Seconds of inactivity before the idle reaper stops (not terminates) this pod. Default 600.",
                             },
+                            "pod_ready_timeout_s": {
+                                "type": "integer",
+                                "description": (
+                                    "Seconds to wait for the pod's comfy-runner "
+                                    "server to become reachable after start. "
+                                    "Default 600. Resumed RunPod pods on secure-cloud "
+                                    "GPUs routinely take 5-8 minutes to register "
+                                    "their Tailscale hostname, so bump this if you "
+                                    "see 'did not become ready within Ns' errors."
+                                ),
+                            },
                             "leave_stopped": {
                                 "type": "boolean",
                                 "default": True,
@@ -2117,6 +2128,17 @@ _ROUTES: list[dict[str, Any]] = [
                                 "type": "boolean",
                                 "default": True,
                                 "description": "Stop each pod after its suites finish (preserves cached models on container disk).",
+                            },
+                            "pod_ready_timeout_s": {
+                                "type": "integer",
+                                "description": (
+                                    "Seconds to wait for each pod's comfy-runner "
+                                    "server to become reachable after wake. Default "
+                                    "600. Resumed RunPod pods on secure-cloud GPUs "
+                                    "routinely take 5-8 minutes to register their "
+                                    "Tailscale hostname, so bump this if you see "
+                                    "'did not become ready within Ns' errors."
+                                ),
                             },
                         },
                     }

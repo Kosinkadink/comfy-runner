@@ -418,6 +418,74 @@ DEFAULT_IDLE_TIMEOUT_S = 600
 DEFAULT_TEST_POD_TTL_S = 7200
 _REAPER_INTERVAL_S = 60
 
+# Default wall-clock budget for ``_wait_for_pod_server`` polling.
+# Resumed RunPod pods on secure-cloud L40S routinely take 5-8 minutes
+# to register their Tailscale hostname and start serving HTTP, so the
+# old 300s default produced spurious failures during fleet-ci wakes.
+# Configurable per-call via the ``pod_ready_timeout_s`` body parameter
+# on ``/pods/create-ci-runner`` and ``/tests/fleet-ci``.
+DEFAULT_POD_READY_TIMEOUT_S = 600
+
+# RunPod ``POST /pods/{id}/start`` failure messages that we treat as
+# transient: the host machine that previously ran the suspended pod
+# may have lost free GPU capacity, in which case waiting briefly and
+# retrying often lets RunPod re-place the resume on a new host. We
+# only retry on these specific substrings -- any other start failure
+# (auth, bad pod id, terminated pod) propagates immediately so the
+# operator can intervene.
+_TRANSIENT_START_ERROR_SUBSTRINGS = (
+    "not enough free GPUs",
+    "Failed to resume pod",
+)
+DEFAULT_START_RETRIES = 2
+DEFAULT_START_RETRY_DELAY_S = 30
+
+
+def _is_transient_start_error(exc: BaseException) -> bool:
+    """Return True if *exc* matches a known transient RunPod resume error."""
+    msg = str(exc)
+    return any(sub in msg for sub in _TRANSIENT_START_ERROR_SUBSTRINGS)
+
+
+def _start_pod_with_retry(
+    provider: Any,
+    pod_id: str,
+    send_output: Callable[[str], None] | None = None,
+    max_retries: int = DEFAULT_START_RETRIES,
+    retry_delay_s: int = DEFAULT_START_RETRY_DELAY_S,
+) -> Any:
+    """Call ``provider.start_pod(pod_id)`` with retries on transient errors.
+
+    RunPod's ``POST /pods/{id}/start`` can fail with "There are not
+    enough free GPUs on the host machine to start this pod" or "Failed
+    to resume pod" when the host that previously ran the suspended pod
+    no longer has free capacity. These are transient -- a brief wait
+    usually lets RunPod find capacity elsewhere -- so we retry up to
+    ``max_retries`` times with a fixed ``retry_delay_s`` delay between
+    attempts. Any non-matching error propagates immediately. Returns
+    whatever ``provider.start_pod`` returns on success.
+    """
+    out = send_output or (lambda _: None)
+    last_exc: BaseException | None = None
+    attempts = max(1, max_retries + 1)
+    for attempt in range(attempts):
+        try:
+            return provider.start_pod(pod_id)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_start_error(exc):
+                raise
+            if attempt + 1 >= attempts:
+                break
+            out(
+                f"Pod start failed transiently (attempt "
+                f"{attempt + 1}/{attempts}): {exc}\n"
+                f"Retrying in {retry_delay_s}s...\n"
+            )
+            time.sleep(retry_delay_s)
+    assert last_exc is not None
+    raise last_exc
+
 _reaper_lock = threading.Lock()
 _reaper_started = False
 
@@ -481,11 +549,20 @@ def _ensure_pod_running(
     name: str,
     send_output: Callable[[str], None] | None = None,
     wait_ready: bool = True,
+    pod_ready_timeout_s: int | None = None,
+    start_retries: int = DEFAULT_START_RETRIES,
+    start_retry_delay_s: int = DEFAULT_START_RETRY_DELAY_S,
 ) -> str:
     """Start a stopped/exited pod and (optionally) wait for its server.
 
     Updates ``last_active_at`` on the record. Returns the resolved
     server URL. Raises ``RuntimeError`` if the pod cannot be reached.
+
+    ``pod_ready_timeout_s`` overrides the default
+    ``DEFAULT_POD_READY_TIMEOUT_S`` budget for the wait-ready poll
+    loop. ``start_retries`` / ``start_retry_delay_s`` configure
+    retries on transient RunPod resume errors (capacity-exhausted
+    host re-placement); see ``_start_pod_with_retry``.
     """
     from comfy_runner.hosted.config import get_pod_record
     out = send_output or (lambda _: None)
@@ -501,10 +578,17 @@ def _ensure_pod_running(
         # EXITED pods can be started by RunPod's start API; fall through.
     if pod and pod.status != "RUNNING":
         out(f"Pod '{name}' is {pod.status}, starting...\n")
-        provider.start_pod(pod_id)
+        _start_pod_with_retry(
+            provider, pod_id, send_output=out,
+            max_retries=start_retries,
+            retry_delay_s=start_retry_delay_s,
+        )
     _touch_pod_activity(name)
     if wait_ready:
-        return _wait_for_pod_server(name, send_output=send_output)
+        timeout = pod_ready_timeout_s or DEFAULT_POD_READY_TIMEOUT_S
+        return _wait_for_pod_server(
+            name, timeout=timeout, send_output=send_output,
+        )
     return _get_pod_server_url(name, raise_on_error=False) or ""
 
 
@@ -859,7 +943,7 @@ def _wait_for_remote_server(
 
 def _wait_for_pod_server(
     pod_name: str,
-    timeout: int = 300,
+    timeout: int = DEFAULT_POD_READY_TIMEOUT_S,
     poll_interval: int = 10,
     send_output: Callable[[str], None] | None = None,
 ) -> str:
@@ -4437,6 +4521,17 @@ def create_app() -> Any:
             if idle_timeout_s <= 0:
                 return _err("'idle_timeout_s' must be > 0")
 
+        raw_ready = body.get("pod_ready_timeout_s")
+        if raw_ready is None:
+            pod_ready_timeout_s = DEFAULT_POD_READY_TIMEOUT_S
+        else:
+            try:
+                pod_ready_timeout_s = int(raw_ready)
+            except (TypeError, ValueError):
+                return _err("'pod_ready_timeout_s' must be an integer")
+            if pod_ready_timeout_s <= 0:
+                return _err("'pod_ready_timeout_s' must be > 0")
+
         # Whether to leave the pod stopped at the end (default True --
         # this is the whole point of pre-warmed CI runners). Tests can
         # disable it.
@@ -4527,12 +4622,16 @@ def create_app() -> Any:
                     update_pod_record("runpod", name, _refresh)
                     if pod and pod.status != "RUNNING":
                         out(f"Pod '{name}' is {pod.status}, starting...\n")
-                        provider.start_pod(rec["id"])
+                        _start_pod_with_retry(
+                            provider, rec["id"], send_output=out,
+                        )
                     else:
                         out(f"Pod '{name}' is already RUNNING.\n")
 
                 # Wait for comfy-runner server.
-                server_url = _wait_for_pod_server(name, send_output=out)
+                server_url = _wait_for_pod_server(
+                    name, timeout=pod_ready_timeout_s, send_output=out,
+                )
 
                 runner = RemoteRunner(server_url)
 
@@ -5262,6 +5361,17 @@ def create_app() -> Any:
             )
         auto_stop = bool(body.get("auto_stop", True))
 
+        raw_ready = body.get("pod_ready_timeout_s")
+        if raw_ready is None:
+            pod_ready_timeout_s = DEFAULT_POD_READY_TIMEOUT_S
+        else:
+            try:
+                pod_ready_timeout_s = int(raw_ready)
+            except (TypeError, ValueError):
+                return _err("'pod_ready_timeout_s' must be an integer")
+            if pod_ready_timeout_s <= 0:
+                return _err("'pod_ready_timeout_s' must be > 0")
+
         job_id = _jobs.create(
             label=f"fleet-ci ({len(validated)} pods)"
         )
@@ -5310,6 +5420,7 @@ def create_app() -> Any:
                     pod_out("Waking pod...\n")
                     server_url = _ensure_pod_running(
                         pod_name, send_output=pod_out, wait_ready=True,
+                        pod_ready_timeout_s=pod_ready_timeout_s,
                     )
 
                     for sname, spath in suites:

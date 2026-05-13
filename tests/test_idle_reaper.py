@@ -985,3 +985,170 @@ class TestDispatchAutoStop:
         # Record's status_hint not stamped on failure.
         rec = get_pod_record("runpod", "stop-fail")
         assert "status_hint" not in rec
+
+
+# =====================================================================
+# _start_pod_with_retry — transient resume failures
+# =====================================================================
+
+class TestStartPodWithRetry:
+    """Verify the retry helper for ``provider.start_pod``.
+
+    RunPod can return HTTP 500 with "There are not enough free GPUs on
+    the host machine to start this pod" or "Failed to resume pod" when
+    a suspended pod's host has lost free capacity. These are transient
+    -- waiting briefly often lets RunPod re-place the pod -- so the
+    helper retries up to ``max_retries`` times. Other errors (auth,
+    bad pod id) propagate immediately.
+    """
+
+    def test_succeeds_on_first_try(self):
+        provider = MagicMock()
+        provider.start_pod.return_value = "ok"
+        result = srv._start_pod_with_retry(provider, "p1", max_retries=2)
+        assert result == "ok"
+        provider.start_pod.assert_called_once_with("p1")
+
+    def test_retries_on_no_free_gpus(self):
+        provider = MagicMock()
+        provider.start_pod.side_effect = [
+            RuntimeError(
+                "RunPod API error 500 on POST /pods/p1/start: "
+                '{"error":"start pod: There are not enough free GPUs '
+                'on the host machine to start this pod.","status":500}'
+            ),
+            "ok",
+        ]
+        with patch.object(srv.time, "sleep") as ms:
+            result = srv._start_pod_with_retry(
+                provider, "p1", max_retries=2, retry_delay_s=5,
+            )
+        assert result == "ok"
+        assert provider.start_pod.call_count == 2
+        ms.assert_called_once_with(5)
+
+    def test_retries_on_failed_to_resume(self):
+        provider = MagicMock()
+        provider.start_pod.side_effect = [
+            RuntimeError(
+                "RunPod API error 500 on POST /pods/p1/start: "
+                '{"error":"start pod: Failed to resume pod","status":500}'
+            ),
+            "ok",
+        ]
+        with patch.object(srv.time, "sleep"):
+            result = srv._start_pod_with_retry(
+                provider, "p1", max_retries=1, retry_delay_s=1,
+            )
+        assert result == "ok"
+        assert provider.start_pod.call_count == 2
+
+    def test_does_not_retry_on_other_errors(self):
+        """Auth / not-found errors must propagate without retrying."""
+        provider = MagicMock()
+        provider.start_pod.side_effect = RuntimeError(
+            "RunPod API error 401 on POST /pods/p1/start: unauthorized"
+        )
+        with patch.object(srv.time, "sleep") as ms:
+            with pytest.raises(RuntimeError, match="unauthorized"):
+                srv._start_pod_with_retry(
+                    provider, "p1", max_retries=5, retry_delay_s=1,
+                )
+        assert provider.start_pod.call_count == 1
+        ms.assert_not_called()
+
+    def test_gives_up_after_max_retries(self):
+        """Persistent transient error eventually propagates the last exception."""
+        provider = MagicMock()
+        err = RuntimeError(
+            "start pod: There are not enough free GPUs on the host"
+        )
+        provider.start_pod.side_effect = err
+        with patch.object(srv.time, "sleep"):
+            with pytest.raises(RuntimeError, match="not enough free GPUs"):
+                srv._start_pod_with_retry(
+                    provider, "p1", max_retries=2, retry_delay_s=1,
+                )
+        # 1 initial + 2 retries = 3 attempts total
+        assert provider.start_pod.call_count == 3
+
+    def test_zero_retries_means_one_attempt(self):
+        provider = MagicMock()
+        provider.start_pod.return_value = "ok"
+        srv._start_pod_with_retry(provider, "p1", max_retries=0)
+        assert provider.start_pod.call_count == 1
+
+
+# =====================================================================
+# _ensure_pod_running — configurable timeout + retry plumbing
+# =====================================================================
+
+class TestEnsurePodRunningWithRetries:
+    """Verify ``_ensure_pod_running`` plumbs the new params correctly:
+
+    * ``pod_ready_timeout_s`` overrides the default budget passed to
+      ``_wait_for_pod_server``
+    * Transient ``provider.start_pod`` failures are retried via the
+      ``_start_pod_with_retry`` helper
+    """
+
+    def test_default_ready_timeout_uses_module_constant(self, tmp_config_dir):
+        """No ``pod_ready_timeout_s`` arg → ``_wait_for_pod_server`` is
+        called with ``DEFAULT_POD_READY_TIMEOUT_S`` (600s, bumped from
+        the old 300s).
+        """
+        set_pod_record("runpod", "p1", {"id": "p1", "purpose": "ci-runner"})
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(
+            id="p1", name="p1", status="EXITED",
+        )
+        with patch.object(srv, "_get_runpod_provider", return_value=provider), \
+             patch.object(
+                 srv, "_wait_for_pod_server", return_value="http://x:9189",
+             ) as mw:
+            srv._ensure_pod_running("p1", wait_ready=True)
+        mw.assert_called_once()
+        kwargs = mw.call_args.kwargs
+        assert kwargs["timeout"] == srv.DEFAULT_POD_READY_TIMEOUT_S == 600
+
+    def test_custom_ready_timeout_is_forwarded(self, tmp_config_dir):
+        set_pod_record("runpod", "p1", {"id": "p1", "purpose": "ci-runner"})
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(
+            id="p1", name="p1", status="EXITED",
+        )
+        with patch.object(srv, "_get_runpod_provider", return_value=provider), \
+             patch.object(
+                 srv, "_wait_for_pod_server", return_value="http://x:9189",
+             ) as mw:
+            srv._ensure_pod_running(
+                "p1", wait_ready=True, pod_ready_timeout_s=1234,
+            )
+        assert mw.call_args.kwargs["timeout"] == 1234
+
+    def test_start_retried_on_transient_error(self, tmp_config_dir):
+        """A transient ``not enough free GPUs`` on resume is retried,
+        then the wait succeeds and the URL is returned.
+        """
+        set_pod_record("runpod", "p1", {"id": "p1", "purpose": "ci-runner"})
+        provider = MagicMock()
+        provider.get_pod.return_value = _make_pod(
+            id="p1", name="p1", status="EXITED",
+        )
+        provider.start_pod.side_effect = [
+            RuntimeError(
+                "start pod: There are not enough free GPUs on the host"
+            ),
+            None,
+        ]
+        with patch.object(srv, "_get_runpod_provider", return_value=provider), \
+             patch.object(
+                 srv, "_wait_for_pod_server", return_value="http://x:9189",
+             ), \
+             patch.object(srv.time, "sleep"):
+            url = srv._ensure_pod_running(
+                "p1", wait_ready=True, start_retries=1,
+                start_retry_delay_s=1,
+            )
+        assert url == "http://x:9189"
+        assert provider.start_pod.call_count == 2
