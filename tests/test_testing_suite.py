@@ -51,6 +51,68 @@ class TestLoadSuite:
         suite = load_suite(suite_dir)
         assert suite.required_models == ["model.safetensors"]
 
+    def test_models_default_empty(self, tmp_path):
+        suite_dir = _make_suite(tmp_path)
+        suite = load_suite(suite_dir)
+        assert suite.models == []
+
+    def test_loads_models_manifest(self, tmp_path):
+        models = [
+            {
+                "name": "v1-5.safetensors",
+                "directory": "checkpoints",
+                "url": "https://example.com/v1-5.safetensors",
+            },
+            {
+                "name": "vae.safetensors",
+                "directory": "vae",
+                "url": "https://example.com/vae.safetensors",
+                "token": "secret",
+            },
+        ]
+        suite_dir = _make_suite(tmp_path, models=models)
+        suite = load_suite(suite_dir)
+        assert len(suite.models) == 2
+        assert suite.models[0] == models[0]
+        assert suite.models[1]["token"] == "secret"
+
+    def test_models_must_be_list(self, tmp_path):
+        suite_dir = _make_suite(tmp_path, models={"name": "x"})
+        with pytest.raises(ValueError, match="must be a list"):
+            load_suite(suite_dir)
+
+    def test_models_entry_must_be_object(self, tmp_path):
+        suite_dir = _make_suite(tmp_path, models=["x"])
+        with pytest.raises(ValueError, match="must be an object"):
+            load_suite(suite_dir)
+
+    def test_models_missing_required_field(self, tmp_path):
+        suite_dir = _make_suite(
+            tmp_path,
+            models=[{"name": "m.safetensors", "directory": "checkpoints"}],
+        )
+        with pytest.raises(ValueError, match="models\\[0\\].url"):
+            load_suite(suite_dir)
+
+    def test_models_empty_field(self, tmp_path):
+        suite_dir = _make_suite(
+            tmp_path,
+            models=[{"name": "", "directory": "checkpoints", "url": "x"}],
+        )
+        with pytest.raises(ValueError, match="models\\[0\\].name"):
+            load_suite(suite_dir)
+
+    def test_models_token_must_be_string(self, tmp_path):
+        suite_dir = _make_suite(
+            tmp_path,
+            models=[{
+                "name": "m.safetensors", "directory": "checkpoints",
+                "url": "x", "token": 42,
+            }],
+        )
+        with pytest.raises(ValueError, match="models\\[0\\].token"):
+            load_suite(suite_dir)
+
     def test_missing_directory(self, tmp_path):
         with pytest.raises(ValueError, match="not a directory"):
             load_suite(tmp_path / "nonexistent")

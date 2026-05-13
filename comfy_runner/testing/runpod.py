@@ -26,6 +26,7 @@ from comfy_runner.hosted.config import (
 from comfy_runner.hosted.remote import RemoteRunner
 from comfy_runner.hosted.runpod_provider import RunPodProvider
 from comfy_runner.testing.client import ComfyTestClient
+from comfy_runner.testing.preflight import ensure_suite_models
 from comfy_runner.testing.report import build_report, write_report
 from comfy_runner.testing.runner import run_suite
 from comfy_runner.testing.suite import load_suite
@@ -231,6 +232,15 @@ def run_on_runpod(
 
         # Resolve remote ComfyUI URL (port 8188) via Tailscale.
         comfy_url = ts_url.rsplit(":", 1)[0] + ":8188"
+
+        # Pre-flight: ensure declared models exist on the pod before
+        # we start submitting workflows.  Existing files are skipped.
+        if suite.models:
+            ensure_suite_models(
+                runner, config.install_name, suite,
+                send_output=send_output,
+                comfy_url=comfy_url,
+            )
         out(f"Running test suite '{suite.name}' against {comfy_url}\n")
 
         client = ComfyTestClient(comfy_url, timeout=config.http_timeout)

@@ -1863,6 +1863,18 @@ _ROUTES: list[dict[str, Any]] = [
                                     "``stop`` falls back to ``terminate`` for untracked pods."
                                 ),
                             },
+                            "auto_stop": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "If true, stop (not terminate) the target's pod after a "
+                                    "non-overrun run completes. Intended for parked-pod e2e "
+                                    "workflows where a long-lived pod runs tests on demand and "
+                                    "is paused between runs to save GPU cost. No effect for "
+                                    "local targets or when the pod is already stopped/untracked. "
+                                    "On overrun, ``on_overrun`` wins."
+                                ),
+                            },
                         },
                     }
                 }
@@ -1924,6 +1936,16 @@ _ROUTES: list[dict[str, Any]] = [
                                     "Pod action to take per target when the fleet watchdog aborts. "
                                     "Defaults per target kind: ``terminate`` for runpod, ``stop`` "
                                     "for remote, ``none`` for local."
+                                ),
+                            },
+                            "auto_stop": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "If true, stop (not terminate) each target's pod after a "
+                                    "non-overrun fleet run completes. Same semantics as on "
+                                    "``/tests/run``: parked-pod workflow, ``on_overrun`` wins on "
+                                    "overrun."
                                 ),
                             },
                         },
