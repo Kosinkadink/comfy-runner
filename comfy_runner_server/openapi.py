@@ -1365,12 +1365,14 @@ _ROUTES: list[dict[str, Any]] = [
                             "wait_ready": {"type": "boolean", "default": True, "description": "Wait for the pod's comfy-runner server to be reachable"},
                             "purpose": {
                                 "type": "string",
-                                "enum": ["pr", "persistent", "test"],
+                                "enum": ["pr", "persistent", "test", "ci-runner"],
                                 "default": "persistent",
                                 "description": (
                                     "Recorded purpose tag for the pod. Defaults to ``persistent``. "
-                                    "Use ``pr`` for review pods (also stamped automatically by /pods/launch-pr) "
-                                    "or ``test`` for ephemeral test-runner pods (stamped automatically by the test runner). "
+                                    "Use ``pr`` for review pods (also stamped automatically by /pods/launch-pr), "
+                                    "``test`` for ephemeral test-runner pods (stamped automatically by the test runner), "
+                                    "or ``ci-runner`` for long-lived test pods (use POST /pods/create-ci-runner instead, "
+                                    "which composes create+deploy+preflight+stop). "
                                     "Any other value is rejected with HTTP 400."
                                 ),
                             },
@@ -1689,6 +1691,58 @@ _ROUTES: list[dict[str, Any]] = [
             "last_active_at": {"type": "integer"},
             "idle_in_s": {"type": "integer", "nullable": True},
         }),
+    },
+    {
+        "path": "/pods/create-ci-runner",
+        "method": "post",
+        "tags": ["Pods"],
+        "summary": "Provision a long-lived CI test runner pod",
+        "description": (
+            "Composed action: create the pod (purpose='ci-runner') → wait → "
+            "deploy 'main' at --latest → preflight-download every model "
+            "declared by the named suites → stop the pod. Container disk "
+            "persists models across suspend/resume so subsequent CI "
+            "invocations skip the downloads. Idempotent: if the pod "
+            "already exists with cached models, the suites' preflight is "
+            "a no-op and the pod is left stopped. Returns a job_id — "
+            "poll GET /job/{job_id} for progress."
+        ),
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["name", "suites"],
+                        "properties": {
+                            "name": {"type": "string", "description": "Pod name (e.g. 'sd-runner')"},
+                            "suites": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Suite names to preflight (must already exist on the server's test-suites/ dir)",
+                            },
+                            "gpu_type": {"type": "string"},
+                            "image": {"type": "string"},
+                            "datacenter": {"type": "string"},
+                            "cloud_type": {"type": "string"},
+                            "container_disk_gb": {"type": "integer", "description": "Container disk size in GB (caller chooses based on union of suite model sizes)"},
+                            "gpu_count": {"type": "integer", "default": 1},
+                            "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "install": {"type": "string", "default": "main"},
+                            "idle_timeout_s": {
+                                "type": "integer",
+                                "description": "Seconds of inactivity before the idle reaper stops (not terminates) this pod. Default 600.",
+                            },
+                            "leave_stopped": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": "Whether to stop the pod after preflight completes. Default true (the whole point of pre-warmed runners).",
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("CI-runner provision job started"),
     },
     {
         "path": "/pods/cleanup",
@@ -2021,13 +2075,68 @@ _ROUTES: list[dict[str, Any]] = [
         }),
     },
     {
+        "path": "/tests/fleet-ci",
+        "method": "post",
+        "tags": ["Tests"],
+        "summary": "Run multiple suites across pre-warmed CI runner pods",
+        "description": (
+            "For each pod-to-suites assignment: wake the pod (no-op if "
+            "running), run every assigned suite sequentially via the "
+            "remote target path (with preflight model downloads), then "
+            "auto-stop the pod (default) so cached models persist on "
+            "the container disk for the next CI invocation. Pods run "
+            "in parallel. Returns a job_id; the resulting fleet test "
+            "run is browsable via /tests/{test_id}/report?format=html."
+        ),
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["assignments"],
+                        "properties": {
+                            "assignments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["pod_name", "suites"],
+                                    "properties": {
+                                        "pod_name": {"type": "string"},
+                                        "suites": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                },
+                                "description": "Pod-to-suites mapping. Each pod runs its suites sequentially.",
+                            },
+                            "timeout": {"type": "integer", "default": 600, "description": "Per-workflow timeout (seconds)"},
+                            "max_runtime_s": {"type": "integer", "description": "Per-suite wall-clock budget (seconds)"},
+                            "on_overrun": {"type": "string", "enum": ["none", "stop", "terminate"]},
+                            "auto_stop": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": "Stop each pod after its suites finish (preserves cached models on container disk).",
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        "responses": _async_response("Fleet-CI job started"),
+    },
+    {
         "path": "/tests/{test_id}/report",
         "method": "get",
         "tags": ["Tests"],
         "summary": "Get test report",
         "description": (
             "Retrieve the test report in JSON, HTML, or Markdown format. "
-            "For fleet runs, returns the fleet summary report."
+            "For fleet runs, returns the fleet summary report. The HTML "
+            "format is rendered on-the-fly with image references "
+            "rewritten to absolute URLs that hit "
+            "``GET /tests/{test_id}/artifact/{path}`` so output thumbnails "
+            "and SSIM diff overlays render in a browser."
         ),
         "parameters": [
             _TEST_ID_PARAM,
@@ -2037,6 +2146,39 @@ _ROUTES: list[dict[str, Any]] = [
             "test_id": {"type": "string"},
             "report": {"type": "object", "description": "Report data (JSON format only)"},
         }),
+    },
+    {
+        "path": "/tests/{test_id}/artifact/{rel_path}",
+        "method": "get",
+        "tags": ["Tests"],
+        "summary": "Serve a file from a test run's output dir",
+        "description": (
+            "Serve any file referenced by the HTML report (workflow "
+            "outputs, baseline copies, ``*_ssim_diff.png`` heatmaps). "
+            "Path is resolved relative to the run's ``output_dir`` and "
+            "rejected if it escapes that directory or contains unsafe "
+            "components (``..``, absolute paths, etc.)."
+        ),
+        "parameters": [
+            _TEST_ID_PARAM,
+            {
+                "name": "rel_path",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string"},
+                "description": (
+                    "POSIX-style relative path under the run's output "
+                    "directory (e.g. ``txt2img-sd15/output_0.png``). "
+                    "For fleet runs, prefix with the per-target subdir "
+                    "(e.g. ``0-runpod-A/txt2img-sd15/output_0.png``)."
+                ),
+            },
+        ],
+        "responses": {
+            "200": {"description": "Artifact file (binary)"},
+            "400": {"description": "Invalid path"},
+            "404": {"description": "Test run or artifact not found"},
+        },
     },
 
     # ── Tailnet ───────────────────────────────────────────────────────

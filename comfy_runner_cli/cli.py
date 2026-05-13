@@ -4088,6 +4088,92 @@ def _station_pods(args: argparse.Namespace) -> None:
             console.print(f"[red]Error: {e}[/red]")
             sys.exit(1)
 
+    elif pod_action == "create-ci-runner":
+        try:
+            runner = RemoteRunner(_station_server(args))
+            config = _station_config(args)
+            defaults = config.get("defaults", {})
+
+            # Push every named suite to the server first.
+            suite_names = list(args.suites or [])
+            if not suite_names:
+                console.print(
+                    "[red]Error: pass at least one --suite name.[/red]",
+                )
+                sys.exit(2)
+            if not args.json:
+                console.print(
+                    f"Pushing {len(suite_names)} suite(s) to the server...",
+                )
+            for sname in suite_names:
+                spath = _resolve_suite_path(sname)
+                _push_suite_to_server(runner, sname, spath)
+
+            body: dict = {"name": args.pod_name, "suites": suite_names}
+            if getattr(args, "gpu", None):
+                body["gpu_type"] = args.gpu
+            elif defaults.get("gpu_type"):
+                body["gpu_type"] = defaults["gpu_type"]
+            if getattr(args, "datacenter", None):
+                body["datacenter"] = args.datacenter
+            elif defaults.get("datacenter"):
+                body["datacenter"] = defaults["datacenter"]
+            if getattr(args, "image", None):
+                body["image"] = args.image
+            if getattr(args, "container_disk", None) is not None:
+                body["container_disk_gb"] = args.container_disk
+            if getattr(args, "install", None):
+                body["install"] = args.install
+            if getattr(args, "idle_timeout", None) is not None:
+                body["idle_timeout_s"] = args.idle_timeout
+            if getattr(args, "no_stop", False):
+                body["leave_stopped"] = False
+
+            data = runner._request(
+                "POST", "/pods/create-ci-runner", json=body,
+            )
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(
+                    f"Provisioning ci-runner [cyan]{args.pod_name}[/cyan] "
+                    f"(job: {job_id})...",
+                )
+            result = runner.poll_job(
+                job_id, timeout=3600,
+                on_output=None if args.json else _output,
+            )
+            if args.json:
+                print(json.dumps({
+                    "ok": True, "job_id": job_id, "result": result,
+                }, indent=2))
+            else:
+                console.print(
+                    f"\n✓ CI-runner [cyan]{args.pod_name}[/cyan] ready "
+                    f"({len(suite_names)} suite(s) preflighted).",
+                )
+                if result.get("server_url"):
+                    console.print(f"  Server: {result['server_url']}")
+                stopped = result.get("stopped")
+                if stopped:
+                    console.print(
+                        "  [dim]Pod stopped — cached, ready for "
+                        "fleet-ci invocations.[/dim]",
+                    )
+                preflight = result.get("preflight", []) or []
+                for p in preflight:
+                    console.print(
+                        f"  [dim]preflight {p.get('suite')}: "
+                        f"requested={p.get('requested', 0)}, "
+                        f"skipped={p.get('skipped', 0)}, "
+                        f"downloaded={p.get('downloaded', 0)}[/dim]",
+                    )
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
     elif pod_action == "self-update":
         try:
             names = list(getattr(args, "pod_names", []) or [])
@@ -4311,6 +4397,113 @@ def _station_tests(args: argparse.Namespace) -> None:
                     console.print(f"\n[green]✓ All {total} targets passed[/green] ({duration:.1f}s)")
                 else:
                     console.print(f"\n[red]✗ {failed}/{total} targets failed[/red] ({duration:.1f}s)")
+            if failed > 0 or timed_out:
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+                sys.exit(1)
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+
+    elif test_action == "fleet-ci":
+        try:
+            runner = RemoteRunner(_station_server(args))
+
+            # Parse --pod entries: each is "pod_name=suite1,suite2,...".
+            pod_assignments: list[dict] = []
+            all_suites: set[str] = set()
+            for spec in args.pod or []:
+                if "=" not in spec:
+                    raise ValueError(
+                        f"Invalid --pod spec {spec!r}: "
+                        f"expected 'pod_name=suite1,suite2'",
+                    )
+                pname, _, slist = spec.partition("=")
+                pname = pname.strip()
+                suites = [s.strip() for s in slist.split(",") if s.strip()]
+                if not pname or not suites:
+                    raise ValueError(
+                        f"Invalid --pod spec {spec!r}: "
+                        f"need a pod name and at least one suite",
+                    )
+                pod_assignments.append({"pod_name": pname, "suites": suites})
+                all_suites.update(suites)
+
+            if not pod_assignments:
+                raise ValueError(
+                    "fleet-ci requires at least one "
+                    "--pod 'name=suite,...' assignment",
+                )
+
+            # Push every referenced suite once.
+            if not args.json:
+                console.print(
+                    f"Pushing {len(all_suites)} suite(s) to the server...",
+                )
+            for sname in sorted(all_suites):
+                spath = _resolve_suite_path(sname)
+                _push_suite_to_server(runner, sname, spath)
+
+            body: dict = {
+                "assignments": pod_assignments,
+                "auto_stop": not getattr(args, "no_auto_stop", False),
+            }
+            if getattr(args, "timeout", None):
+                body["timeout"] = args.timeout
+            if getattr(args, "max_runtime", None) is not None:
+                body["max_runtime_s"] = args.max_runtime
+            if getattr(args, "on_overrun", None) is not None:
+                body["on_overrun"] = args.on_overrun
+
+            data = runner._request("POST", "/tests/fleet-ci", json=body)
+            job_id = data.get("job_id")
+            if not args.json:
+                console.print(
+                    f"Fleet-CI started ({len(pod_assignments)} pods, "
+                    f"{sum(len(p['suites']) for p in pod_assignments)} "
+                    f"total suites, job: {job_id})...",
+                )
+            result = runner.poll_job(
+                job_id, timeout=7200,
+                on_output=None if args.json else _output,
+            )
+            timed_out = bool(result.get("timed_out"))
+            failed = result.get("targets_failed", 0) or 0
+            total = result.get("total_targets", 0) or 0
+            duration = result.get("total_duration", 0) or 0
+
+            if args.json:
+                print(json.dumps({
+                    "ok": failed == 0 and not timed_out,
+                    "job_id": job_id,
+                    "timed_out": timed_out,
+                    "result": result,
+                }, indent=2))
+            else:
+                if timed_out:
+                    console.print(
+                        f"\n[red]✗ Fleet-CI aborted by watchdog: "
+                        f"{failed}/{total} pods failed[/red] "
+                        f"({duration:.1f}s)",
+                    )
+                elif failed == 0:
+                    console.print(
+                        f"\n[green]✓ All {total} pods passed[/green] "
+                        f"({duration:.1f}s)",
+                    )
+                else:
+                    console.print(
+                        f"\n[red]✗ {failed}/{total} pods failed[/red] "
+                        f"({duration:.1f}s)",
+                    )
+                if result.get("test_id"):
+                    console.print(
+                        f"  Report: /tests/{result['test_id']}/report"
+                        f"?format=html",
+                    )
             if failed > 0 or timed_out:
                 sys.exit(1)
         except SystemExit:
@@ -5301,6 +5494,55 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_st_pod_touch.add_argument("pod_name", help="Pod name")
 
+    p_st_pod_create_ci = st_pods_sub.add_parser(
+        "create-ci-runner",
+        help=(
+            "Provision a long-lived CI test runner pod (create + deploy "
+            "main + preflight suite models + stop)"
+        ),
+    )
+    p_st_pod_create_ci.add_argument("pod_name", help="Pod name (e.g. 'sd-runner')")
+    p_st_pod_create_ci.add_argument(
+        "--suite", "-s", dest="suites", action="append", required=True,
+        help=(
+            "Suite name to preflight (repeatable). Models declared by "
+            "every named suite are downloaded onto the pod."
+        ),
+    )
+    p_st_pod_create_ci.add_argument(
+        "--gpu", "-g",
+        help="GPU type (default: from station config)",
+    )
+    p_st_pod_create_ci.add_argument("--datacenter", help="Datacenter ID")
+    p_st_pod_create_ci.add_argument("--image", help="Docker image")
+    p_st_pod_create_ci.add_argument(
+        "--container-disk", type=int,
+        help=(
+            "Container disk size in GB. Size to fit the union of all "
+            "named suites' model files plus the install dir (50 GB "
+            "headroom recommended)."
+        ),
+    )
+    p_st_pod_create_ci.add_argument(
+        "--install",
+        help="Installation name on the pod (default: main)",
+    )
+    p_st_pod_create_ci.add_argument(
+        "--idle-timeout", type=int, dest="idle_timeout",
+        help=(
+            "Seconds of inactivity before the idle reaper stops "
+            "(not terminates) this pod. Default 600."
+        ),
+    )
+    p_st_pod_create_ci.add_argument(
+        "--no-stop", action="store_true",
+        help=(
+            "Do NOT stop the pod after preflight. Useful when chaining "
+            "into an immediate test run; otherwise let the default "
+            "(stop) save GPU cost between CI invocations."
+        ),
+    )
+
     p_st_pod_self_update = st_pods_sub.add_parser(
         "self-update",
         help=(
@@ -5398,6 +5640,52 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Stop (not terminate) every target's pod after the fleet "
             "run completes. Same semantics as on `tests run`."
+        ),
+    )
+
+    p_st_test_fleet_ci = st_tests_sub.add_parser(
+        "fleet-ci",
+        help=(
+            "Run multiple suites across multiple pre-warmed CI runner "
+            "pods (start each pod, run its assigned suites sequentially, "
+            "stop it after). Pods run in parallel."
+        ),
+    )
+    p_st_test_fleet_ci.add_argument(
+        "--pod", "-p", action="append", required=True,
+        help=(
+            "Pod-to-suite assignment 'pod_name=suite1,suite2,...'. "
+            "Repeatable. Each pod is started, runs all its assigned "
+            "suites sequentially, then is stopped (default). Pods run "
+            "in parallel across the fleet."
+        ),
+    )
+    p_st_test_fleet_ci.add_argument(
+        "--timeout", type=int,
+        help="Per-workflow timeout in seconds",
+    )
+    p_st_test_fleet_ci.add_argument(
+        "--max-runtime", type=int, default=None,
+        help=(
+            "Per-suite wall-clock budget in seconds. Watchdog aborts "
+            "the suite on overrun."
+        ),
+    )
+    p_st_test_fleet_ci.add_argument(
+        "--on-overrun",
+        choices=("none", "stop", "terminate"),
+        default=None,
+        help=(
+            "Pod action when the watchdog aborts a suite. Defaults to "
+            "'stop' for ci-runner pods (preserve cached models)."
+        ),
+    )
+    p_st_test_fleet_ci.add_argument(
+        "--no-auto-stop", action="store_true",
+        help=(
+            "Leave pods running after their suites finish. Default is "
+            "to stop each pod, preserving cached models on its container "
+            "disk for the next CI invocation."
         ),
     )
 

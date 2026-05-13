@@ -304,6 +304,13 @@ _HTML_TEMPLATE = """\
   th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }}
   th {{ color: #94a3b8; font-weight: 500; }}
   .score-pass {{ color: var(--pass); }} .score-fail {{ color: var(--fail); }}
+  .img-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 12px; }}
+  .img-tile {{ background: #0b1220; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }}
+  .img-tile a {{ display: block; }}
+  .img-tile img {{ width: 100%; height: auto; display: block; border-radius: 4px; background: #000; }}
+  .img-tile .label {{ color: #94a3b8; font-size: 0.75rem; margin-top: 6px; word-break: break-all; }}
+  .img-tile.diff {{ border-color: var(--fail); }}
+  .img-tile.baseline {{ border-color: var(--pass); }}
   .timestamp {{ color: #64748b; font-size: 0.8rem; margin-top: 2rem; }}
 </style>
 </head>
@@ -335,8 +342,29 @@ _CARD_TEMPLATE = """\
 """
 
 
-def render_html(report: SuiteReport) -> str:
-    """Render the report as a self-contained HTML page."""
+def render_html(
+    report: SuiteReport,
+    artifact_url_prefix: str | None = None,
+) -> str:
+    """Render the report as an HTML page.
+
+    Image references (workflow outputs and ``*_ssim_diff.png``
+    overlays) are emitted as ``<img>`` tags pointing at paths relative
+    to the report file (e.g. ``./<workflow>/output_0.png``). When the
+    HTML is served over HTTP via the central server's
+    ``GET /tests/{id}/artifact/<path>`` route, pass that URL prefix as
+    *artifact_url_prefix* to rewrite the ``<img>`` srcs accordingly.
+    """
+    prefix = (artifact_url_prefix or "").rstrip("/")
+
+    def _href(rel: str) -> str:
+        # ``rel`` is the workflow-name + filename relative to the
+        # run output dir. When opened as a local file, the report
+        # sits at the run-dir root so a relative ``./`` link works.
+        if not prefix:
+            return _html_escape(rel)
+        return _html_escape(f"{prefix}/{rel}")
+
     cards: list[str] = []
     for wf in report.workflows:
         card_class = "pass" if wf.passed else "fail"
@@ -379,6 +407,41 @@ def render_html(report: SuiteReport) -> str:
                 + "</tbody></table>"
             )
 
+            # Image grid: per-comparison test image + diff overlay.
+            tiles: list[str] = []
+            for c in wf.comparisons:
+                if not _looks_like_image(c.test_file):
+                    continue
+                test_rel = f"{wf.name}/{c.test_file}"
+                tiles.append(
+                    f'<div class="img-tile">'
+                    f'<a href="{_href(test_rel)}" target="_blank">'
+                    f'<img src="{_href(test_rel)}" alt="output" loading="lazy"></a>'
+                    f'<div class="label">test: {_html_escape(c.test_file)}</div>'
+                    f'</div>'
+                )
+                diff_artifact = c.result.diff_artifact
+                if diff_artifact:
+                    diff_name = Path(str(diff_artifact)).name
+                    diff_rel = f"{wf.name}/{diff_name}"
+                    tiles.append(
+                        f'<div class="img-tile diff">'
+                        f'<a href="{_href(diff_rel)}" target="_blank">'
+                        f'<img src="{_href(diff_rel)}" alt="diff" loading="lazy"></a>'
+                        f'<div class="label">diff: {_html_escape(diff_name)} '
+                        f'({c.result.method})</div>'
+                        f'</div>'
+                    )
+            if tiles:
+                comparisons_html += (
+                    '<div class="img-grid">' + "\n".join(tiles) + "</div>"
+                )
+        elif wf.passed and wf.output_count > 0:
+            # Even without baselines, surface a thumbnail of the
+            # first output per workflow so the operator can eyeball
+            # the run.
+            pass
+
         cards.append(_CARD_TEMPLATE.format(
             card_class=card_class,
             name=_html_escape(wf.name),
@@ -412,6 +475,14 @@ def _html_escape(s: str) -> str:
     """HTML-escape a string."""
     import html
     return html.escape(s, quote=True)
+
+
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+
+
+def _looks_like_image(filename: str) -> bool:
+    """Return True if *filename*'s extension is a browser-renderable image."""
+    return Path(filename).suffix.lower() in _IMAGE_EXTS
 
 
 # ===================================================================

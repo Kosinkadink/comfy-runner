@@ -320,6 +320,78 @@ class TestRenderHTML:
         html = render_html(report)
         assert "pod-a100" in html
 
+    def test_image_grid_for_passing_image_comparison(self):
+        """Each image-typed comparison emits an <img> tag we can click on."""
+        report = build_report(
+            _make_suite_run(),
+            comparisons=_make_comparisons(),
+        )
+        html = render_html(report)
+        # Workflow name is wf_pass_0 and the test_file is out_0.png.
+        assert "<img" in html
+        assert "wf_pass_0/out_0.png" in html
+        # No diff_artifact set on the passing comparison so no diff tile.
+        assert "img-tile diff" not in html
+
+    def test_image_grid_includes_diff_when_failed(self):
+        """SSIM diff artifacts are surfaced as side-by-side overlay tiles."""
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="baseline/out_0.png",
+                    test_file="out_0.png",
+                    result=CompareResult(
+                        method="ssim", score=0.5, passed=False,
+                        threshold=0.95,
+                        diff_artifact=Path("out_0_ssim_diff.png"),
+                    ),
+                ),
+            ],
+        }
+        report = build_report(_make_suite_run(), comparisons=comparisons)
+        html = render_html(report)
+        assert "img-tile diff" in html
+        assert "wf_pass_0/out_0_ssim_diff.png" in html
+
+    def test_artifact_url_prefix_rewrites_img_src(self):
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="baseline/out_0.png",
+                    test_file="out_0.png",
+                    result=CompareResult(
+                        method="ssim", score=0.5, passed=False,
+                        threshold=0.95,
+                        diff_artifact=Path("out_0_ssim_diff.png"),
+                    ),
+                ),
+            ],
+        }
+        report = build_report(_make_suite_run(), comparisons=comparisons)
+        html = render_html(
+            report,
+            artifact_url_prefix="/tests/T-abc/artifact",
+        )
+        assert "/tests/T-abc/artifact/wf_pass_0/out_0.png" in html
+        assert "/tests/T-abc/artifact/wf_pass_0/out_0_ssim_diff.png" in html
+
+    def test_non_image_comparisons_do_not_get_thumbnails(self):
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="baseline/data.txt",
+                    test_file="data.txt",
+                    result=CompareResult(
+                        method="existence", passed=True,
+                    ),
+                ),
+            ],
+        }
+        report = build_report(_make_suite_run(), comparisons=comparisons)
+        html = render_html(report)
+        # Only the comparison table -- no <img> tile for .txt.
+        assert "<img" not in html
+
 
 # ---------------------------------------------------------------------------
 # write_report
