@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any, Callable
 
 from comfy_runner.config import load_config, save_config
@@ -230,6 +231,58 @@ def remove_pod_record(provider: str, pod_name: str) -> bool:
             save_config(config)
             return True
         return False
+
+
+def backfill_pod_metadata(
+    provider_obj: Any,
+    pod_name: str,
+    pod_id: str,
+    provider: str = "runpod",
+) -> dict[str, Any] | None:
+    """Best-effort refresh of static pod metadata (``gpu_type``,
+    ``datacenter``, ``image``) on a persisted record.
+
+    Background: ``provider.create_pod()`` returns a ``PodInfo`` whose
+    ``gpu_type`` / ``datacenter`` / ``image`` are often empty because
+    RunPod's create response doesn't include the resolved GPU or
+    machine block immediately. The persisted record then keeps those
+    empties forever, and once the pod transitions to ``EXITED`` the
+    provider's ``list_pods`` no longer carries the GPU info either, so
+    the ``GET /pods`` merge has nothing to fall back on.
+
+    This helper calls ``provider_obj.get_pod(pod_id)`` once the pod is
+    actually ready (i.e. allocated on a host so the metadata is
+    populated) and merges any *non-empty* values into the persisted
+    record. Empty strings from the live response are ignored so we
+    never overwrite previously-good cached metadata with ``""``.
+
+    Returns the updated record (or ``None`` on failure / no record).
+    Failures are swallowed -- this is a best-effort enrichment, never
+    a blocking step.
+    """
+    try:
+        pod = provider_obj.get_pod(pod_id)
+    except Exception:
+        return None
+    if pod is None:
+        return None
+
+    def _apply(rec: dict[str, Any] | None) -> dict[str, Any] | None:
+        if rec is None:
+            return None
+        if pod.gpu_type:
+            rec["gpu_type"] = pod.gpu_type
+        if pod.datacenter:
+            rec["datacenter"] = pod.datacenter
+        if pod.image:
+            rec["image"] = pod.image
+        rec["metadata_refreshed_at"] = int(time.time())
+        return rec
+
+    try:
+        return update_pod_record(provider, pod_name, _apply)
+    except Exception:
+        return None
 
 
 def list_pod_records(provider: str) -> dict[str, dict[str, Any]]:

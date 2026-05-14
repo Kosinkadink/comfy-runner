@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from comfy_runner.hosted.config import (
+    backfill_pod_metadata,
     get_pod_record,
     list_pod_records,
     remove_pod_record,
@@ -111,6 +112,111 @@ class TestUpdatePodRecord:
         for t in threads:
             t.join()
         assert get_pod_record("runpod", "counter")["n"] == 50
+
+
+# ---------------------------------------------------------------------------
+# backfill_pod_metadata
+# ---------------------------------------------------------------------------
+
+def _fake_provider(pod: PodInfo | None, raises: BaseException | None = None):
+    """Build a stub provider whose ``get_pod`` returns *pod* (or raises)."""
+    prov = MagicMock()
+    if raises is not None:
+        prov.get_pod.side_effect = raises
+    else:
+        prov.get_pod.return_value = pod
+    return prov
+
+
+class TestBackfillPodMetadata:
+    def test_fills_missing_fields(self, tmp_config_dir):
+        # Record was persisted with empties (mirrors the create-time bug).
+        set_pod_record("runpod", "p", {
+            "id": "abc",
+            "gpu_type": "",
+            "datacenter": "",
+            "image": "",
+            "purpose": "ci-runner",
+        })
+        prov = _fake_provider(PodInfo(
+            id="abc", name="p", status="RUNNING",
+            gpu_type="NVIDIA GeForce RTX 5090",
+            datacenter="US-NJ-1",
+            cost_per_hr=0.69,
+            image="ghcr.io/kosinkadink/comfy-runner:latest",
+        ))
+        rec = backfill_pod_metadata(prov, "p", "abc")
+        assert rec is not None
+        assert rec["gpu_type"] == "NVIDIA GeForce RTX 5090"
+        assert rec["datacenter"] == "US-NJ-1"
+        assert rec["image"] == "ghcr.io/kosinkadink/comfy-runner:latest"
+        assert "metadata_refreshed_at" in rec
+        # Unrelated fields preserved.
+        assert rec["purpose"] == "ci-runner"
+
+    def test_does_not_overwrite_with_empties(self, tmp_config_dir):
+        # Record already has good metadata; live values are blank
+        # (e.g. pod is EXITED so RunPod dropped the GPU block).
+        # Backfill must NOT clobber the cached values.
+        set_pod_record("runpod", "p", {
+            "id": "abc",
+            "gpu_type": "NVIDIA GeForce RTX 5090",
+            "datacenter": "US-NJ-1",
+            "image": "ghcr.io/img:1",
+        })
+        prov = _fake_provider(PodInfo(
+            id="abc", name="p", status="EXITED",
+            gpu_type="", datacenter="", cost_per_hr=0.0, image="",
+        ))
+        rec = backfill_pod_metadata(prov, "p", "abc")
+        assert rec is not None
+        assert rec["gpu_type"] == "NVIDIA GeForce RTX 5090"
+        assert rec["datacenter"] == "US-NJ-1"
+        assert rec["image"] == "ghcr.io/img:1"
+
+    def test_partial_fill(self, tmp_config_dir):
+        # Live response only knows gpu_type; datacenter and image stay
+        # whatever was persisted.
+        set_pod_record("runpod", "p", {
+            "id": "abc",
+            "gpu_type": "",
+            "datacenter": "US-NJ-1",
+            "image": "",
+        })
+        prov = _fake_provider(PodInfo(
+            id="abc", name="p", status="RUNNING",
+            gpu_type="L40S", datacenter="", cost_per_hr=0.0, image="",
+        ))
+        rec = backfill_pod_metadata(prov, "p", "abc")
+        assert rec is not None
+        assert rec["gpu_type"] == "L40S"
+        assert rec["datacenter"] == "US-NJ-1"
+        assert rec["image"] == ""
+
+    def test_provider_exception_returns_none(self, tmp_config_dir):
+        set_pod_record("runpod", "p", {"id": "abc", "gpu_type": ""})
+        prov = _fake_provider(None, raises=RuntimeError("transient"))
+        rec = backfill_pod_metadata(prov, "p", "abc")
+        assert rec is None
+        # Record untouched.
+        assert get_pod_record("runpod", "p")["gpu_type"] == ""
+
+    def test_provider_returns_none_returns_none(self, tmp_config_dir):
+        set_pod_record("runpod", "p", {"id": "abc", "gpu_type": ""})
+        prov = _fake_provider(None)
+        rec = backfill_pod_metadata(prov, "p", "abc")
+        assert rec is None
+
+    def test_no_record_returns_none(self, tmp_config_dir):
+        prov = _fake_provider(PodInfo(
+            id="abc", name="ghost", status="RUNNING",
+            gpu_type="L40S", datacenter="", cost_per_hr=0.0, image="",
+        ))
+        # No persisted record -- update_pod_record's updater sees None
+        # and returns None, so nothing is written.
+        rec = backfill_pod_metadata(prov, "ghost", "abc")
+        assert rec is None
+        assert get_pod_record("runpod", "ghost") is None
 
 
 # ---------------------------------------------------------------------------

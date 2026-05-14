@@ -19,6 +19,7 @@ from typing import Any, Callable
 import requests
 
 from comfy_runner.hosted.config import (
+    backfill_pod_metadata,
     get_pod_record,
     remove_pod_record,
     set_pod_record,
@@ -193,6 +194,18 @@ def run_on_runpod(
         # ── Step 2: Wait for server ready ──────────────────────────
         out(f"Waiting for comfy-runner server at {server_url}...\n")
         _wait_for_server(server_url, send_output=send_output)
+
+        # Best-effort: refresh static metadata (gpu_type / datacenter /
+        # image) on the persisted record now that the pod is allocated
+        # on a host. RunPod's create response often omits these fields,
+        # leaving the record stuck with empty strings forever -- which
+        # then surface as blanks in GET /pods, especially after the pod
+        # transitions to EXITED.
+        if pod_id:
+            try:
+                backfill_pod_metadata(provider, pod_name, pod_id)
+            except Exception:
+                pass
 
         runner = RemoteRunner(server_url)
 
