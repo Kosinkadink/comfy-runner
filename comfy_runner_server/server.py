@@ -1084,6 +1084,10 @@ def _wait_for_pod_server(
     responded.
     """
     import requests as _requests
+    from comfy_runner.hosted.config import (
+        backfill_pod_metadata,
+        get_pod_record,
+    )
     out = send_output or (lambda _: None)
     deadline = time.monotonic() + timeout
     last_url: str | None = None
@@ -1109,6 +1113,23 @@ def _wait_for_pod_server(
                 if resp.ok:
                     resp.json()
                     out("Remote server is ready.\n")
+                    # Best-effort: refresh ``gpu_type`` / ``datacenter`` /
+                    # ``image`` on the persisted record now that the pod
+                    # is allocated on a host. RunPod's create response
+                    # often omits these, leaving the record permanently
+                    # incomplete (visible as empty strings in GET /pods,
+                    # especially after the pod transitions to EXITED).
+                    rec = get_pod_record("runpod", pod_name)
+                    if rec and rec.get("id"):
+                        try:
+                            backfill_pod_metadata(
+                                _get_runpod_provider(),
+                                pod_name,
+                                rec["id"],
+                            )
+                        except Exception:
+                            # Never fail readiness on metadata refresh.
+                            pass
                     return url
             except Exception:
                 pass
@@ -3732,7 +3753,14 @@ def create_app() -> Any:
                 if live:
                     entry["status"] = live.status
                     entry["cost_per_hr"] = live.cost_per_hr
+                    # Prefer live values when present, else fall back to
+                    # whatever was persisted at create / backfill time.
+                    # This protects EXITED pods, whose ``list_pods``
+                    # response usually drops the GPU / machine / image
+                    # fields, from showing empty strings.
                     entry["gpu_type"] = live.gpu_type or entry["gpu_type"]
+                    entry["datacenter"] = live.datacenter or entry["datacenter"]
+                    entry["image"] = live.image or entry["image"]
                 else:
                     entry["status"] = "UNKNOWN"
                 # Activity / idle-reaper metadata
