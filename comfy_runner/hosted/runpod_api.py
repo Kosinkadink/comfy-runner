@@ -71,12 +71,25 @@ class RunPodAPI:
         return self._request("POST", "/pods", json=kwargs)  # type: ignore[return-value]
 
     def list_pods(self) -> list[dict[str, Any]]:
-        """``GET /pods`` — list all pods."""
-        return self._request("GET", "/pods") or []  # type: ignore[return-value]
+        """``GET /pods`` — list all pods.
+
+        Always asks for the machine block so callers can read GPU
+        display name and ``dataCenterId`` (those live under
+        ``machine.gpuType.displayName`` / ``machine.dataCenterId``;
+        without ``includeMachine=true`` the API returns ``machine: {}``).
+        """
+        return self._request(  # type: ignore[return-value]
+            "GET", "/pods", params={"includeMachine": "true"},
+        ) or []
 
     def get_pod(self, pod_id: str) -> dict[str, Any] | None:
-        """``GET /pods/{pod_id}`` — get a single pod."""
-        return self._request("GET", f"/pods/{pod_id}")
+        """``GET /pods/{pod_id}`` — get a single pod.
+
+        Always asks for the machine block (see ``list_pods``).
+        """
+        return self._request(
+            "GET", f"/pods/{pod_id}", params={"includeMachine": "true"},
+        )
 
     def start_pod(self, pod_id: str) -> dict[str, Any]:
         """``POST /pods/{pod_id}/start`` — start a stopped pod."""
