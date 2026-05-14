@@ -4421,34 +4421,6 @@ def create_app() -> Any:
             _remove_pod_lock(name)
 
     # ------------------------------------------------------------------
-    # GET /pods/<name>/_debug — TEMPORARY: dump raw provider + record
-    # ------------------------------------------------------------------
-    @app.route("/pods/<name>/_debug", methods=["GET"])
-    def route_pods_debug_inspect(name: str) -> Any:
-        name_err = _validate_pod_name(name)
-        if name_err:
-            return _err(name_err)
-        from comfy_runner.hosted.config import get_pod_record
-        rec = get_pod_record("runpod", name)
-        result: dict[str, Any] = {"persisted_record": rec}
-        if rec and rec.get("id"):
-            try:
-                provider = _get_runpod_provider()
-                pod = provider.get_pod(rec["id"])
-                if pod is None:
-                    result["get_pod"] = None
-                else:
-                    result["get_pod"] = {
-                        "id": pod.id, "name": pod.name, "status": pod.status,
-                        "gpu_type": pod.gpu_type, "datacenter": pod.datacenter,
-                        "image": pod.image, "cost_per_hr": pod.cost_per_hr,
-                        "raw": pod.raw,
-                    }
-            except Exception as e:
-                result["get_pod_error"] = str(e)
-        return jsonify({"ok": True, **result})
-
-    # ------------------------------------------------------------------
     # POST /pods/<name>/touch — reset the idle timer
     # ------------------------------------------------------------------
     @app.route("/pods/<name>/touch", methods=["POST"])

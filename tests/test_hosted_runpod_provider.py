@@ -66,6 +66,69 @@ class TestPodInfoMapping:
         info = _pod_info(raw)
         assert info.cost_per_hr == 0.0
 
+    def test_current_rest_api_shape(self):
+        """Match the actual current ``GET /pods/{id}?includeMachine=true``
+        response: ``imageName`` (not ``image``), GPU info under
+        ``machine.gpuType``, ``dataCenterId`` under ``machine``."""
+        raw = {
+            "id": "abc",
+            "name": "p",
+            "desiredStatus": "RUNNING",
+            "imageName": "ghcr.io/kosinkadink/comfy-runner:latest",
+            "costPerHr": 0.69,
+            "machine": {
+                "dataCenterId": "US-NJ-1",
+                "gpuType": {
+                    "displayName": "NVIDIA GeForce RTX 5090",
+                    "id": "NVIDIA GeForce RTX 5090",
+                },
+            },
+        }
+        info = _pod_info(raw)
+        assert info.gpu_type == "NVIDIA GeForce RTX 5090"
+        assert info.datacenter == "US-NJ-1"
+        assert info.image == "ghcr.io/kosinkadink/comfy-runner:latest"
+
+    def test_machine_gpu_display_name_fallback(self):
+        # Some endpoints expose the GPU info as flat fields on machine
+        # rather than the nested ``gpuType`` object.
+        raw = {
+            "machine": {
+                "gpuDisplayName": "RTX 4090",
+                "gpuTypeId": "NVIDIA GeForce RTX 4090",
+                "dataCenterId": "EU-RO-1",
+            },
+        }
+        info = _pod_info(raw)
+        assert info.gpu_type == "RTX 4090"
+        assert info.datacenter == "EU-RO-1"
+
+    def test_image_field_fallback_when_imageName_missing(self):
+        raw = {"image": "runpod/pytorch:2.1.0"}
+        info = _pod_info(raw)
+        assert info.image == "runpod/pytorch:2.1.0"
+
+    def test_imageName_takes_precedence_over_legacy_image(self):
+        raw = {"imageName": "new", "image": "old"}
+        info = _pod_info(raw)
+        assert info.image == "new"
+
+    def test_empty_machine_block(self):
+        # Reproduces the create-time response: no machine, no gpu block,
+        # only top-level fields like imageName.
+        raw = {
+            "id": "abc",
+            "name": "p",
+            "desiredStatus": "RUNNING",
+            "imageName": "ghcr.io/img:1",
+            "costPerHr": 0.69,
+            "machine": {},
+        }
+        info = _pod_info(raw)
+        assert info.gpu_type == ""
+        assert info.datacenter == ""
+        assert info.image == "ghcr.io/img:1"
+
 
 # ---------------------------------------------------------------------------
 # _volume_info mapping

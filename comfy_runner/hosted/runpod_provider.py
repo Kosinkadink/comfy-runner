@@ -21,16 +21,44 @@ DEFAULT_CUDA_VERSIONS = ["13.0"]
 
 
 def _pod_info(data: dict[str, Any]) -> PodInfo:
-    """Map a RunPod pod response to a PodInfo."""
+    """Map a RunPod pod response to a PodInfo.
+
+    The current RunPod REST API places fields differently than the
+    legacy GraphQL schema:
+
+    * The image lives in ``imageName`` (the legacy ``image`` field is
+      no longer populated on most responses).
+    * The GPU display name lives under ``machine.gpuType.displayName``
+      when ``?includeMachine=true`` is set on the request -- the
+      top-level ``gpu`` block is no longer returned.
+    * ``machine.dataCenterId`` is only populated when
+      ``?includeMachine=true`` is set; otherwise ``machine`` is ``{}``.
+
+    We accept both shapes so this mapper keeps working if RunPod
+    re-introduces the legacy fields, and so we can map create-time
+    responses (which never include the machine block) without crashing.
+    """
+    machine = data.get("machine") or {}
     gpu = data.get("gpu") or {}
+    machine_gpu = machine.get("gpuType") or {}
+    gpu_type = (
+        machine_gpu.get("displayName")
+        or machine_gpu.get("id")
+        or machine.get("gpuDisplayName")
+        or machine.get("gpuTypeId")
+        or gpu.get("displayName")
+        or gpu.get("id")
+        or ""
+    )
+    image = data.get("imageName") or data.get("image") or ""
     return PodInfo(
         id=data.get("id", ""),
         name=data.get("name", ""),
         status=data.get("desiredStatus", "UNKNOWN"),
-        gpu_type=gpu.get("displayName", gpu.get("id", "")),
-        datacenter=data.get("machine", {}).get("dataCenterId", ""),
+        gpu_type=gpu_type,
+        datacenter=machine.get("dataCenterId", ""),
         cost_per_hr=float(data.get("costPerHr") or 0),
-        image=data.get("image", ""),
+        image=image,
         raw=data,
     )
 
