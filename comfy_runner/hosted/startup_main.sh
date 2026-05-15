@@ -45,134 +45,209 @@ if ! command -v 7z &>/dev/null; then
 fi
 
 # ── 2. Tailscale auto-join ────────────────────────────────────────────
+#
+# Two auth flows are supported (in order of preference):
+#
+#   1. OAuth client (recommended) — TAILSCALE_OAUTH_CLIENT_ID +
+#      TAILSCALE_OAUTH_CLIENT_SECRET in env. We exchange them for a
+#      bearer token and mint a fresh single-use ephemeral auth key per
+#      boot. This works reliably across arbitrary pod stop/start
+#      cycles because we never reuse a key. See
+#      https://tailscale.com/kb/1215/oauth-clients .
+#
+#   2. Static auth key (legacy) — TAILSCALE_AUTH_KEY in env. Only
+#      reliable if the key is configured as Reusable; single-use keys
+#      will fail on the second boot. Kept as a fallback for backwards
+#      compatibility with single-developer setups.
+#
+# This block is the "front door" to the tailnet. If we don't get on
+# the tailnet, the pod is unreachable from the central server and
+# every later step is wasted compute. We therefore exit non-zero on
+# any failure here so RunPod surfaces a crashed container instead of
+# leaving an unreachable RUNNING zombie.
 
 SERVER_TAILSCALE=""
-if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
+TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
+TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
+
+# Decide which flow to use up front.
+TS_FLOW=""
+if [ -n "${TAILSCALE_OAUTH_CLIENT_ID:-}" ] && [ -n "${TAILSCALE_OAUTH_CLIENT_SECRET:-}" ]; then
+    TS_FLOW="oauth"
+elif [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
+    TS_FLOW="static"
+fi
+
+if [ -n "${TS_FLOW}" ]; then
+    log "Tailscale auth flow: ${TS_FLOW}"
     log "Installing Tailscale..."
-    if curl -fsSL https://tailscale.com/install.sh | sh; then
-        TAILSCALE_STATE="/var/lib/tailscale"
-        if [ -d "/workspace" ] && [ -w "/workspace" ]; then
-            # Persist state across pod restarts via the network volume.
-            # tailscaled --state expects a FILE path, not a directory.
-            mkdir -p "/workspace/.tailscale"
-            TAILSCALE_STATE="/workspace/.tailscale/tailscaled.state"
-        fi
-        mkdir -p /var/run/tailscale
-        # Use userspace networking — RunPod containers lack /dev/net/tun
-        tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock --tun=userspace-networking &
-        # Wait for tailscaled socket to become available (up to 10s)
-        for i in $(seq 1 20); do
-            [ -S /var/run/tailscale/tailscaled.sock ] && break
-            sleep 0.5
-        done
+    if ! curl -fsSL https://tailscale.com/install.sh | sh; then
+        log "ERROR: Tailscale install failed — pod cannot join tailnet, aborting boot"
+        exit 1
+    fi
 
-        TS_HOSTNAME="${TAILSCALE_HOSTNAME:-comfy-runner}"
-        TS_TAGS="${TAILSCALE_TAGS:-tag:runpod}"
+    # ── State location.
+    # CI runner pods don't mount /workspace, so state lives on the
+    # container disk at /var/lib/tailscale (which persists across
+    # stop/start). However, persisted state can carry a stale node
+    # identity that conflicts with re-auth, especially after the
+    # corresponding tailnet device record was GC'd. Wipe it on every
+    # boot so we always register fresh — combined with ephemeral keys,
+    # this gives us a clean tailnet device per boot with no leftover
+    # state to fight.
+    TAILSCALE_STATE="/var/lib/tailscale"
+    if [ -d "/workspace" ] && [ -w "/workspace" ]; then
+        # tailscaled --state expects a FILE path, not a directory.
+        mkdir -p "/workspace/.tailscale"
+        TAILSCALE_STATE="/workspace/.tailscale/tailscaled.state"
+    fi
+    if [ -d "${TAILSCALE_STATE}" ]; then
+        log "Wiping persisted tailscaled state directory: ${TAILSCALE_STATE}"
+        rm -rf "${TAILSCALE_STATE}"/*
+    elif [ -f "${TAILSCALE_STATE}" ]; then
+        log "Wiping persisted tailscaled state file: ${TAILSCALE_STATE}"
+        rm -f "${TAILSCALE_STATE}"
+    fi
 
-        # ── Remove stale Tailscale devices via the Tailscale REST API.
-        # When a pod with the same name was previously connected, its
-        # device record persists in the tailnet. Joining without cleanup
-        # causes Tailscale to assign a suffixed hostname (e.g.
-        # ``comfy-pool-image-1``), breaking URL resolution. Delete any
-        # device whose hostname matches our target (or target-N) before
-        # ``tailscale up``.
-        if [ -n "${TAILSCALE_API_KEY:-}" ] && [ -n "${TAILSCALE_TAILNET:-}" ]; then
-            log "Cleaning up stale Tailscale devices for hostname '${TS_HOSTNAME}'..."
-            TS_HOSTNAME="${TS_HOSTNAME}" \
-            TAILSCALE_API_KEY="${TAILSCALE_API_KEY}" \
-            TAILSCALE_TAILNET="${TAILSCALE_TAILNET}" \
-            python3 - <<'PYEOF' || log "WARNING: stale device cleanup failed (continuing)"
+    mkdir -p /var/run/tailscale
+    # Use userspace networking — RunPod containers lack /dev/net/tun
+    tailscaled --state="${TAILSCALE_STATE}" --socket=/var/run/tailscale/tailscaled.sock --tun=userspace-networking &
+    # Wait for tailscaled socket to become available (up to 10s)
+    for i in $(seq 1 20); do
+        [ -S /var/run/tailscale/tailscaled.sock ] && break
+        sleep 0.5
+    done
+    if [ ! -S /var/run/tailscale/tailscaled.sock ]; then
+        log "ERROR: tailscaled socket did not appear within 10s — aborting boot"
+        exit 1
+    fi
+
+    # ── Acquire a fresh auth key.
+    TS_AUTH_KEY=""
+    if [ "${TS_FLOW}" = "oauth" ]; then
+        log "Minting fresh ephemeral auth key via Tailscale OAuth..."
+        TS_AUTH_KEY="$(
+            TAILSCALE_OAUTH_CLIENT_ID="${TAILSCALE_OAUTH_CLIENT_ID}" \
+            TAILSCALE_OAUTH_CLIENT_SECRET="${TAILSCALE_OAUTH_CLIENT_SECRET}" \
+            TS_TAGS="${TS_TAGS}" \
+            python3 - <<'PYEOF'
 import json
 import os
-import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
-target = os.environ["TS_HOSTNAME"]
-api_key = os.environ["TAILSCALE_API_KEY"]
-tailnet = os.environ["TAILSCALE_TAILNET"]
+client_id = os.environ["TAILSCALE_OAUTH_CLIENT_ID"]
+client_secret = os.environ["TAILSCALE_OAUTH_CLIENT_SECRET"]
+tags = [t.strip() for t in os.environ["TS_TAGS"].split(",") if t.strip()]
 
-# Match the exact hostname or hostname-N (Tailscale's auto-suffix pattern)
-suffix_re = re.compile(r"^" + re.escape(target) + r"(-\d+)?$")
-
-base = f"https://api.tailscale.com/api/v2/tailnet/{tailnet}"
-list_req = urllib.request.Request(
-    f"{base}/devices",
-    headers={"Authorization": f"Bearer {api_key}"},
+# Step 1: OAuth client_credentials -> bearer token
+token_req = urllib.request.Request(
+    "https://api.tailscale.com/api/v2/oauth/token",
+    data=urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode("ascii"),
+    method="POST",
 )
 try:
-    with urllib.request.urlopen(list_req, timeout=15) as resp:
-        data = json.load(resp)
+    with urllib.request.urlopen(token_req, timeout=20) as resp:
+        token_data = json.load(resp)
 except urllib.error.HTTPError as e:
-    print(f"[ts-cleanup] list devices failed: HTTP {e.code} {e.reason}")
-    sys.exit(1)
+    body = e.read().decode("utf-8", errors="replace")[:300]
+    print(f"[ts-mint] OAuth token exchange failed: HTTP {e.code} {e.reason}: {body}",
+          file=sys.stderr)
+    sys.exit(2)
 except Exception as e:
-    print(f"[ts-cleanup] list devices failed: {e}")
-    sys.exit(1)
+    print(f"[ts-mint] OAuth token exchange failed: {e}", file=sys.stderr)
+    sys.exit(2)
+bearer = token_data.get("access_token")
+if not bearer:
+    print(f"[ts-mint] OAuth response missing access_token: {token_data!r}",
+          file=sys.stderr)
+    sys.exit(2)
 
-devices = data.get("devices", []) or []
-matches = []
-for d in devices:
-    host = d.get("hostname", "") or ""
-    # Tailscale also exposes ``name`` as FQDN; first DNS label is the host
-    if not host:
-        fqdn = d.get("name", "") or ""
-        host = fqdn.split(".", 1)[0]
-    if suffix_re.match(host):
-        matches.append((d.get("id", ""), host))
-
-if not matches:
-    print(f"[ts-cleanup] no stale devices for '{target}'")
-    sys.exit(0)
-
-for did, host in matches:
-    if not did:
-        continue
-    del_req = urllib.request.Request(
-        f"https://api.tailscale.com/api/v2/device/{did}",
-        method="DELETE",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urllib.request.urlopen(del_req, timeout=15) as r:
-            r.read()
-        print(f"[ts-cleanup] deleted device id={did} hostname={host}")
-    except urllib.error.HTTPError as e:
-        print(f"[ts-cleanup] delete id={did} ({host}) failed: HTTP {e.code} {e.reason}")
-    except Exception as e:
-        print(f"[ts-cleanup] delete id={did} ({host}) failed: {e}")
+# Step 2: mint a single-use ephemeral pre-authorized key on the
+# tailnet the OAuth client belongs to ("-" is the magic alias).
+key_req = urllib.request.Request(
+    "https://api.tailscale.com/api/v2/tailnet/-/keys",
+    data=json.dumps({
+        "capabilities": {
+            "devices": {
+                "create": {
+                    "reusable": False,
+                    "ephemeral": True,
+                    "preauthorized": True,
+                    "tags": tags,
+                },
+            },
+        },
+        # 10 min — plenty of time for tailscale up to consume it.
+        "expirySeconds": 600,
+    }).encode("utf-8"),
+    method="POST",
+    headers={
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+    },
+)
+try:
+    with urllib.request.urlopen(key_req, timeout=20) as resp:
+        key_data = json.load(resp)
+except urllib.error.HTTPError as e:
+    body = e.read().decode("utf-8", errors="replace")[:300]
+    print(f"[ts-mint] auth key creation failed: HTTP {e.code} {e.reason}: {body}",
+          file=sys.stderr)
+    sys.exit(3)
+except Exception as e:
+    print(f"[ts-mint] auth key creation failed: {e}", file=sys.stderr)
+    sys.exit(3)
+key = key_data.get("key")
+if not key:
+    print(f"[ts-mint] auth key response missing 'key': {key_data!r}",
+          file=sys.stderr)
+    sys.exit(3)
+# Print only the key on stdout; diagnostics go to stderr.
+print(key)
 PYEOF
-        else
-            log "TAILSCALE_API_KEY/TAILSCALE_TAILNET not set — skipping stale device cleanup"
+        )"
+        if [ -z "${TS_AUTH_KEY}" ]; then
+            log "ERROR: failed to mint Tailscale auth key via OAuth — aborting boot"
+            exit 1
         fi
-
-        if timeout 30 tailscale up --auth-key="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}" --force-reauth 2>&1; then
-            log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
-            # Don't pass --tailscale to the server — pods serve plain HTTP.
-            # Tailscale provides the encrypted tunnel; tailscale serve (HTTPS)
-            # would break the RunPod proxy and http:// URLs used by the central server.
-
-            # ── Verify the actually-assigned Tailscale hostname.
-            # Even with --hostname=X, Tailscale may suffix the name
-            # if a stale device with that hostname still exists.
-            sleep 1
-            TS_STATUS_JSON="$(timeout 10 tailscale status --json 2>/dev/null || echo '{}')"
-            ACTUAL_HOST="$(echo "${TS_STATUS_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("Self") or {}).get("HostName",""))' 2>/dev/null || echo "")"
-            ACTUAL_DNS="$(echo "${TS_STATUS_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("Self") or {}).get("DNSName",""))' 2>/dev/null || echo "")"
-            log "Tailscale hostname: expected='${TS_HOSTNAME}' actual='${ACTUAL_HOST:-unknown}' dns='${ACTUAL_DNS:-unknown}'"
-            if [ -n "${ACTUAL_HOST}" ] && [ "${ACTUAL_HOST}" != "${TS_HOSTNAME}" ]; then
-                log "WARNING: Tailscale hostname drift detected — server URL resolution may rely on the API fallback"
-            fi
-        else
-            TS_EXIT=$?
-            log "WARNING: tailscale up failed (exit ${TS_EXIT}) — continuing without Tailscale"
-            # Dump tailscaled logs for debugging
-            tailscale bugreport 2>/dev/null || true
-        fi
+        log "Minted ephemeral auth key (single-use, ${TS_TAGS})"
     else
-        log "WARNING: Tailscale install failed — continuing without Tailscale"
+        TS_AUTH_KEY="${TAILSCALE_AUTH_KEY}"
     fi
+
+    # ── Join the tailnet. Bumped from 30s to 60s to ride out
+    # transient API hiccups on cold-booting hosts.
+    if ! timeout 60 tailscale up --auth-key="${TS_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --ssh --advertise-tags="${TS_TAGS}" --force-reauth 2>&1; then
+        TS_EXIT=$?
+        log "ERROR: tailscale up failed (exit ${TS_EXIT}) — pod cannot join tailnet, aborting boot"
+        # Dump tailscaled logs for debugging
+        tailscale bugreport 2>/dev/null || true
+        exit 1
+    fi
+    log "Tailscale up: $(tailscale ip -4 2>/dev/null || echo 'unknown')"
+    # Don't pass --tailscale to the server — pods serve plain HTTP.
+    # Tailscale provides the encrypted tunnel; tailscale serve (HTTPS)
+    # would break the RunPod proxy and http:// URLs used by the central server.
+
+    # ── Verify the actually-assigned Tailscale hostname. With ephemeral
+    # keys + state-wipe each boot, suffix collisions should not happen,
+    # but we still log for diagnostic visibility.
+    sleep 1
+    TS_STATUS_JSON="$(timeout 10 tailscale status --json 2>/dev/null || echo '{}')"
+    ACTUAL_HOST="$(echo "${TS_STATUS_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("Self") or {}).get("HostName",""))' 2>/dev/null || echo "")"
+    ACTUAL_DNS="$(echo "${TS_STATUS_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("Self") or {}).get("DNSName",""))' 2>/dev/null || echo "")"
+    log "Tailscale hostname: expected='${TS_HOSTNAME}' actual='${ACTUAL_HOST:-unknown}' dns='${ACTUAL_DNS:-unknown}'"
+    if [ -n "${ACTUAL_HOST}" ] && [ "${ACTUAL_HOST}" != "${TS_HOSTNAME}" ]; then
+        log "WARNING: Tailscale hostname drift detected — server URL resolution may rely on the API fallback"
+    fi
+else
+    log "No Tailscale credentials in env — skipping tailnet join"
 fi
 
 # ── 3. Create venv and install requirements ──────────────────────────

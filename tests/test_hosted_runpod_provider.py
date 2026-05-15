@@ -265,6 +265,157 @@ class TestRunPodProviderCreatePod:
 
 
 # ---------------------------------------------------------------------------
+# RunPodProvider — create_pod env vars (Tailscale auth flow selection)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def patched_creds(monkeypatch):
+    """Yield a setter function that patches every Tailscale config getter +
+    GITHUB_TOKEN + RunPod API key + provider config and returns a fresh
+    RunPodProvider whose `.api` is a MagicMock with create_pod returning
+    a stub pod. Caller passes the values to inject. All patches stay
+    active for the entire test, not just for the helper call.
+    """
+    def _setup(
+        *,
+        oauth_id: str = "",
+        oauth_secret: str = "",
+        static_key: str = "",
+        api_key: str = "",
+        tailnet: str = "",
+        github_token: str = "",
+    ) -> RunPodProvider:
+        # Patch source-module attributes; runpod_provider does
+        # ``from .config import ...`` inside the function body, so the
+        # binding is fresh on every call and resolves through the patched
+        # source.
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.get_tailscale_oauth_client_id",
+            lambda: oauth_id,
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.get_tailscale_oauth_client_secret",
+            lambda: oauth_secret,
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.get_tailscale_auth_key",
+            lambda: static_key,
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.get_tailscale_api_key",
+            lambda: api_key,
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.get_tailscale_tailnet",
+            lambda: tailnet,
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.runpod_provider.get_github_token",
+            lambda: github_token,
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.runpod_provider.get_runpod_api_key",
+            lambda: "rk_test",
+        )
+        monkeypatch.setattr(
+            "comfy_runner.hosted.runpod_provider.get_provider_config",
+            lambda _provider: {
+                "default_gpu": "NVIDIA L40S",
+                "default_datacenter": "US-KS-2",
+                "default_cloud_type": "SECURE",
+            },
+        )
+        prov = RunPodProvider()
+        prov.api = MagicMock()
+        prov.api.create_pod.return_value = {
+            "id": "p_test", "desiredStatus": "RUNNING",
+        }
+        return prov
+    return _setup
+
+
+class TestCreatePodTailscaleEnv:
+    def test_oauth_flow_injects_oauth_env(self, patched_creds):
+        prov = patched_creds(
+            oauth_id="kqygtKT9ABC",
+            oauth_secret="tskey-client-kqygtKT9-secret",
+            static_key="tskey-auth-legacy",  # Should be IGNORED in favor of OAuth.
+            api_key="tskey-api-legacy",
+            tailnet="example.ts.net",
+        )
+        prov.create_pod("ci-runner-1")
+
+        env = prov.api.create_pod.call_args[1]["env"]
+        # OAuth credentials present.
+        assert env["TAILSCALE_OAUTH_CLIENT_ID"] == "kqygtKT9ABC"
+        assert env["TAILSCALE_OAUTH_CLIENT_SECRET"] == "tskey-client-kqygtKT9-secret"
+        # Hostname always set.
+        assert env["TAILSCALE_HOSTNAME"] == "comfy-ci-runner-1"
+        # Static-key-flow vars are NOT injected when OAuth wins.
+        assert "TAILSCALE_AUTH_KEY" not in env
+        assert "TAILSCALE_API_KEY" not in env
+        assert "TAILSCALE_TAILNET" not in env
+
+    def test_static_flow_injects_legacy_env(self, patched_creds):
+        prov = patched_creds(
+            oauth_id="",
+            oauth_secret="",
+            static_key="tskey-auth-legacy",
+            api_key="tskey-api-legacy",
+            tailnet="example.ts.net",
+        )
+        prov.create_pod("ci-runner-2")
+
+        env = prov.api.create_pod.call_args[1]["env"]
+        assert env["TAILSCALE_AUTH_KEY"] == "tskey-auth-legacy"
+        assert env["TAILSCALE_API_KEY"] == "tskey-api-legacy"
+        assert env["TAILSCALE_TAILNET"] == "example.ts.net"
+        assert env["TAILSCALE_HOSTNAME"] == "comfy-ci-runner-2"
+        assert "TAILSCALE_OAUTH_CLIENT_ID" not in env
+        assert "TAILSCALE_OAUTH_CLIENT_SECRET" not in env
+
+    def test_partial_oauth_falls_back_to_static(self, patched_creds):
+        # Only OAuth client_id present (no secret) — must NOT use OAuth flow,
+        # falls back to static auth key if available.
+        prov = patched_creds(
+            oauth_id="kqygtKT9ABC",
+            oauth_secret="",  # Missing!
+            static_key="tskey-auth-legacy",
+        )
+        prov.create_pod("ci-runner-3")
+
+        env = prov.api.create_pod.call_args[1]["env"]
+        assert env["TAILSCALE_AUTH_KEY"] == "tskey-auth-legacy"
+        assert "TAILSCALE_OAUTH_CLIENT_ID" not in env
+
+    def test_no_tailscale_creds_no_tailscale_env(self, patched_creds):
+        prov = patched_creds()  # All Tailscale fields default to "".
+        prov.create_pod("ci-runner-4")
+
+        call_kwargs = prov.api.create_pod.call_args[1]
+        env = call_kwargs.get("env", {})
+        assert "TAILSCALE_HOSTNAME" not in env
+        assert "TAILSCALE_AUTH_KEY" not in env
+        assert "TAILSCALE_OAUTH_CLIENT_ID" not in env
+
+    def test_oauth_flow_omits_api_key_when_unset(self, patched_creds):
+        # OAuth flow doesn't need TAILSCALE_API_KEY/TAILSCALE_TAILNET
+        # because ephemeral devices auto-clean (no stale device cleanup needed).
+        prov = patched_creds(
+            oauth_id="id",
+            oauth_secret="secret",
+            api_key="",
+            tailnet="",
+        )
+        prov.create_pod("ci-runner-5")
+
+        env = prov.api.create_pod.call_args[1]["env"]
+        assert env["TAILSCALE_OAUTH_CLIENT_ID"] == "id"
+        assert "TAILSCALE_API_KEY" not in env
+        assert "TAILSCALE_TAILNET" not in env
+
+
+# ---------------------------------------------------------------------------
 # RunPodProvider — get_pod_url
 # ---------------------------------------------------------------------------
 

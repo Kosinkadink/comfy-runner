@@ -141,26 +141,54 @@ class RunPodProvider:
         github_token = get_github_token()
         if github_token:
             pod_env["GITHUB_TOKEN"] = github_token
-        # Pass Tailscale auth key for automatic tailnet join
+        # Pass Tailscale credentials for automatic tailnet join.
+        #
+        # Two flows are supported, in order of preference:
+        #
+        #   1. OAuth client (recommended) -- pod boots with OAuth client
+        #      credentials in its env and mints a fresh single-use
+        #      ephemeral auth key per boot via the Tailscale REST API.
+        #      Works across arbitrary pod stop/start cycles because the
+        #      key is generated fresh every time. See
+        #      https://tailscale.com/kb/1215/oauth-clients .
+        #
+        #   2. Static auth key (legacy / single-developer) -- pod uses a
+        #      pre-shared TAILSCALE_AUTH_KEY. If the key is single-use
+        #      (the Tailscale default) only the first boot succeeds; the
+        #      pod becomes unreachable after any stop/start cycle. Kept
+        #      as a fallback for backward compatibility.
         from .config import (
             get_tailscale_api_key,
             get_tailscale_auth_key,
+            get_tailscale_oauth_client_id,
+            get_tailscale_oauth_client_secret,
             get_tailscale_tailnet,
         )
+        ts_oauth_id = get_tailscale_oauth_client_id()
+        ts_oauth_secret = get_tailscale_oauth_client_secret()
         ts_auth_key = get_tailscale_auth_key()
-        if ts_auth_key:
-            pod_env["TAILSCALE_AUTH_KEY"] = ts_auth_key
-            # Use pod name as Tailscale hostname for easy identification
+        # Whether we're configuring tailscale at all (either flow).
+        ts_configured = bool((ts_oauth_id and ts_oauth_secret) or ts_auth_key)
+        if ts_configured:
+            # Use pod name as Tailscale hostname for easy identification.
             pod_env["TAILSCALE_HOSTNAME"] = f"comfy-{name}"
-            # Pass API key + tailnet so the pod can clean up its own
-            # stale device entry before joining (avoids -1, -2 suffixes
-            # when a pod with the same name was previously connected).
-            ts_api_key = get_tailscale_api_key()
-            ts_tailnet = get_tailscale_tailnet()
-            if ts_api_key:
-                pod_env["TAILSCALE_API_KEY"] = ts_api_key
-            if ts_tailnet:
-                pod_env["TAILSCALE_TAILNET"] = ts_tailnet
+            if ts_oauth_id and ts_oauth_secret:
+                pod_env["TAILSCALE_OAUTH_CLIENT_ID"] = ts_oauth_id
+                pod_env["TAILSCALE_OAUTH_CLIENT_SECRET"] = ts_oauth_secret
+            elif ts_auth_key:
+                pod_env["TAILSCALE_AUTH_KEY"] = ts_auth_key
+                # The static-key flow needs API key + tailnet so the
+                # pod can clean up its own stale device entry before
+                # joining (avoids -1, -2 hostname suffixes when a pod
+                # with the same name previously connected). The OAuth
+                # flow doesn't need this because each boot mints an
+                # ephemeral device that auto-disappears when offline.
+                ts_api_key = get_tailscale_api_key()
+                ts_tailnet = get_tailscale_tailnet()
+                if ts_api_key:
+                    pod_env["TAILSCALE_API_KEY"] = ts_api_key
+                if ts_tailnet:
+                    pod_env["TAILSCALE_TAILNET"] = ts_tailnet
         if env is not None:
             pod_env.update(env)
         if pod_env:
@@ -202,8 +230,8 @@ class RunPodProvider:
 
     def get_pod_tailscale_url(self, pod_name: str, port: int = 9189) -> str | None:
         """Return the Tailscale URL for a pod, or None if tailscale is not configured."""
-        from .config import get_tailscale_auth_key
-        if not get_tailscale_auth_key():
+        from .config import is_tailscale_configured
+        if not is_tailscale_configured():
             return None
         ts_domain = get_provider_config("runpod").get("tailscale_domain", "")
         if not ts_domain:
