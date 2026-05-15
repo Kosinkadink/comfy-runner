@@ -4706,6 +4706,29 @@ def create_app() -> Any:
         container_disk_gb = body.get("container_disk_gb")
         gpu_count = body.get("gpu_count", 1)
         env = body.get("env")
+        # Optional persistent network volume. If ``volume_size_gb`` is
+        # provided without an explicit ``volume_id``, the handler will
+        # find-or-create a volume named ``vol-<pod_name>`` in the
+        # requested ``datacenter`` and attach it. Models on the volume
+        # then survive a full pod termination (not just suspend/resume),
+        # which avoids re-downloading multi-GB checkpoints when a host
+        # has to be evicted due to capacity drought.
+        volume_id = body.get("volume_id")
+        raw_volume_size = body.get("volume_size_gb")
+        volume_size_gb: int | None = None
+        if raw_volume_size is not None:
+            try:
+                volume_size_gb = int(raw_volume_size)
+            except (TypeError, ValueError):
+                return _err("'volume_size_gb' must be an integer")
+            if volume_size_gb <= 0:
+                return _err("'volume_size_gb' must be > 0")
+        if volume_size_gb is not None and not volume_id and not datacenter:
+            return _err(
+                "'datacenter' is required when 'volume_size_gb' is set "
+                "without an explicit 'volume_id' "
+                "(network volumes are tied to a specific datacenter)"
+            )
         install_name = body.get("install", "main")
         install_err = _validate_pod_name(install_name)
         if install_err:
@@ -4771,22 +4794,82 @@ def create_app() -> Any:
                         rec = None
 
                 if not rec:
+                    # Find-or-create the named persistent volume so the
+                    # pod's /workspace survives a full pod termination
+                    # (and not just suspend/resume).
+                    resolved_volume_id = volume_id
+                    # The datacenter the pod will actually be created
+                    # in. If we reuse or attach to an existing volume,
+                    # the volume's datacenter wins (RunPod requires
+                    # dataCenterIds to match the volume's DC, otherwise
+                    # the create call fails).
+                    effective_datacenter = datacenter
+                    if volume_size_gb is not None and not resolved_volume_id:
+                        vol_name = f"vol-{name}"
+                        existing_vol = None
+                        try:
+                            for v in provider.list_volumes():
+                                if v.name == vol_name:
+                                    existing_vol = v
+                                    break
+                        except Exception as e:
+                            out(f"⚠ list_volumes failed ({e}); will create new volume.\n")
+                        if existing_vol:
+                            resolved_volume_id = existing_vol.id
+                            if (
+                                datacenter
+                                and existing_vol.datacenter
+                                and existing_vol.datacenter != datacenter
+                            ):
+                                out(
+                                    f"⚠ Existing volume '{vol_name}' is in "
+                                    f"datacenter '{existing_vol.datacenter}' "
+                                    f"(requested '{datacenter}'); pod will be "
+                                    f"pinned to the volume's datacenter.\n"
+                                )
+                            if existing_vol.datacenter:
+                                effective_datacenter = existing_vol.datacenter
+                            out(
+                                f"Reusing existing volume '{vol_name}' "
+                                f"(id: {resolved_volume_id}, "
+                                f"{existing_vol.size_gb} GB, "
+                                f"datacenter: {existing_vol.datacenter})\n"
+                            )
+                        else:
+                            out(
+                                f"Creating volume '{vol_name}' "
+                                f"({volume_size_gb} GB, datacenter: "
+                                f"{datacenter})...\n"
+                            )
+                            new_vol = provider.create_volume(
+                                name=vol_name,
+                                size_gb=volume_size_gb,
+                                datacenter=datacenter,
+                            )
+                            resolved_volume_id = new_vol.id
+                            if new_vol.datacenter:
+                                effective_datacenter = new_vol.datacenter
+                            out(
+                                f"Volume created (id: {resolved_volume_id})\n"
+                            )
+
                     out(f"Creating ci-runner pod '{name}'...\n")
                     pod = provider.create_pod(
                         name=name,
                         gpu_type=gpu_type,
                         image=image,
+                        volume_id=resolved_volume_id,
                         container_disk_gb=container_disk_gb,
-                        datacenter=datacenter,
+                        datacenter=effective_datacenter,
                         cloud_type=cloud_type,
                         gpu_count=gpu_count,
                         env=env,
                     )
                     created_new = True
-                    set_pod_record("runpod", name, {
+                    new_record: dict[str, Any] = {
                         "id": pod.id,
                         "gpu_type": pod.gpu_type,
-                        "datacenter": pod.datacenter,
+                        "datacenter": pod.datacenter or effective_datacenter,
                         "image": pod.image,
                         "purpose": "ci-runner",
                         "suites": list(suites),
@@ -4794,7 +4877,12 @@ def create_app() -> Any:
                         "idle_timeout_s": idle_timeout_s,
                         "created_at": int(time.time()),
                         "last_active_at": int(time.time()),
-                    })
+                    }
+                    if resolved_volume_id:
+                        new_record["volume_id"] = resolved_volume_id
+                    if volume_size_gb is not None:
+                        new_record["volume_size_gb"] = volume_size_gb
+                    set_pod_record("runpod", name, new_record)
                     out(
                         f"Pod created (id: {pod.id}, {pod.gpu_type}, "
                         f"${pod.cost_per_hr}/hr)\n"
