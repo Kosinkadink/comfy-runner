@@ -246,7 +246,17 @@ def download_models(
         "errors": [],
     }
     total = len(models)
-    staging_tmpdir = tempfile.mkdtemp(prefix="comfy-dl-staging-")
+    # Stage downloads on the same filesystem as ``models_dir`` so the
+    # final ``os.replace`` is atomic (cross-fs rename falls back to a
+    # full copy), AND so we don't fill up the default ``/tmp`` tmpfs.
+    # On RunPod containers ``/tmp`` is a tiny tmpfs (~80 MB), which
+    # caused every download larger than that to fail with
+    # ``[Errno 28] No space left on device`` -- even though
+    # ``models_dir`` lives on a multi-TB network volume.
+    models_dir.mkdir(parents=True, exist_ok=True)
+    staging_tmpdir = tempfile.mkdtemp(
+        prefix="comfy-dl-staging-", dir=str(models_dir),
+    )
     staging_dir = Path(staging_tmpdir)
 
     try:
