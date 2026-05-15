@@ -1722,9 +1722,39 @@ _ROUTES: list[dict[str, Any]] = [
                             },
                             "gpu_type": {"type": "string"},
                             "image": {"type": "string"},
-                            "datacenter": {"type": "string"},
+                            "datacenter": {
+                                "type": "string",
+                                "description": (
+                                    "Datacenter ID (e.g. 'US-IL-1', 'EU-CZ-1'). "
+                                    "REQUIRED when 'volume_size_gb' is set without "
+                                    "an explicit 'volume_id', because network "
+                                    "volumes are tied to a specific datacenter."
+                                ),
+                            },
                             "cloud_type": {"type": "string"},
                             "container_disk_gb": {"type": "integer", "description": "Container disk size in GB (caller chooses based on union of suite model sizes)"},
+                            "volume_id": {
+                                "type": "string",
+                                "description": (
+                                    "Attach an existing network volume by ID "
+                                    "(skips the find-or-create flow). The pod "
+                                    "is automatically pinned to that volume's "
+                                    "datacenter."
+                                ),
+                            },
+                            "volume_size_gb": {
+                                "type": "integer",
+                                "description": (
+                                    "Find-or-create a persistent network volume "
+                                    "named 'vol-<name>' in the requested "
+                                    "'datacenter' at this size, mount it at "
+                                    "/workspace, and persist its volume_id on "
+                                    "the pod record. Skipped if 'volume_id' is "
+                                    "given. With a named volume, models on "
+                                    "/workspace survive a full pod termination "
+                                    "(not just suspend/resume)."
+                                ),
+                            },
                             "gpu_count": {"type": "integer", "default": 1},
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
                             "install": {"type": "string", "default": "main"},
