@@ -20,21 +20,25 @@ SERVER_PORT="${COMFY_RUNNER_PORT:-9189}"
 
 log() { echo "[comfy-runner] $(date '+%H:%M:%S') $*"; }
 
-# ── 0. Persist download cache on volume (if mounted) ─────────────────
-# Installations run on fast container disk (~/.comfy-runner/installations/).
-# Only the download cache (large .7z archives) is symlinked to the volume
-# so re-downloads are avoided across pod stop/restart/terminate cycles.
+# ── 0. Persist comfy-runner state on volume (if mounted) ─────────────
+# RunPod stop/start wipes the entire container rootfs and reschedules
+# the pod onto a fresh host, so anything in $HOME (installations,
+# config.json, port-locks, downloaded model cache) is lost on resume.
+# Only /workspace survives — RunPod auto-allocates an ephemeral volume
+# there whenever ``volumeMountPath`` is set on the pod, which the
+# provider does unconditionally.
+#
+# Point COMFY_RUNNER_HOME at /workspace/.comfy-runner so that EVERY
+# subsystem (config, installations dir, cache, bin, port-locks, tunnel
+# state, tailscale-serves) lives on the persistent volume. Single
+# env var, no symlink dance — comfy_runner.config reads
+# COMFY_RUNNER_HOME on import and every other module derives off the
+# resulting CONFIG_DIR.
 
 if [ -d "/workspace" ] && [ -w "/workspace" ]; then
-    CACHE_ON_VOLUME="/workspace/.comfy-runner/cache"
-    LOCAL_CACHE="${HOME}/.comfy-runner/cache"
-    mkdir -p "${CACHE_ON_VOLUME}"
-    mkdir -p "$(dirname "${LOCAL_CACHE}")"
-    if [ ! -L "${LOCAL_CACHE}" ]; then
-        rm -rf "${LOCAL_CACHE}"
-        ln -s "${CACHE_ON_VOLUME}" "${LOCAL_CACHE}"
-        log "Download cache linked to volume: ${LOCAL_CACHE} → ${CACHE_ON_VOLUME}"
-    fi
+    export COMFY_RUNNER_HOME="/workspace/.comfy-runner"
+    mkdir -p "${COMFY_RUNNER_HOME}"
+    log "comfy-runner state on volume: COMFY_RUNNER_HOME=${COMFY_RUNNER_HOME}"
 fi
 
 # ── 1. Ensure native 7z is available (fast extraction) ───────────────
