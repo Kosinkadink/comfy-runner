@@ -136,6 +136,51 @@ def get_tailscale_api_key() -> str:
     return get_provider_config("runpod").get("tailscale_api_key", "")
 
 
+def get_tailscale_oauth_client_id() -> str:
+    """Get Tailscale OAuth client ID for minting per-pod ephemeral auth keys.
+
+    When set together with ``tailscale_oauth_client_secret``, pods boot
+    with the OAuth credentials in their env and mint a fresh single-use
+    ephemeral auth key on every boot via the Tailscale REST API. This
+    is the recommended pattern for ephemeral container nodes (see
+    https://tailscale.com/kb/1215/oauth-clients) and lets pods survive
+    arbitrary stop/start cycles without consuming a static auth key.
+
+    Read from env var ``TAILSCALE_OAUTH_CLIENT_ID`` first, then provider
+    config key ``tailscale_oauth_client_id``.
+    """
+    val = os.environ.get("TAILSCALE_OAUTH_CLIENT_ID", "")
+    if val:
+        return val
+    return get_provider_config("runpod").get("tailscale_oauth_client_id", "")
+
+
+def get_tailscale_oauth_client_secret() -> str:
+    """Get Tailscale OAuth client secret. Companion to :func:`get_tailscale_oauth_client_id`.
+
+    Read from env var ``TAILSCALE_OAUTH_CLIENT_SECRET`` first, then
+    provider config key ``tailscale_oauth_client_secret``.
+    """
+    val = os.environ.get("TAILSCALE_OAUTH_CLIENT_SECRET", "")
+    if val:
+        return val
+    return get_provider_config("runpod").get("tailscale_oauth_client_secret", "")
+
+
+def is_tailscale_configured() -> bool:
+    """Return True if any Tailscale auth flow is configured.
+
+    Either the OAuth client (preferred) or the static auth key (legacy)
+    counts as "configured" for the purposes of pod URL resolution and
+    enabling tailnet-based features.
+    """
+    if get_tailscale_oauth_client_id() and get_tailscale_oauth_client_secret():
+        return True
+    if get_tailscale_auth_key():
+        return True
+    return False
+
+
 def get_tailscale_tailnet() -> str:
     """Get Tailscale tailnet name (e.g. ``example.com`` or ``-``).
 

@@ -8,7 +8,11 @@ from comfy_runner.hosted.config import (
     get_hosted_config,
     get_provider_config,
     get_runpod_api_key,
+    get_tailscale_auth_key,
+    get_tailscale_oauth_client_id,
+    get_tailscale_oauth_client_secret,
     get_volume_config,
+    is_tailscale_configured,
     list_volume_configs,
     remove_volume_config,
     set_provider_config,
@@ -141,3 +145,88 @@ class TestRunpodApiKey:
         monkeypatch.setenv("RUNPOD_API_KEY", "")
         set_provider_config("runpod", {"api_key": "cfg"})
         assert get_runpod_api_key() == "cfg"
+
+
+# ---------------------------------------------------------------------------
+# Tailscale OAuth client credentials — env → config fallback
+# ---------------------------------------------------------------------------
+
+class TestTailscaleOAuthCreds:
+    def test_client_id_env_var_takes_precedence(self, tmp_config_dir, monkeypatch):
+        set_provider_config("runpod", {"tailscale_oauth_client_id": "cfg-id"})
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_ID", "env-id")
+        assert get_tailscale_oauth_client_id() == "env-id"
+
+    def test_client_id_falls_back_to_config(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_ID", raising=False)
+        set_provider_config("runpod", {"tailscale_oauth_client_id": "cfg-id"})
+        assert get_tailscale_oauth_client_id() == "cfg-id"
+
+    def test_client_id_returns_empty_when_neither_set(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_ID", raising=False)
+        assert get_tailscale_oauth_client_id() == ""
+
+    def test_client_secret_env_var_takes_precedence(self, tmp_config_dir, monkeypatch):
+        set_provider_config("runpod", {"tailscale_oauth_client_secret": "cfg-secret"})
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_SECRET", "env-secret")
+        assert get_tailscale_oauth_client_secret() == "env-secret"
+
+    def test_client_secret_falls_back_to_config(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_SECRET", raising=False)
+        set_provider_config("runpod", {"tailscale_oauth_client_secret": "cfg-secret"})
+        assert get_tailscale_oauth_client_secret() == "cfg-secret"
+
+    def test_client_secret_returns_empty_when_neither_set(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_SECRET", raising=False)
+        assert get_tailscale_oauth_client_secret() == ""
+
+
+# ---------------------------------------------------------------------------
+# is_tailscale_configured — accepts either OAuth or static auth key
+# ---------------------------------------------------------------------------
+
+class TestIsTailscaleConfigured:
+    def test_returns_false_when_nothing_set(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_ID", raising=False)
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("TAILSCALE_AUTH_KEY", raising=False)
+        assert is_tailscale_configured() is False
+
+    def test_returns_true_with_static_auth_key(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_ID", raising=False)
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("TAILSCALE_AUTH_KEY", "tskey-auth-foo")
+        assert is_tailscale_configured() is True
+
+    def test_returns_true_with_oauth_pair(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_AUTH_KEY", raising=False)
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_ID", "id")
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_SECRET", "secret")
+        assert is_tailscale_configured() is True
+
+    def test_returns_false_with_only_oauth_id(self, tmp_config_dir, monkeypatch):
+        # An incomplete OAuth pair must not count as configured.
+        monkeypatch.delenv("TAILSCALE_AUTH_KEY", raising=False)
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_ID", "id")
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_SECRET", raising=False)
+        assert is_tailscale_configured() is False
+
+    def test_returns_false_with_only_oauth_secret(self, tmp_config_dir, monkeypatch):
+        monkeypatch.delenv("TAILSCALE_AUTH_KEY", raising=False)
+        monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_ID", raising=False)
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_SECRET", "secret")
+        assert is_tailscale_configured() is False
+
+    def test_oauth_pair_takes_precedence_over_static_in_resolution(
+        self, tmp_config_dir, monkeypatch,
+    ):
+        # Both flows present: is_tailscale_configured returns True regardless,
+        # but downstream code (runpod_provider.create_pod) prefers OAuth.
+        monkeypatch.setenv("TAILSCALE_AUTH_KEY", "tskey-auth-foo")
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_ID", "id")
+        monkeypatch.setenv("TAILSCALE_OAUTH_CLIENT_SECRET", "secret")
+        assert is_tailscale_configured() is True
+        # And both individual getters work.
+        assert get_tailscale_auth_key() == "tskey-auth-foo"
+        assert get_tailscale_oauth_client_id() == "id"
+        assert get_tailscale_oauth_client_secret() == "secret"

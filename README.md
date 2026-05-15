@@ -401,6 +401,13 @@ comfy_runner.py hosted config show
 comfy_runner.py hosted config set runpod.default_gpu "NVIDIA A100 80GB"
 comfy_runner.py hosted config set runpod.default_datacenter EU-RO-1
 
+# Configure Tailscale (REQUIRED for pods to be reachable -- pods are
+# Tailscale-only, no public RunPod proxy). See "Tailscale auth on pods"
+# below for the recommended OAuth flow vs the legacy static auth key.
+comfy_runner.py hosted config set runpod.tailscale_oauth_client_id <client-id>
+comfy_runner.py hosted config set runpod.tailscale_oauth_client_secret <client-secret>
+comfy_runner.py hosted config set runpod.tailscale_domain <tailnet>.ts.net
+
 # Create a network volume
 comfy_runner.py hosted volume create --name workspace --size 50 --region US-KS-2
 
@@ -462,6 +469,22 @@ The pod runs a thin Docker image (`ghcr.io/kosinkadink/comfy-runner:latest`) tha
 **Persistent cache:** When a network volume is mounted at `/workspace`, the startup script symlinks the download cache (`~/.comfy-runner/cache/`) to the volume. This avoids re-downloading the ~2.7GB standalone environment on each pod lifecycle. Installations and ComfyUI itself run on the fast container disk (NVMe) for best performance.
 
 **CUDA compatibility:** The standalone environment bundles PyTorch built for CUDA 13.0, which requires NVIDIA driver ≥ 580. Many cloud hosts have older drivers. Pass `--cuda-compat` to `init` (or `"cuda_compat": true` in the deploy API) to auto-detect the host driver and reinstall PyTorch with a compatible CUDA version. Pod creation filters for hosts with CUDA ≥ 12.4 by default (override with `--cuda-versions`).
+
+#### Tailscale auth on pods
+
+Pods are reachable from the central server only via the Tailscale tunnel (no public RunPod proxy), so every pod must successfully join the tailnet on every boot. Two flows are supported:
+
+**OAuth client (recommended).** Set `runpod.tailscale_oauth_client_id` and `runpod.tailscale_oauth_client_secret` in the hosted config. On every pod boot the startup script exchanges the OAuth credentials for a bearer token and mints a fresh **single-use ephemeral pre-authorized auth key** via the Tailscale REST API, then runs `tailscale up` with that key. Each boot gets a brand-new key and a brand-new ephemeral device, so arbitrary stop/start cycles work indefinitely without consuming a static key. To set this up:
+
+1. In the [Tailscale admin → OAuth clients](https://login.tailscale.com/admin/settings/oauth) page, create a new OAuth client with **only** the `Auth Keys` scope set to **Write**, scoped to the tag your pods will use (default: `tag:runpod`).
+2. Copy the client ID and client secret (the secret is shown only once).
+3. Set them on the central server: `comfy_runner.py hosted config set runpod.tailscale_oauth_client_id <id>` and `... runpod.tailscale_oauth_client_secret <secret>`.
+
+The OAuth flow is the canonical [Tailscale-recommended pattern for ephemeral container nodes](https://tailscale.com/kb/1215/oauth-clients).
+
+**Static auth key (legacy fallback).** If `runpod.tailscale_auth_key` is set and the OAuth credentials are not, pods reuse the same static key on every boot. This only works reliably if the key is configured as **Reusable** in the Tailscale admin — the default single-use ephemeral key will succeed on the first pod boot and then silently fail on every subsequent boot, leaving an unreachable RUNNING pod. Kept for backwards compatibility with single-developer setups.
+
+**Fail-loud:** if either flow fails to bring tailscale up, the pod startup script exits non-zero so RunPod surfaces a crashed container instead of leaving an unreachable RUNNING zombie. Check the RunPod web UI's container logs for `[comfy-runner] ... ERROR: ...` lines.
 
 The hosted module lives under `comfy_runner/hosted/` and provides:
 
