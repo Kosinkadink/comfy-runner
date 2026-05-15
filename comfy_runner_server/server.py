@@ -438,7 +438,7 @@ _TRANSIENT_START_ERROR_SUBSTRINGS = (
     "not enough free GPUs",
     "Failed to resume pod",
 )
-DEFAULT_START_RETRIES = 2
+DEFAULT_START_RETRIES = 5
 DEFAULT_START_RETRY_DELAY_S = 30
 
 # Orphan reconciliation -- safety net for pods that exist on RunPod but
@@ -3841,7 +3841,9 @@ def create_app() -> Any:
                     if pod and pod.status not in ("TERMINATED", "EXITED"):
                         if pod.status != "RUNNING":
                             out(f"Pod '{name}' exists but is {pod.status}, starting...\n")
-                            provider.start_pod(rec["id"])
+                            _start_pod_with_retry(
+                                provider, rec["id"], send_output=out,
+                            )
                         else:
                             out(f"Pod '{name}' already running.\n")
                         if wait_ready:
@@ -3965,7 +3967,9 @@ def create_app() -> Any:
                     return
                 if pod.status != "RUNNING":
                     out(f"Pod is {pod.status}, starting...\n")
-                    provider.start_pod(pod_id)
+                    _start_pod_with_retry(
+                        provider, pod_id, send_output=out,
+                    )
 
                 _touch_pod_activity(name)
                 server_url = _get_pod_server_url(name)
@@ -4160,7 +4164,9 @@ def create_app() -> Any:
                     return
                 if pod.status != "RUNNING":
                     out(f"Pod was {pod.status} — auto-waking...\n")
-                    provider.start_pod(pod_id)
+                    _start_pod_with_retry(
+                        provider, pod_id, send_output=out,
+                    )
                 else:
                     out("Pod is RUNNING.\n")
 
@@ -4352,6 +4358,16 @@ def create_app() -> Any:
 
         body = request.get_json(silent=True) or {}
         wait_ready = body.get("wait_ready", True)
+        try:
+            start_retries = int(body.get("start_retries", DEFAULT_START_RETRIES))
+        except (TypeError, ValueError):
+            return _err("start_retries must be an integer")
+        try:
+            start_retry_delay_s = int(
+                body.get("start_retry_delay_s", DEFAULT_START_RETRY_DELAY_S)
+            )
+        except (TypeError, ValueError):
+            return _err("start_retry_delay_s must be an integer")
 
         job_id = _jobs.create(label=f"pod start {name}")
 
@@ -4364,7 +4380,11 @@ def create_app() -> Any:
             try:
                 provider = _get_runpod_provider()
                 out(f"Starting pod '{name}'...\n")
-                provider.start_pod(rec["id"])
+                _start_pod_with_retry(
+                    provider, rec["id"], send_output=out,
+                    max_retries=start_retries,
+                    retry_delay_s=start_retry_delay_s,
+                )
 
                 if wait_ready:
                     server_url = _wait_for_pod_server(name, send_output=out)
@@ -4589,7 +4609,9 @@ def create_app() -> Any:
                     update_pod_record("runpod", name, _refresh_meta)
                     if pod and pod.status != "RUNNING":
                         out(f"Pod '{name}' is {pod.status}, starting...\n")
-                        provider.start_pod(rec["id"])
+                        _start_pod_with_retry(
+                            provider, rec["id"], send_output=out,
+                        )
                     else:
                         out(f"Pod '{name}' is already RUNNING.\n")
 
