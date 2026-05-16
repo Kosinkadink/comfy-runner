@@ -14,8 +14,24 @@ from typing import Any
 CONFIG_DIR = Path(os.environ.get("COMFY_RUNNER_HOME", Path.home() / ".comfy-runner"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-# Default shared directory matches ComfyUI Desktop 2.0 (~/ComfyUI-Shared)
-DEFAULT_SHARED_DIR = str(Path.home() / "ComfyUI-Shared")
+
+def _default_shared_dir() -> str:
+    """Return the default shared directory path.
+
+    When COMFY_RUNNER_HOME is explicitly set (e.g. on RunPod where it points
+    at the persistent network volume ``/workspace/.comfy-runner``), place
+    ``ComfyUI-Shared`` as a sibling on that same filesystem instead of under
+    ``$HOME``, which on RunPod is the small container rootfs and quickly
+    fills up during model downloads.
+
+    Otherwise default to ``~/ComfyUI-Shared`` to match ComfyUI Desktop 2.0.
+    """
+    if "COMFY_RUNNER_HOME" in os.environ:
+        return str(CONFIG_DIR.parent / "ComfyUI-Shared")
+    return str(Path.home() / "ComfyUI-Shared")
+
+
+DEFAULT_SHARED_DIR = _default_shared_dir()
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "installations_dir": str(CONFIG_DIR / "installations"),

@@ -80,6 +80,27 @@ class TestSharedDir:
         set_shared_dir("/mnt/shared")
         assert get_shared_dir() == "/mnt/shared"
 
+    def test_default_follows_comfy_runner_home(self, tmp_path, monkeypatch):
+        """When COMFY_RUNNER_HOME is set, shared dir defaults to a sibling on
+        the same filesystem (so on RunPod it lands on /workspace alongside
+        /workspace/.comfy-runner rather than on the tiny container rootfs)."""
+        import comfy_runner.config as cfg_mod
+
+        runner_home = tmp_path / ".comfy-runner"
+        monkeypatch.setenv("COMFY_RUNNER_HOME", str(runner_home))
+        monkeypatch.setattr(cfg_mod, "CONFIG_DIR", runner_home)
+        monkeypatch.setattr(cfg_mod, "CONFIG_FILE", runner_home / "config.json")
+
+        assert cfg_mod._default_shared_dir() == str(tmp_path / "ComfyUI-Shared")
+
+    def test_default_without_comfy_runner_home(self, monkeypatch):
+        """Without COMFY_RUNNER_HOME, default stays at ~/ComfyUI-Shared."""
+        from pathlib import Path
+        import comfy_runner.config as cfg_mod
+
+        monkeypatch.delenv("COMFY_RUNNER_HOME", raising=False)
+        assert cfg_mod._default_shared_dir() == str(Path.home() / "ComfyUI-Shared")
+
 
 class TestGithubToken:
     def test_env_var(self, tmp_config_dir, monkeypatch):
