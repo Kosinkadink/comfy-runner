@@ -570,6 +570,106 @@ def _test_pod_ttl_remaining(rec: dict[str, Any]) -> int | None:
     return max(0, ttl - int(time.time() - int(last)))
 
 
+# Pod purposes for which ``_ensure_pod_running`` may *terminate +
+# recreate* a stuck pod (after start retries are exhausted with a
+# transient capacity error) when the pod has a ``volume_id`` on its
+# record. The recreate gives RunPod a chance to place the pod on a
+# fresh host, and the named network volume preserves ``/workspace``
+# (cached models, deployments) across the cycle.
+#
+# Restricted to ``ci-runner`` for now -- ``persistent`` pods may have
+# unsaved dev state on the ephemeral container disk, and ``pr`` pods
+# don't currently set up named volumes.
+_RECREATE_ON_STUCK_PURPOSES = ("ci-runner",)
+
+
+def _recreate_pod_for_capacity(
+    name: str,
+    send_output: Callable[[str], None] | None = None,
+) -> Any:
+    """Terminate + recreate a pod with the same identity and reattach
+    its network volume so RunPod re-places it on a fresh host.
+
+    Used as a last-resort fallback by ``_ensure_pod_running`` when the
+    underlying ``_start_pod_with_retry`` exhausts its retries on
+    transient capacity errors -- the host that previously ran the
+    suspended pod has lost its free GPUs, and RunPod's resume path
+    keeps re-trying the same host. A full terminate forces RunPod to
+    pick a new host on the next ``create_pod`` call.
+
+    Only safe when the pod has a ``volume_id`` on its record. The
+    volume preserves ``/workspace`` (where ``COMFY_RUNNER_HOME`` lives,
+    so installations and downloaded models survive). Without a volume
+    the pod's container disk would be wiped and we'd silently lose the
+    cached state -- callers must enforce this precondition before
+    calling.
+
+    Updates the pod record in-place (new pod id, refreshed metadata)
+    and returns the new ``PodInfo``.
+    """
+    from comfy_runner.hosted.config import (
+        get_pod_record,
+        update_pod_record,
+    )
+
+    out = send_output or (lambda _: None)
+    rec = get_pod_record("runpod", name)
+    if not rec:
+        raise RuntimeError(f"Pod '{name}' not found in config")
+    volume_id = rec.get("volume_id")
+    if not volume_id:
+        raise RuntimeError(
+            f"Pod '{name}' has no volume_id on its record; "
+            f"cannot safely terminate + recreate (would wipe "
+            f"/workspace cache)"
+        )
+    provider = _get_runpod_provider()
+    old_id = rec["id"]
+    out(
+        f"Terminating pod '{name}' (id: {old_id}) for fresh host "
+        f"placement -- network volume '{volume_id}' preserves "
+        f"/workspace data...\n"
+    )
+    try:
+        provider.terminate_pod(old_id)
+    except Exception as e:
+        # Pod may already be gone; continue. Worst case we leak a
+        # billed pod -- the orphan reconciler will clean it up.
+        out(f"  terminate raised: {e} (continuing)\n")
+
+    out(f"Recreating pod '{name}' on a fresh host...\n")
+    new_pod = provider.create_pod(
+        name=name,
+        gpu_type=rec.get("gpu_type"),
+        image=rec.get("image"),
+        volume_id=volume_id,
+        container_disk_gb=rec.get("container_disk_gb"),
+        datacenter=rec.get("datacenter") or None,
+        cloud_type=rec.get("cloud_type"),
+    )
+
+    def _apply(r: dict[str, Any] | None) -> dict[str, Any] | None:
+        if r is None:
+            return None
+        r["id"] = new_pod.id
+        if new_pod.gpu_type:
+            r["gpu_type"] = new_pod.gpu_type
+        if new_pod.datacenter:
+            r["datacenter"] = new_pod.datacenter
+        if new_pod.image:
+            r["image"] = new_pod.image
+        r["last_active_at"] = int(time.time())
+        r.pop("status_hint", None)
+        return r
+
+    update_pod_record("runpod", name, _apply)
+    out(
+        f"Recreated (id: {new_pod.id}, datacenter: "
+        f"{new_pod.datacenter or '(unknown)'})\n"
+    )
+    return new_pod
+
+
 def _ensure_pod_running(
     name: str,
     send_output: Callable[[str], None] | None = None,
@@ -577,6 +677,7 @@ def _ensure_pod_running(
     pod_ready_timeout_s: int | None = None,
     start_retries: int = DEFAULT_START_RETRIES,
     start_retry_delay_s: int = DEFAULT_START_RETRY_DELAY_S,
+    recreate_on_stuck: bool = True,
 ) -> str:
     """Start a stopped/exited pod and (optionally) wait for its server.
 
@@ -588,6 +689,13 @@ def _ensure_pod_running(
     loop. ``start_retries`` / ``start_retry_delay_s`` configure
     retries on transient RunPod resume errors (capacity-exhausted
     host re-placement); see ``_start_pod_with_retry``.
+
+    If ``recreate_on_stuck`` is True (the default) and start retries
+    *still* exhaust with a transient capacity error AND the pod has a
+    ``volume_id`` on its record AND its ``purpose`` is in
+    ``_RECREATE_ON_STUCK_PURPOSES``, the pod is terminated and recreated
+    on a fresh host (the network volume preserves ``/workspace``).
+    See ``_recreate_pod_for_capacity``.
     """
     from comfy_runner.hosted.config import get_pod_record
     out = send_output or (lambda _: None)
@@ -603,11 +711,27 @@ def _ensure_pod_running(
         # EXITED pods can be started by RunPod's start API; fall through.
     if pod and pod.status != "RUNNING":
         out(f"Pod '{name}' is {pod.status}, starting...\n")
-        _start_pod_with_retry(
-            provider, pod_id, send_output=out,
-            max_retries=start_retries,
-            retry_delay_s=start_retry_delay_s,
-        )
+        try:
+            _start_pod_with_retry(
+                provider, pod_id, send_output=out,
+                max_retries=start_retries,
+                retry_delay_s=start_retry_delay_s,
+            )
+        except Exception as e:
+            should_recreate = (
+                recreate_on_stuck
+                and _is_transient_start_error(e)
+                and rec.get("volume_id")
+                and rec.get("purpose") in _RECREATE_ON_STUCK_PURPOSES
+            )
+            if not should_recreate:
+                raise
+            out(
+                f"Start retries exhausted ({e}); pod has a network "
+                f"volume -- attempting terminate + recreate for fresh "
+                f"host placement...\n"
+            )
+            _recreate_pod_for_capacity(name, send_output=out)
     _touch_pod_activity(name)
     if wait_ready:
         timeout = pod_ready_timeout_s or DEFAULT_POD_READY_TIMEOUT_S
@@ -4378,25 +4502,30 @@ def create_app() -> Any:
                 _jobs.fail(job_id, f"Pod '{name}' is busy", lines)
                 return
             try:
-                provider = _get_runpod_provider()
                 out(f"Starting pod '{name}'...\n")
-                _start_pod_with_retry(
-                    provider, rec["id"], send_output=out,
-                    max_retries=start_retries,
-                    retry_delay_s=start_retry_delay_s,
+                # ``_ensure_pod_running`` wraps ``_start_pod_with_retry``
+                # and additionally falls back to terminate+recreate (on
+                # the same network volume) when the pod is stuck on a
+                # capacity-exhausted host. The recreate-on-stuck branch
+                # only triggers for ``ci-runner`` pods that have a
+                # ``volume_id`` on their record; other pod types behave
+                # exactly as before.
+                server_url = _ensure_pod_running(
+                    name,
+                    send_output=out,
+                    wait_ready=wait_ready,
+                    start_retries=start_retries,
+                    start_retry_delay_s=start_retry_delay_s,
                 )
 
-                if wait_ready:
-                    server_url = _wait_for_pod_server(name, send_output=out)
-                else:
-                    server_url = _get_pod_server_url(
-                        name, raise_on_error=False,
-                    ) or ""
-
-                _touch_pod_activity(name)
+                # ``_ensure_pod_running`` may have updated the pod id
+                # via ``_recreate_pod_for_capacity``; re-read the
+                # record so the response reflects the live id.
+                from comfy_runner.hosted.config import get_pod_record
+                fresh_rec = get_pod_record("runpod", name) or rec
                 _jobs.finish(job_id, {
                     "name": name,
-                    "id": rec["id"],
+                    "id": fresh_rec.get("id", rec["id"]),
                     "status": "RUNNING",
                     "server_url": server_url,
                 }, lines)
