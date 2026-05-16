@@ -133,8 +133,21 @@ def set_tunnel_config(provider: str, data: dict[str, Any]) -> None:
 def get_shared_dir() -> str:
     """Return the configured shared directory path.
 
-    Defaults to ``~/ComfyUI-Shared`` to match ComfyUI Desktop 2.0.
+    Resolution order:
+
+    1. ``COMFY_RUNNER_SHARED_DIR`` env var, if set. Explicit override
+       that wins over a persisted config value — useful when the
+       persisted ``shared_dir`` is stale (e.g. an existing RunPod pod
+       whose ``config.json`` was written before COMFY_RUNNER_HOME was
+       respected and still points at ``/root/ComfyUI-Shared`` on the
+       small container rootfs).
+    2. ``shared_dir`` from ``config.json``.
+    3. ``DEFAULT_SHARED_DIR`` (``~/ComfyUI-Shared``, or a sibling of
+       ``COMFY_RUNNER_HOME`` when that env var is set).
     """
+    env_override = os.environ.get("COMFY_RUNNER_SHARED_DIR")
+    if env_override:
+        return env_override
     config = load_config()
     return config.get("shared_dir", DEFAULT_SHARED_DIR)
 

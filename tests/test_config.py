@@ -101,6 +101,31 @@ class TestSharedDir:
         monkeypatch.delenv("COMFY_RUNNER_HOME", raising=False)
         assert cfg_mod._default_shared_dir() == str(Path.home() / "ComfyUI-Shared")
 
+    def test_env_override_wins_over_config(self, tmp_config_dir, monkeypatch):
+        """COMFY_RUNNER_SHARED_DIR env var overrides a persisted shared_dir.
+
+        This is the migration path for existing RunPod ci-runner pods
+        whose config.json still has shared_dir='/root/ComfyUI-Shared'
+        from a boot that predates the COMFY_RUNNER_HOME-aware default.
+        """
+        # Persist a value that would otherwise win.
+        set_shared_dir("/root/ComfyUI-Shared")
+        assert get_shared_dir() == "/root/ComfyUI-Shared"
+
+        # Now point the env var at a different location -- it should win.
+        monkeypatch.setenv("COMFY_RUNNER_SHARED_DIR", "/workspace/ComfyUI-Shared")
+        assert get_shared_dir() == "/workspace/ComfyUI-Shared"
+
+        # Persisted value must not have been modified by the read.
+        cfg = load_config()
+        assert cfg["shared_dir"] == "/root/ComfyUI-Shared"
+
+    def test_env_override_empty_string_ignored(self, tmp_config_dir, monkeypatch):
+        """An empty COMFY_RUNNER_SHARED_DIR is treated as unset."""
+        set_shared_dir("/mnt/shared")
+        monkeypatch.setenv("COMFY_RUNNER_SHARED_DIR", "")
+        assert get_shared_dir() == "/mnt/shared"
+
 
 class TestGithubToken:
     def test_env_var(self, tmp_config_dir, monkeypatch):

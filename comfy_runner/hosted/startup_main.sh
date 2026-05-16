@@ -39,6 +39,18 @@ if [ -d "/workspace" ] && [ -w "/workspace" ]; then
     export COMFY_RUNNER_HOME="/workspace/.comfy-runner"
     mkdir -p "${COMFY_RUNNER_HOME}"
     log "comfy-runner state on volume: COMFY_RUNNER_HOME=${COMFY_RUNNER_HOME}"
+
+    # Force shared_dir onto the persistent volume too. Without this,
+    # any pre-existing config.json on /workspace/.comfy-runner that
+    # was written before COMFY_RUNNER_HOME was respected may still
+    # carry shared_dir="/root/ComfyUI-Shared", which points at the
+    # ~50 GB container rootfs. Preflight model downloads then fill
+    # the rootfs and crash with [Errno 28] No space left on device
+    # while the 1+ TB volume sits empty. The env var override beats
+    # the persisted config value (see comfy_runner.config.get_shared_dir).
+    export COMFY_RUNNER_SHARED_DIR="/workspace/ComfyUI-Shared"
+    mkdir -p "${COMFY_RUNNER_SHARED_DIR}"
+    log "comfy-runner shared dir on volume: COMFY_RUNNER_SHARED_DIR=${COMFY_RUNNER_SHARED_DIR}"
 fi
 
 # ── 1. Ensure native 7z is available (fast extraction) ───────────────
