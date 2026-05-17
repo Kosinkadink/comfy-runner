@@ -354,3 +354,71 @@ class TestWatchdog:
         with watchdog(1, on_abort=_boom) as cancelled:
             assert cancelled.wait(timeout=5.0), "watchdog never fired"
         assert cancelled.is_set()
+
+
+# ---------------------------------------------------------------------------
+# wait_until_ready
+# ---------------------------------------------------------------------------
+
+class TestWaitUntilReady:
+    @patch("comfy_runner.testing.client.requests.get")
+    def test_returns_immediately_on_200(self, mock_get):
+        resp = MagicMock()
+        resp.status_code = 200
+        mock_get.return_value = resp
+        client = ComfyTestClient("http://localhost:8188")
+        client.wait_until_ready(timeout_s=5.0, interval_s=0.01)
+        mock_get.assert_called()
+        # Hits the /system_stats endpoint
+        called_url = mock_get.call_args[0][0]
+        assert called_url == "http://localhost:8188/system_stats"
+
+    @patch("comfy_runner.testing.client.time.sleep", lambda *_a, **_kw: None)
+    @patch("comfy_runner.testing.client.requests.get")
+    def test_retries_through_connection_errors(self, mock_get):
+        """ConnectionError responses should not abort the loop."""
+        ok = MagicMock()
+        ok.status_code = 200
+        mock_get.side_effect = [
+            requests.ConnectionError("refused"),
+            requests.ConnectionError("refused"),
+            ok,
+        ]
+        client = ComfyTestClient("http://localhost:8188")
+        client.wait_until_ready(timeout_s=5.0, interval_s=0.01)
+        assert mock_get.call_count == 3
+
+    @patch("comfy_runner.testing.client.time.sleep", lambda *_a, **_kw: None)
+    @patch("comfy_runner.testing.client.requests.get")
+    def test_raises_runtime_error_on_timeout(self, mock_get):
+        mock_get.side_effect = requests.ConnectionError("refused")
+        client = ComfyTestClient("http://localhost:8188")
+        with pytest.raises(RuntimeError, match="did not become ready"):
+            client.wait_until_ready(timeout_s=0.05, interval_s=0.01)
+
+    @patch("comfy_runner.testing.client.time.sleep", lambda *_a, **_kw: None)
+    @patch("comfy_runner.testing.client.requests.get")
+    def test_non_200_is_treated_as_not_ready(self, mock_get):
+        """A 503 (or any other non-200) should keep polling, not return."""
+        bad = MagicMock()
+        bad.status_code = 503
+        ok = MagicMock()
+        ok.status_code = 200
+        mock_get.side_effect = [bad, bad, ok]
+        client = ComfyTestClient("http://localhost:8188")
+        client.wait_until_ready(timeout_s=5.0, interval_s=0.01)
+        assert mock_get.call_count == 3
+
+    @patch("comfy_runner.testing.client.requests.get")
+    def test_send_output_callback_is_invoked(self, mock_get):
+        resp = MagicMock()
+        resp.status_code = 200
+        mock_get.return_value = resp
+        client = ComfyTestClient("http://localhost:8188")
+        captured: list[str] = []
+        client.wait_until_ready(
+            timeout_s=5.0, interval_s=0.01,
+            send_output=captured.append,
+        )
+        # At least the "ready" message should have been emitted
+        assert any("is ready" in s for s in captured)
