@@ -64,6 +64,12 @@ class SuiteReport:
     # a short reason string (e.g. ``"overrun"``).
     timed_out: bool = False
     aborted_reason: str | None = None
+    # Path to the suite directory on the host that produced this run.
+    # Used by ``write_report`` to copy baseline files into the output
+    # dir so the HTML report can render a baseline | test | diff
+    # three-up tile per image comparison.  Stored as a string for
+    # JSON-serializability.
+    suite_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dict."""
@@ -85,6 +91,7 @@ def build_report(
     suite_run: SuiteRun,
     comparisons: dict[str, list[ComparisonEntry]] | None = None,
     target_info: dict[str, Any] | None = None,
+    suite_path: Path | str | None = None,
 ) -> SuiteReport:
     """Build a ``SuiteReport`` from a ``SuiteRun`` and optional comparisons.
 
@@ -94,6 +101,10 @@ def build_report(
             If None, uses ``suite_run.comparisons`` (populated by
             ``run_suite()`` when baselines are present).
         target_info: Optional metadata about the test target.
+        suite_path: Optional path to the suite directory.  Defaults to
+            ``suite_run.suite_path``.  Recorded on the report so
+            ``write_report`` can copy baseline files into the output
+            dir for the HTML three-up tile.
     """
     if comparisons is None:
         comparisons = suite_run.comparisons
@@ -121,6 +132,9 @@ def build_report(
             comparisons=wf_comparisons,
         ))
 
+    resolved_suite_path = suite_path if suite_path is not None else getattr(
+        suite_run, "suite_path", None
+    )
     return SuiteReport(
         suite_name=suite_run.suite_name,
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -132,6 +146,7 @@ def build_report(
         target_info=target_info or {},
         timed_out=getattr(suite_run, "timed_out", False),
         aborted_reason=getattr(suite_run, "aborted_reason", None),
+        suite_path=str(resolved_suite_path) if resolved_suite_path else None,
     )
 
 
@@ -304,13 +319,17 @@ _HTML_TEMPLATE = """\
   th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }}
   th {{ color: #94a3b8; font-weight: 500; }}
   .score-pass {{ color: var(--pass); }} .score-fail {{ color: var(--fail); }}
-  .img-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 12px; }}
+  .img-grid {{ display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }}
+  .img-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: start; }}
   .img-tile {{ background: #0b1220; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }}
   .img-tile a {{ display: block; }}
-  .img-tile img {{ width: 100%; height: auto; display: block; border-radius: 4px; background: #000; }}
+  .img-tile img,
+  .img-tile video {{ width: 100%; height: auto; display: block; border-radius: 4px; background: #000; }}
   .img-tile .label {{ color: #94a3b8; font-size: 0.75rem; margin-top: 6px; word-break: break-all; }}
-  .img-tile.diff {{ border-color: var(--fail); }}
   .img-tile.baseline {{ border-color: var(--pass); }}
+  .img-tile.test {{ border-color: var(--border); }}
+  .img-tile.test.fail {{ border-color: var(--fail); }}
+  .img-tile.diff {{ border-color: var(--fail); }}
   .timestamp {{ color: #64748b; font-size: 0.8rem; margin-top: 2rem; }}
 </style>
 </head>
@@ -407,21 +426,55 @@ def render_html(
                 + "</tbody></table>"
             )
 
-            # Image grid: per-comparison test image + diff overlay.
-            tiles: list[str] = []
+            # Image grid: per-comparison baseline + test + diff overlay.
+            # Render each comparison as its own three-up row so the
+            # operator can scan baseline ↔ new ↔ diff at a glance.
+            # Video comparisons (e.g. ``video_frame_ssim``) keep the
+            # baseline/test tiles as ``<video>`` players so the diff
+            # strip alongside is contextualized by the actual clip.
+            rows_html: list[str] = []
             for c in wf.comparisons:
-                if not _looks_like_image(c.test_file):
-                    continue
-                test_rel = f"{wf.name}/{c.test_file}"
-                tiles.append(
-                    f'<div class="img-tile">'
-                    f'<a href="{_href(test_rel)}" target="_blank">'
-                    f'<img src="{_href(test_rel)}" alt="output" loading="lazy"></a>'
-                    f'<div class="label">test: {_html_escape(c.test_file)}</div>'
-                    f'</div>'
-                )
+                test_is_image = _looks_like_image(c.test_file)
+                test_is_video = _looks_like_video(c.test_file)
                 diff_artifact = c.result.diff_artifact
-                if diff_artifact:
+                diff_is_image = (
+                    bool(diff_artifact)
+                    and _looks_like_image(str(diff_artifact))
+                )
+                if not (test_is_image or test_is_video or diff_is_image):
+                    continue
+
+                tiles: list[str] = []
+                # Baseline tile — copied into output_dir/_baselines/<wf>/
+                # by write_report when suite_path is known.
+                baseline_is_image = _looks_like_image(c.baseline_file or "")
+                baseline_is_video = _looks_like_video(c.baseline_file or "")
+                if c.baseline_file and (baseline_is_image or baseline_is_video):
+                    baseline_rel = (
+                        f"_baselines/{wf.name}/{c.baseline_file}"
+                    )
+                    tiles.append(_render_media_tile(
+                        css="img-tile baseline",
+                        label_prefix="baseline",
+                        filename=c.baseline_file,
+                        href=_href(baseline_rel),
+                        is_video=baseline_is_video,
+                    ))
+                # Test (new) tile.
+                test_tile_class = "img-tile test"
+                if not c.result.passed:
+                    test_tile_class += " fail"
+                if test_is_image or test_is_video:
+                    test_rel = f"{wf.name}/{c.test_file}"
+                    tiles.append(_render_media_tile(
+                        css=test_tile_class,
+                        label_prefix="test",
+                        filename=c.test_file,
+                        href=_href(test_rel),
+                        is_video=test_is_video,
+                    ))
+                # Diff tile (SSIM heatmap, video frame strip, …).
+                if diff_is_image:
                     diff_name = Path(str(diff_artifact)).name
                     diff_rel = f"{wf.name}/{diff_name}"
                     tiles.append(
@@ -432,9 +485,12 @@ def render_html(
                         f'({c.result.method})</div>'
                         f'</div>'
                     )
-            if tiles:
+                rows_html.append(
+                    '<div class="img-row">' + "\n".join(tiles) + "</div>"
+                )
+            if rows_html:
                 comparisons_html += (
-                    '<div class="img-grid">' + "\n".join(tiles) + "</div>"
+                    '<div class="img-grid">' + "\n".join(rows_html) + "</div>"
                 )
         elif wf.passed and wf.output_count > 0:
             # Even without baselines, surface a thumbnail of the
@@ -478,11 +534,47 @@ def _html_escape(s: str) -> str:
 
 
 _IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+_VIDEO_EXTS = frozenset({".mp4", ".webm", ".mov", ".m4v"})
 
 
 def _looks_like_image(filename: str) -> bool:
     """Return True if *filename*'s extension is a browser-renderable image."""
     return Path(filename).suffix.lower() in _IMAGE_EXTS
+
+
+def _looks_like_video(filename: str) -> bool:
+    """Return True if *filename*'s extension plays in a ``<video>`` tag."""
+    return Path(filename).suffix.lower() in _VIDEO_EXTS
+
+
+def _render_media_tile(
+    *, css: str, label_prefix: str, filename: str, href: str, is_video: bool,
+) -> str:
+    """Render one tile in the three-up comparison row.
+
+    Images use ``<img loading="lazy">`` so big runs paint progressively;
+    videos use ``<video controls preload="metadata">`` so the report
+    stays small even when the workflow produced multi-MB clips.
+    """
+    label = (
+        f'<div class="label">{label_prefix}: {_html_escape(filename)}</div>'
+    )
+    if is_video:
+        return (
+            f'<div class="{css}">'
+            f'<video controls preload="metadata" muted playsinline>'
+            f'<source src="{href}">'
+            f'</video>'
+            f'{label}'
+            f'</div>'
+        )
+    return (
+        f'<div class="{css}">'
+        f'<a href="{href}" target="_blank">'
+        f'<img src="{href}" alt="{label_prefix}" loading="lazy"></a>'
+        f'{label}'
+        f'</div>'
+    )
 
 
 # ===================================================================
@@ -502,6 +594,13 @@ def write_report(
         formats: List of formats to write.  Defaults to all.
             Choices: ``json``, ``html``, ``markdown``, ``console``.
 
+    When HTML is requested and ``report.suite_path`` is set, the
+    baseline image files referenced by each comparison are copied
+    into ``output_dir/_baselines/<workflow>/<file>`` so the HTML
+    three-up tile (baseline | test | diff) can render with relative
+    paths and remain self-contained when the run directory is moved
+    or served over the central server's artifact route.
+
     Returns a dict mapping format name → written file path.
     """
     if formats is None:
@@ -516,6 +615,7 @@ def write_report(
         written["json"] = p
 
     if "html" in formats:
+        _copy_baselines_for_html(report, output_dir)
         p = output_dir / "report.html"
         p.write_text(render_html(report), encoding="utf-8")
         written["html"] = p
@@ -531,3 +631,48 @@ def write_report(
         written["console"] = p
 
     return written
+
+
+def _copy_baselines_for_html(report: SuiteReport, output_dir: Path) -> None:
+    """Copy referenced baseline image files into ``output_dir/_baselines``.
+
+    Baselines normally live in ``{suite_path}/baselines/<workflow>/``.
+    For the HTML three-up tile to render them via a relative ``<img>``
+    src, they need to be reachable from ``output_dir``.  We copy only
+    the baseline files that are actually referenced by a comparison
+    entry, and only when the file extension is browser-renderable.
+    Existing copies are reused (``Path.exists()`` skip) so repeated
+    report writes are cheap.
+
+    Failures are intentionally silent — the table-only fallback in
+    the HTML report still works without baselines copied.
+    """
+    if not report.suite_path:
+        return
+    suite_dir = Path(report.suite_path)
+    baselines_root = suite_dir / "baselines"
+    if not baselines_root.is_dir():
+        return
+
+    import shutil
+
+    for wf in report.workflows:
+        for c in wf.comparisons:
+            if not c.baseline_file:
+                continue
+            if not _looks_like_image(c.baseline_file):
+                continue
+            src = baselines_root / wf.name / c.baseline_file
+            if not src.is_file():
+                continue
+            dst_dir = output_dir / "_baselines" / wf.name
+            dst = dst_dir / c.baseline_file
+            if dst.exists():
+                continue
+            try:
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            except OSError:
+                # Best-effort: HTML still renders with the test +
+                # diff tiles even if the baseline copy fails.
+                continue

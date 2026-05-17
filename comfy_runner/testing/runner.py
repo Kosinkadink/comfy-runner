@@ -314,6 +314,11 @@ def run_suite(
                 continue
             mimetype = _guess_mimetype(bl_path)
             cfg = suite.get_compare_config(mimetype)
+            # Auto-enable diff artifact generation so the HTML report
+            # can render the three-up baseline | test | diff tile.
+            # User config wins if they explicitly set save_diff.
+            if "save_diff" not in cfg:
+                cfg = {**cfg, "save_diff": True}
             cmp_result = compare_outputs(bl_path, test_path, cfg)
             entries.append(ComparisonEntry(
                 baseline_file=bl_path.name,
