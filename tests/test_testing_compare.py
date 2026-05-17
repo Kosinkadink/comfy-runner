@@ -21,7 +21,10 @@ from comfy_runner.testing.compare import (
 
 class TestRegistry:
     def test_builtin_comparators_registered(self):
-        expected = {"existence", "file_size", "ssim", "ahash", "pixel_mse", "metadata"}
+        expected = {
+            "existence", "file_size", "ssim", "ahash", "pixel_mse",
+            "metadata", "video_frame_ssim",
+        }
         assert expected.issubset(set(REGISTRY.keys()))
 
     def test_get_comparator_exists(self):
@@ -248,3 +251,86 @@ class TestCompareOutputsDispatch:
             "threshold": 0.5,
         })
         assert result.threshold == 0.5
+
+
+# ---------------------------------------------------------------------------
+# video_frame_ssim
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+
+_FFMPEG = shutil.which("ffmpeg")
+_pillow = pytest.importorskip("PIL", reason="Pillow required")
+
+
+def _write_solid_video(path: Path, *, color: tuple[int, int, int],
+                       frames: int = 8, size: int = 32) -> None:
+    """Write a tiny constant-color mp4 via ffmpeg (lavfi color source)."""
+    import subprocess
+    r, g, b = color
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi",
+            "-i", f"color=c=0x{r:02x}{g:02x}{b:02x}:s={size}x{size}:r=8:d=1",
+            "-frames:v", str(frames),
+            "-pix_fmt", "yuv420p",
+            str(path),
+        ],
+        check=True,
+    )
+
+
+@pytest.mark.skipif(_FFMPEG is None, reason="ffmpeg not installed")
+class TestVideoFrameSSIM:
+    def test_identical_videos_score_near_one(self, tmp_path):
+        a = tmp_path / "a.mp4"
+        b = tmp_path / "b.mp4"
+        _write_solid_video(a, color=(128, 128, 128))
+        _write_solid_video(b, color=(128, 128, 128))
+        result = compare_outputs(a, b, {
+            "method": "video_frame_ssim",
+            "threshold": 0.95,
+            "frame_count": 4,
+        })
+        assert result.method == "video_frame_ssim"
+        assert result.passed is True
+        assert result.score is not None and result.score > 0.99
+        assert result.details["frames_compared"] >= 1
+
+    def test_different_videos_below_threshold(self, tmp_path):
+        a = tmp_path / "a.mp4"
+        b = tmp_path / "b.mp4"
+        _write_solid_video(a, color=(0, 0, 0))
+        _write_solid_video(b, color=(255, 255, 255))
+        result = compare_outputs(a, b, {
+            "method": "video_frame_ssim",
+            "threshold": 0.95,
+            "frame_count": 3,
+            "save_diff": True,
+        })
+        assert result.passed is False
+        # Diff artifact PNG strip is generated.
+        assert result.diff_artifact is not None
+        assert result.diff_artifact.is_file()
+        assert result.diff_artifact.suffix == ".png"
+
+    def test_missing_file_returns_failure(self, tmp_path):
+        a = tmp_path / "exists.mp4"
+        _write_solid_video(a, color=(0, 0, 0))
+        result = compare_outputs(a, tmp_path / "missing.mp4", {
+            "method": "video_frame_ssim",
+        })
+        assert result.passed is False
+        assert "missing" in result.details.get("error", "")
+
+
+def test_video_frame_ssim_without_ffmpeg(monkeypatch, tmp_path):
+    """Comparator raises a clear error when ffmpeg is not on PATH."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    a.write_bytes(b"\0")
+    b.write_bytes(b"\0")
+    with pytest.raises(RuntimeError, match="ffmpeg"):
+        compare_outputs(a, b, {"method": "video_frame_ssim"})

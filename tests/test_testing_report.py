@@ -392,6 +392,62 @@ class TestRenderHTML:
         # Only the comparison table -- no <img> tile for .txt.
         assert "<img" not in html
 
+    def test_three_up_row_includes_baseline_tile(self):
+        """A baseline tile is rendered alongside the test (new) tile."""
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="out_0.png",
+                    test_file="out_0.png",
+                    result=CompareResult(
+                        method="ssim", score=0.5, passed=False,
+                        threshold=0.95,
+                        diff_artifact=Path("out_0_ssim_diff.png"),
+                    ),
+                ),
+            ],
+        }
+        report = build_report(_make_suite_run(), comparisons=comparisons)
+        html = render_html(report)
+        # Baseline tile references the _baselines/<wf>/ directory.
+        assert "img-tile baseline" in html
+        assert "_baselines/wf_pass_0/out_0.png" in html
+        # Test tile carries the fail modifier when comparison failed.
+        assert "img-tile test fail" in html
+        # All three (baseline + test + diff) are present.
+        assert "img-tile diff" in html
+
+    def test_three_up_row_test_passed_no_fail_class(self):
+        """Passing comparisons render the test tile without the fail class."""
+        report = build_report(
+            _make_suite_run(), comparisons=_make_comparisons(),
+        )
+        html = render_html(report)
+        assert "img-tile test fail" not in html
+        # Baseline still rendered for passing comparisons (visual sanity).
+        assert "img-tile baseline" in html
+
+    def test_video_test_file_uses_video_tag(self):
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="clip.mp4",
+                    test_file="clip.mp4",
+                    result=CompareResult(
+                        method="video_frame_ssim", score=0.5,
+                        passed=False, threshold=0.9,
+                        diff_artifact=Path("clip_frame_diff.png"),
+                    ),
+                ),
+            ],
+        }
+        report = build_report(_make_suite_run(), comparisons=comparisons)
+        html = render_html(report)
+        assert "<video" in html
+        assert "wf_pass_0/clip.mp4" in html
+        # The frame-strip PNG diff still renders as <img>.
+        assert "wf_pass_0/clip_frame_diff.png" in html
+
 
 # ---------------------------------------------------------------------------
 # write_report
@@ -435,3 +491,95 @@ class TestWriteReport:
         data = json.loads((tmp_path / "report.json").read_text())
         assert data["suite_name"] == "Test Suite"
         assert data["workflows"][0]["comparisons"][0]["result"]["score"] == 0.9823
+
+    def test_copies_baseline_image_for_html(self, tmp_path):
+        """write_report copies baseline images into _baselines/<wf>/."""
+        # Build a suite layout with a real baseline file on disk.
+        suite_dir = tmp_path / "suite"
+        wf_baseline_dir = suite_dir / "baselines" / "wf_pass_0"
+        wf_baseline_dir.mkdir(parents=True)
+        baseline_png = wf_baseline_dir / "out_0.png"
+        baseline_png.write_bytes(b"\x89PNG\r\n\x1a\nfake-pixels")
+
+        run = _make_suite_run()
+        run.suite_path = suite_dir
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="out_0.png",
+                    test_file="out_0.png",
+                    result=CompareResult(
+                        method="ssim", score=0.9, passed=True, threshold=0.95,
+                    ),
+                ),
+            ],
+        }
+        report = build_report(run, comparisons=comparisons)
+        out_dir = tmp_path / "run"
+        write_report(report, out_dir, formats=["html"])
+
+        copied = out_dir / "_baselines" / "wf_pass_0" / "out_0.png"
+        assert copied.is_file()
+        # File contents preserved (copy2 keeps bytes + mtime).
+        assert copied.read_bytes() == baseline_png.read_bytes()
+
+    def test_baseline_copy_skipped_without_suite_path(self, tmp_path):
+        """No _baselines/ directory when report.suite_path is None."""
+        run = _make_suite_run()
+        run.suite_path = None
+        report = build_report(run, comparisons=_make_comparisons())
+        assert report.suite_path is None
+        out_dir = tmp_path / "run"
+        write_report(report, out_dir, formats=["html"])
+        assert not (out_dir / "_baselines").exists()
+
+    def test_baseline_copy_skipped_for_non_image(self, tmp_path):
+        """Non-image baselines are not copied even when suite_path is set."""
+        suite_dir = tmp_path / "suite"
+        bl_dir = suite_dir / "baselines" / "wf_pass_0"
+        bl_dir.mkdir(parents=True)
+        (bl_dir / "data.txt").write_text("baseline")
+
+        run = _make_suite_run()
+        run.suite_path = suite_dir
+        comparisons = {
+            "wf_pass_0": [
+                ComparisonEntry(
+                    baseline_file="data.txt",
+                    test_file="data.txt",
+                    result=CompareResult(method="existence", passed=True),
+                ),
+            ],
+        }
+        report = build_report(run, comparisons=comparisons)
+        out_dir = tmp_path / "run"
+        write_report(report, out_dir, formats=["html"])
+        assert not (out_dir / "_baselines" / "wf_pass_0" / "data.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# suite_path propagation
+# ---------------------------------------------------------------------------
+
+class TestSuitePathPropagation:
+    def test_build_report_defaults_to_suite_run_suite_path(self):
+        run = _make_suite_run()
+        run.suite_path = Path("/some/suite/dir")
+        report = build_report(run)
+        assert report.suite_path == "/some/suite/dir" or report.suite_path == str(
+            Path("/some/suite/dir")
+        )
+
+    def test_build_report_explicit_suite_path_wins(self):
+        run = _make_suite_run()
+        run.suite_path = Path("/from/run")
+        report = build_report(run, suite_path=Path("/explicit"))
+        assert report.suite_path == str(Path("/explicit"))
+
+    def test_suite_path_in_json_roundtrip(self, tmp_path):
+        run = _make_suite_run()
+        run.suite_path = tmp_path / "suite"
+        report = build_report(run)
+        write_report(report, tmp_path, formats=["json"])
+        data = json.loads((tmp_path / "report.json").read_text())
+        assert data["suite_path"] == str(tmp_path / "suite")

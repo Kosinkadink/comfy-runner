@@ -302,3 +302,237 @@ def _metadata(
     )
 
 register("metadata", _metadata)
+
+
+# ---------------------------------------------------------------------------
+# video_frame_ssim — sample frames from a video and SSIM each pair
+# ---------------------------------------------------------------------------
+
+def _video_frame_ssim(
+    baseline: Path,
+    test: Path,
+    *,
+    threshold: float = 0.90,
+    frame_count: int = 5,
+    **kwargs: Any,
+) -> CompareResult:
+    """Sample ``frame_count`` frames from each video and SSIM-compare pairs.
+
+    Score is the mean SSIM across all sampled frame pairs.  Passes when
+    the mean meets ``threshold``.  On failure (and when ``save_diff`` is
+    truthy) a single composite PNG strip is written next to *test*:
+    rows = frame index, columns = baseline | test | per-pixel diff.
+
+    Requires ``ffmpeg`` on ``PATH`` (used to extract frames) plus
+    ``Pillow`` and ``numpy`` (already required for image SSIM).  Raises
+    ``RuntimeError`` if ``ffmpeg`` is not available.
+    """
+    import shutil
+    import tempfile
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "video_frame_ssim requires ffmpeg on PATH "
+            "(install via your OS package manager or `imageio-ffmpeg`)"
+        )
+
+    import numpy as np
+    from PIL import Image
+
+    if not test.is_file() or not baseline.is_file():
+        return CompareResult(method="video_frame_ssim", passed=False,
+                             details={"error": "video file missing"})
+
+    frame_count = max(1, int(frame_count))
+
+    with tempfile.TemporaryDirectory(prefix="video_ssim_") as td:
+        td_path = Path(td)
+        b_dir = td_path / "baseline"
+        t_dir = td_path / "test"
+        b_dir.mkdir()
+        t_dir.mkdir()
+
+        # Sample N frames evenly spaced via ffmpeg's ``thumbnail`` is
+        # quality-biased; we want a deterministic time grid, so use
+        # ``select`` with frame indices computed from probed nb_frames.
+        nb_b = _probe_frame_count(baseline)
+        nb_t = _probe_frame_count(test)
+        if nb_b == 0 or nb_t == 0:
+            return CompareResult(
+                method="video_frame_ssim", passed=False,
+                details={"error": "could not probe video frame count"},
+            )
+
+        n = min(frame_count, nb_b, nb_t)
+        b_indices = _evenly_spaced(nb_b, n)
+        t_indices = _evenly_spaced(nb_t, n)
+
+        for i, idx in enumerate(b_indices):
+            _extract_frame(baseline, idx, b_dir / f"f{i:04d}.png")
+        for i, idx in enumerate(t_indices):
+            _extract_frame(test, idx, t_dir / f"f{i:04d}.png")
+
+        # Compute per-frame SSIM.
+        per_frame: list[float] = []
+        pairs: list[tuple[np.ndarray, np.ndarray]] = []
+        for i in range(n):
+            bp = b_dir / f"f{i:04d}.png"
+            tp = t_dir / f"f{i:04d}.png"
+            if not bp.is_file() or not tp.is_file():
+                continue
+            img_b = Image.open(bp).convert("L")
+            img_t = Image.open(tp).convert("L")
+            if img_t.size != img_b.size:
+                img_t = img_t.resize(img_b.size, Image.LANCZOS)
+            arr_b = np.asarray(img_b, dtype=np.float64)
+            arr_t = np.asarray(img_t, dtype=np.float64)
+            per_frame.append(_compute_ssim(arr_b, arr_t))
+            pairs.append((arr_b, arr_t))
+
+        if not per_frame:
+            return CompareResult(
+                method="video_frame_ssim", passed=False,
+                details={"error": "no extractable frames"},
+            )
+
+        mean_score = float(sum(per_frame) / len(per_frame))
+        passed = mean_score >= threshold
+
+        result = CompareResult(
+            method="video_frame_ssim",
+            score=round(mean_score, 4),
+            passed=passed,
+            threshold=threshold,
+            details={
+                "frames_compared": len(per_frame),
+                "per_frame_ssim": [round(s, 4) for s in per_frame],
+                "min_frame_ssim": round(min(per_frame), 4),
+            },
+        )
+
+        if kwargs.get("save_diff") and not passed:
+            diff_path = test.parent / f"{test.stem}_frame_diff.png"
+            _save_video_strip_diff(pairs, per_frame, diff_path)
+            result.diff_artifact = diff_path
+
+        return result
+
+
+def _probe_frame_count(path: Path) -> int:
+    """Return the total frame count of *path* via ffprobe, or 0 on failure."""
+    import subprocess
+    import shutil
+
+    if shutil.which("ffprobe") is None:
+        # Fall back to ffmpeg packet count.
+        return _probe_frame_count_via_ffmpeg(path)
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-count_packets",
+                "-show_entries", "stream=nb_read_packets",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+        return int(out.decode().strip() or 0)
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return 0
+
+
+def _probe_frame_count_via_ffmpeg(path: Path) -> int:
+    """Fallback frame count via ``ffmpeg -vcodec copy -f null``."""
+    import re
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-nostats", "-i", str(path),
+             "-vcodec", "copy", "-f", "null", "-"],
+            capture_output=True, text=True, check=False,
+        )
+        # ffmpeg writes ``frame= NNNN`` to stderr.
+        m = re.search(r"frame=\s*(\d+)", proc.stderr)
+        return int(m.group(1)) if m else 0
+    except OSError:
+        return 0
+
+
+def _evenly_spaced(total: int, n: int) -> list[int]:
+    """Return ``n`` 0-based frame indices evenly spaced across ``total``."""
+    if n <= 1:
+        return [max(0, total // 2)]
+    step = (total - 1) / (n - 1)
+    return [int(round(i * step)) for i in range(n)]
+
+
+def _extract_frame(video: Path, index: int, out: Path) -> None:
+    """Extract the frame at zero-based ``index`` from *video* to *out*."""
+    import subprocess
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(video),
+                "-vf", f"select=eq(n\\,{index})",
+                "-frames:v", "1",
+                str(out),
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def _save_video_strip_diff(
+    pairs: list[tuple[Any, Any]],
+    per_frame_ssim: list[float],
+    path: Path,
+) -> None:
+    """Write a composite PNG: one row per frame, columns = baseline | test | diff.
+
+    Per-frame SSIM is rendered as a label band underneath each row.
+    """
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    if not pairs:
+        return
+
+    # Use the first pair's shape as the canonical tile size.
+    h, w = pairs[0][0].shape[:2]
+    cols = 3
+    label_h = 18
+    row_h = h + label_h
+    canvas = Image.new("RGB", (w * cols, row_h * len(pairs)), color=(11, 18, 32))
+    draw = ImageDraw.Draw(canvas)
+
+    for i, ((arr_b, arr_t), score) in enumerate(zip(pairs, per_frame_ssim)):
+        # Normalize sizes to the canonical tile.
+        b_img = Image.fromarray(arr_b.astype(np.uint8)).convert("RGB").resize((w, h))
+        t_img = Image.fromarray(arr_t.astype(np.uint8)).convert("RGB").resize((w, h))
+        diff_arr = np.abs(arr_b - arr_t)
+        if diff_arr.max() > 0:
+            diff_arr = (diff_arr / diff_arr.max() * 255).astype(np.uint8)
+        else:
+            diff_arr = diff_arr.astype(np.uint8)
+        d_img = Image.fromarray(diff_arr).convert("RGB").resize((w, h))
+
+        y = i * row_h
+        canvas.paste(b_img, (0, y))
+        canvas.paste(t_img, (w, y))
+        canvas.paste(d_img, (w * 2, y))
+        draw.text((4, y + h + 2),
+                  f"frame {i}  ssim={score:.4f}",
+                  fill=(226, 232, 240))
+
+    canvas.save(path)
+
+
+register("video_frame_ssim", _video_frame_ssim)
