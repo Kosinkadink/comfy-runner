@@ -121,6 +121,55 @@ class ComfyTestClient:
         self.poll_interval = poll_interval
 
     # ------------------------------------------------------------------
+    # Readiness
+    # ------------------------------------------------------------------
+
+    def wait_until_ready(
+        self,
+        timeout_s: float = 300.0,
+        interval_s: float = 2.0,
+        send_output: Callable[[str], None] | None = None,
+    ) -> None:
+        """Poll ``GET {base_url}/system_stats`` until ComfyUI responds 200.
+
+        Used as a client-side guard before firing the first workflow,
+        so we never race against a half-bound port. This complements
+        (rather than replaces) the runner-server's own readiness check
+        — we may be reaching ComfyUI over a different network path
+        (e.g. Tailscale port 8188) than the server used internally.
+
+        Raises ``RuntimeError`` on timeout.
+        """
+        url = f"{self.base_url}/system_stats"
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+        while True:
+            elapsed = time.monotonic() - (deadline - timeout_s)
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"ComfyUI at {self.base_url} did not become "
+                    f"ready within {int(timeout_s)}s"
+                )
+            attempt += 1
+            if send_output and attempt % 5 == 1:
+                send_output(
+                    f"Waiting for ComfyUI at {self.base_url}... "
+                    f"({int(elapsed)}s)\n"
+                )
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    if send_output:
+                        send_output(
+                            f"ComfyUI at {self.base_url} is ready "
+                            f"({int(elapsed)}s)\n"
+                        )
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(interval_s)
+
+    # ------------------------------------------------------------------
     # Queue
     # ------------------------------------------------------------------
 

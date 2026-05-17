@@ -162,6 +162,16 @@ class RemoteRunner:
     # Process control
     # ------------------------------------------------------------------
 
+    def start(self, name: str) -> dict[str, Any]:
+        """POST /{name}/start — async.
+
+        Fails server-side with ``Installation '<name>' is already
+        running`` if the install is already up; callers that don't
+        already know the state should check first or fall back to
+        ``restart``.
+        """
+        return self._request("POST", f"/{name}/start")
+
     def restart(self, name: str) -> dict[str, Any]:
         """POST /{name}/restart — async."""
         return self._request("POST", f"/{name}/restart")

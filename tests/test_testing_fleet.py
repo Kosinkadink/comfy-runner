@@ -317,11 +317,18 @@ class TestLocalTargetRun:
 # ---------------------------------------------------------------------------
 
 class TestRemoteTargetRun:
+    @patch(
+        "comfy_runner.testing.client.ComfyTestClient.wait_until_ready",
+        return_value=None,
+    )
     @patch("comfy_runner.testing.fleet.write_report", return_value={})
     @patch("comfy_runner.testing.fleet.build_report")
     @patch("comfy_runner.testing.fleet.run_suite")
     @patch("comfy_runner.hosted.remote.RemoteRunner.get_status")
-    def test_success(self, mock_status, mock_run_suite, mock_build, mock_write, tmp_path):
+    def test_success(
+        self, mock_status, mock_run_suite, mock_build, mock_write,
+        mock_ready, tmp_path,
+    ):
         mock_status.return_value = {"running": True}
         mock_build.return_value = _mock_report()
         suite_dir = _make_suite(tmp_path)
@@ -333,20 +340,29 @@ class TestRemoteTargetRun:
 
         assert result.passed is True
         assert result.target_kind == "remote"
+        mock_ready.assert_called_once()
 
+    @patch(
+        "comfy_runner.testing.client.ComfyTestClient.wait_until_ready",
+        side_effect=RuntimeError(
+            "ComfyUI at https://mybox:8188 did not become ready"
+        ),
+    )
     @patch("comfy_runner.hosted.remote.RemoteRunner.get_status")
-    def test_error_handled(self, mock_status, tmp_path):
+    def test_error_handled(self, mock_status, mock_ready, tmp_path):
+        # The runner status check itself errors, but the readiness
+        # probe then surfaces the real "ComfyUI is unreachable"
+        # failure and the outer try/except wraps it as a TargetResult
+        # error instead of crashing the fleet.
         mock_status.side_effect = RuntimeError("Server down")
         suite_dir = _make_suite(tmp_path)
         from comfy_runner.testing.suite import load_suite
         suite = load_suite(suite_dir)
 
         target = RemoteTarget("https://mybox:9189")
-        # run_suite will fail because ComfyTestClient can't connect
-        # but error is caught
         result = target.run(suite, tmp_path / "output")
-        # Status error is caught and ignored, so run_suite tries and fails
-        assert result.error is not None or result.report is not None
+        assert result.error is not None
+        assert "did not become ready" in result.error
 
 
 # ---------------------------------------------------------------------------

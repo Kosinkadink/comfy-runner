@@ -226,17 +226,39 @@ class RemoteTarget:
         try:
             runner = RemoteRunner(self._server_url)
 
-            # Ensure ComfyUI is running
+            # Ensure ComfyUI is running. We try ``start`` first (cheap
+            # no-stop path) and fall back to ``restart`` only when the
+            # server reports it as already running, since ``restart``
+            # adds ``stop_installation`` overhead and pushes us closer
+            # to the poll-job timeout. Errors are surfaced via ``out()``
+            # rather than swallowed — the readiness probe below is
+            # what actually guards the test from racing.
+            #
+            # ``timeout=300`` matches the server's HEALTH_TIMEOUT_S
+            # (process.HEALTH_TIMEOUT_S) so any successful start on
+            # the server side will be observed here.
             try:
                 status = runner.get_status(self._install_name)
                 if not status.get("running"):
                     out("Starting ComfyUI...\n")
-                    start_data = runner.restart(self._install_name)
+                    try:
+                        start_data = runner.start(self._install_name)
+                    except RuntimeError as start_err:
+                        out(
+                            f"start failed ({start_err}); "
+                            f"falling back to restart...\n"
+                        )
+                        start_data = runner.restart(self._install_name)
                     job_id = start_data.get("job_id")
                     if job_id:
-                        runner.poll_job(job_id, timeout=120, on_output=send_output)
-            except RuntimeError:
-                pass
+                        runner.poll_job(
+                            job_id, timeout=300, on_output=send_output,
+                        )
+            except RuntimeError as e:
+                out(
+                    f"⚠ ComfyUI start/restart returned an error "
+                    f"({e}); continuing to readiness probe.\n"
+                )
 
             comfy_url = self._resolve_comfy_url()
 
@@ -249,10 +271,18 @@ class RemoteTarget:
                     comfy_url=comfy_url,
                 )
 
+            # Final readiness guard: block until the ComfyUI URL we're
+            # actually going to hit accepts requests. This catches
+            # cases where the server-side health check passed but the
+            # external network path (e.g. Tailscale port 8188) is not
+            # yet wired up, and any race between health-check-passed
+            # and TCP-accept-ready.
+            client = ComfyTestClient(comfy_url)
+            client.wait_until_ready(
+                timeout_s=300.0, send_output=send_output,
+            )
 
             out(f"Running tests against {comfy_url}\n")
-
-            client = ComfyTestClient(comfy_url)
             suite_run = run_suite(
                 client, suite, output_dir,
                 timeout=timeout, send_output=send_output,
