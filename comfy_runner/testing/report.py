@@ -14,6 +14,7 @@ Supported formats:
 from __future__ import annotations
 
 import json
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -380,9 +381,15 @@ def render_html(
         # ``rel`` is the workflow-name + filename relative to the
         # run output dir. When opened as a local file, the report
         # sits at the run-dir root so a relative ``./`` link works.
+        # Normalize Windows path separators and URL-encode unsafe
+        # characters (spaces, ``#``, ``?``, non-ASCII) so the link
+        # works in any browser and over HTTP. The path is then
+        # HTML-escaped on top to neutralize ``&``/``<``/``>`` etc.
+        rel = rel.replace("\\", "/")
+        encoded = urllib.parse.quote(rel, safe="/")
         if not prefix:
-            return _html_escape(rel)
-        return _html_escape(f"{prefix}/{rel}")
+            return _html_escape(encoded)
+        return _html_escape(f"{prefix}/{encoded}")
 
     cards: list[str] = []
     for wf in report.workflows:

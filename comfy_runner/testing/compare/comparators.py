@@ -328,7 +328,6 @@ def _video_frame_ssim(
     ``RuntimeError`` if ``ffmpeg`` is not available.
     """
     import shutil
-    import subprocess
     import tempfile
 
     if shutil.which("ffmpeg") is None:

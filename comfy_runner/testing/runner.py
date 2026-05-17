@@ -316,7 +316,13 @@ def run_suite(
             cfg = suite.get_compare_config(mimetype)
             # Auto-enable diff artifact generation so the HTML report
             # can render the three-up baseline | test | diff tile.
+            # Normalize non-dict shorthand (string method name, None)
+            # so we can always merge save_diff without TypeError.
             # User config wins if they explicitly set save_diff.
+            if isinstance(cfg, str):
+                cfg = {"method": cfg}
+            elif not isinstance(cfg, dict):
+                cfg = {"method": "existence"}
             if "save_diff" not in cfg:
                 cfg = {**cfg, "save_diff": True}
             cmp_result = compare_outputs(bl_path, test_path, cfg)

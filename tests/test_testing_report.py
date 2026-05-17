@@ -526,9 +526,9 @@ class TestWriteReport:
     def test_baseline_copy_skipped_without_suite_path(self, tmp_path):
         """No _baselines/ directory when report.suite_path is None."""
         run = _make_suite_run()
-        run.suite_path = Path("")  # falsy after str() conversion below
+        run.suite_path = None
         report = build_report(run, comparisons=_make_comparisons())
-        report.suite_path = None
+        assert report.suite_path is None
         out_dir = tmp_path / "run"
         write_report(report, out_dir, formats=["html"])
         assert not (out_dir / "_baselines").exists()
