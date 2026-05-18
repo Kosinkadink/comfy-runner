@@ -409,6 +409,50 @@ class TestTestsReportHtml:
         # Mimetype is text/html.
         assert resp.mimetype == "text/html"
 
+    def test_html_report_renders_outputs_without_baseline(
+        self, client, tmp_path, clean_test_runs,
+    ):
+        """A run with no comparisons (no baseline yet) still shows
+        every output thumbnail in the HTML report so the operator can
+        eyeball the run. Regression for the bug where the report's
+        ``outputs`` field wasn't being carried through
+        ``_suite_report_from_dict`` to the renderer."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Fresh-suite shape: ``has_baseline=False``, ``comparisons=[]``,
+        # ``outputs`` populated by ``build_report`` so the renderer can
+        # find them on the round-trip.
+        (run_dir / "report.json").write_text(json.dumps({
+            "suite_name": "smoke",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "duration": 1.0,
+            "total": 1,
+            "passed": 1,
+            "failed": 0,
+            "workflows": [{
+                "name": "wf1",
+                "passed": True,
+                "execution_time": 0.5,
+                "output_count": 1,
+                "has_baseline": False,
+                "comparisons": [],
+                "outputs": ["out_0.png"],
+            }],
+            "target_info": {"name": "pod-x"},
+        }), encoding="utf-8")
+        test_id = "T-html-no-baseline"
+        clean_test_runs._test_runs[test_id] = {
+            "id": test_id, "kind": "single", "output_dir": str(run_dir),
+            "summary": {}, "status": "done", "created_at": 0,
+        }
+        resp = client.get(f"/tests/{test_id}/report?format=html")
+        assert resp.status_code == 200
+        html = resp.data.decode("utf-8")
+        assert f"/tests/{test_id}/artifact/wf1/out_0.png" in html
+        assert "<img" in html
+        # No diff overlay (no baseline → no comparison ran).
+        assert "ssim_diff" not in html
+
 
 class TestPromoteBaselines:
     """POST /tests/<test_id>/promote-baselines — bulk-approve fleet outputs."""
