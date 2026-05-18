@@ -1270,8 +1270,10 @@ class TestTailnetRunners:
         assert "submitReview" in body
         assert "podAction" in body
         assert "prefillReview" in body
-        # Per-pod Review button is wired.
-        assert "prefillReview('ci-runner')" in body
+        # Per-pod Review button passes ``this`` (no interpolated pod name)
+        # and the row carries the name via data-pod.
+        assert "prefillReview(this)" in body
+        assert 'data-pod="ci-runner"' in body
 
     def test_dashboard_pod_purpose_badge_renders(
         self, client, tmp_config_dir, monkeypatch,

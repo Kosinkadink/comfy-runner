@@ -26,13 +26,35 @@ from comfy_runner_server import server as srv
 
 @pytest.fixture
 def isolated_state_dir(tmp_path, monkeypatch):
-    """Point persistence at a temp dir for the duration of the test."""
+    """Point persistence at a temp dir for the duration of the test.
+
+    Stops any pending background timer on the previously-cached saver
+    before zeroing the module slot — otherwise the orphaned Timer would
+    fire up to ``DebouncedSaver._delay`` seconds later against a
+    torn-down temp dir and could flake adjacent tests.
+    """
     monkeypatch.setenv("COMFY_RUNNER_HOME", str(tmp_path))
-    # Reset cached saver so it rebinds to the new path on next use.
+    # Cancel any pending write from a prior test before swapping the
+    # saver out. ``flush`` cancels the timer and synchronously writes
+    # whatever's cached; the snapshot is empty by then because clean_test_runs
+    # ran first, so this is a cheap no-op.
+    prev_saver = getattr(srv, "_saver_instance", None)
+    if prev_saver is not None:
+        try:
+            prev_saver.flush()
+        except Exception:
+            pass
     monkeypatch.setattr(srv, "_saver_instance", None)
-    # Make sure persistence env-disable flag is clear.
     monkeypatch.delenv("COMFY_RUNNER_DISABLE_TEST_RUN_PERSISTENCE", raising=False)
     yield tmp_path
+    # Tear-down: cancel any timer the test scheduled so it cannot fire
+    # against ``tmp_path`` after pytest has cleaned it up.
+    fresh_saver = getattr(srv, "_saver_instance", None)
+    if fresh_saver is not None and fresh_saver is not prev_saver:
+        try:
+            fresh_saver.flush()
+        except Exception:
+            pass
 
 
 @pytest.fixture
