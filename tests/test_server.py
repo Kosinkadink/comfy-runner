@@ -1233,6 +1233,46 @@ class TestTailnetRunners:
         assert "runpod" in body
         assert "#1234" in body
 
+    def test_dashboard_test_runs_links_to_report_and_shows_results(
+        self, client, tmp_config_dir,
+    ):
+        """Recent Test Runs row exposes HTML report link + pass/fail counts."""
+        from unittest.mock import patch
+        from comfy_runner_server import server as srv
+        # Seed one fleet run so the template renders the new columns.
+        with srv._test_runs_lock:
+            srv._test_runs["fleet-xyz"] = {
+                "id": "fleet-xyz",
+                "kind": "fleet",
+                "suite": "a,b,c",
+                "status": "done",
+                "created_at": 1.0,
+                "targets": [{"kind": "remote", "pod_name": "p"}],
+                "summary": {
+                    "targets_passed": 3,
+                    "targets_failed": 0,
+                    "total_targets": 3,
+                },
+            }
+        try:
+            with patch(
+                "comfy_runner.hosted.tailnet.discover_comfy_runners",
+                return_value={
+                    "ok": True, "runners": [], "tailnet_configured": False,
+                    "device_count": 0, "online_count": 0,
+                },
+            ):
+                resp = client.get("/dashboard")
+        finally:
+            with srv._test_runs_lock:
+                srv._test_runs.pop("fleet-xyz", None)
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        # Direct link to the rendered HTML report.
+        assert '/tests/fleet-xyz/report?format=html' in body
+        # Pass-count column populated from the summary.
+        assert "3/3" in body
+
 
 # =====================================================================
 # POST /pods/self-update — fan out to discovered comfy-runners
