@@ -302,6 +302,24 @@ class TestTestsArtifact:
         assert resp.status_code == 200
         assert resp.data.startswith(b"\x89PNG")
 
+    def test_serves_file_under_nested_subdirs(
+        self, client, tmp_path, clean_test_runs,
+    ):
+        """Fleet layout is ``<run>/<pod>/<suite>/<workflow>/<node_id>/<file>``
+        — the artifact endpoint must serve multi-segment relative paths,
+        not just single-suite ``<workflow>/<file>`` ones."""
+        run_dir = tmp_path / "run"
+        nested = run_dir / "0-ci-runner" / "chroma-smoke" / "txt2img-chroma" / "51"
+        nested.mkdir(parents=True)
+        (nested / "test_00485_.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        test_id = self._register_run(clean_test_runs, run_dir, test_id="T-test-art-nested")
+        resp = client.get(
+            f"/tests/{test_id}/artifact/"
+            "0-ci-runner/chroma-smoke/txt2img-chroma/51/test_00485_.png"
+        )
+        assert resp.status_code == 200
+        assert resp.data.startswith(b"\x89PNG")
+
     def test_unknown_test_id_404(self, client, tmp_path, clean_test_runs):
         resp = client.get("/tests/T-nope/artifact/x.png")
         assert resp.status_code == 404
@@ -452,6 +470,58 @@ class TestTestsReportHtml:
         assert "<img" in html
         # No diff overlay (no baseline → no comparison ran).
         assert "ssim_diff" not in html
+
+    def test_html_report_rewrites_outputs_from_on_disk_node_id_subdir(
+        self, client, tmp_path, clean_test_runs,
+    ):
+        """When the on-disk layout is ``<wf>/<node_id>/<file>`` (the
+        real layout produced by the downloader) and the stored
+        ``report.json`` only has bare filenames in ``outputs`` (older
+        runs, before ``build_report`` learned the node-id prefix), the
+        server should rewrite the rendered URLs to include the
+        ``<node_id>/`` segment so the ``<img>`` srcs actually resolve
+        via the artifact endpoint."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # On-disk: <wf>/<node_id>/<file>
+        node_dir = run_dir / "wf1" / "51"
+        node_dir.mkdir(parents=True)
+        (node_dir / "test_00485_.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        # report.json: bare filename, as a pre-fix run would have written.
+        (run_dir / "report.json").write_text(json.dumps({
+            "suite_name": "smoke",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "duration": 1.0,
+            "total": 1,
+            "passed": 1,
+            "failed": 0,
+            "workflows": [{
+                "name": "wf1",
+                "passed": True,
+                "execution_time": 0.5,
+                "output_count": 1,
+                "has_baseline": False,
+                "comparisons": [],
+                "outputs": ["test_00485_.png"],
+            }],
+            "target_info": {"name": "pod-x"},
+        }), encoding="utf-8")
+        test_id = "T-html-node-id-rewrite"
+        clean_test_runs._test_runs[test_id] = {
+            "id": test_id, "kind": "single", "output_dir": str(run_dir),
+            "summary": {}, "status": "done", "created_at": 0,
+        }
+        resp = client.get(f"/tests/{test_id}/report?format=html")
+        assert resp.status_code == 200
+        html = resp.data.decode("utf-8")
+        # The img src should point at the on-disk path including <node_id>.
+        assert f"/tests/{test_id}/artifact/wf1/51/test_00485_.png" in html
+        # And following that URL should actually serve the bytes.
+        artifact_resp = client.get(
+            f"/tests/{test_id}/artifact/wf1/51/test_00485_.png"
+        )
+        assert artifact_resp.status_code == 200
+        assert artifact_resp.data.startswith(b"\x89PNG")
 
 
 class TestPromoteBaselines:

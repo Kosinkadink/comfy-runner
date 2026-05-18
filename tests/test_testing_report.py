@@ -470,10 +470,13 @@ class TestRenderHTML:
             r.has_baseline = False
         report = build_report(run)
         html = render_html(report)
-        # Every workflow's output appears as an inline tile.
-        assert "wf_pass_0/out_0.png" in html
-        assert "wf_pass_1/out_1.png" in html
-        # Labels say "output: …" rather than "baseline: …" / "test: …".
+        # Every workflow's output appears as an inline tile. The href
+        # carries the ``<node_id>/`` segment because that's where the
+        # downloader actually saves the file on disk
+        # (``<output_dir>/<workflow>/<node_id>/<file>``).
+        assert "wf_pass_0/9/out_0.png" in html
+        assert "wf_pass_1/9/out_1.png" in html
+        # Labels show only the basename for readability.
         assert "output: out_0.png" in html
         # Comparison table is suppressed (no comparisons ran).
         assert "<th>Method</th>" not in html
@@ -488,7 +491,7 @@ class TestRenderHTML:
         report = build_report(run)
         html = render_html(report)
         assert "<video" in html
-        assert "wf_pass_0/clip.mp4" in html
+        assert "wf_pass_0/9/clip.mp4" in html
 
     def test_outputs_non_media_rendered_as_download_links(self):
         run = _make_suite_run(passed_count=1, failed_count=0)
@@ -502,8 +505,10 @@ class TestRenderHTML:
         report = build_report(run)
         html = render_html(report)
         # Non-media outputs are linked but never embedded as <img>/<video>.
-        assert 'href="wf_pass_0/embedding.safetensors"' in html
-        assert 'href="wf_pass_0/metadata.json"' in html
+        assert 'href="wf_pass_0/9/embedding.safetensors"' in html
+        assert 'href="wf_pass_0/9/metadata.json"' in html
+        # Labels show only the basename for readability (no node-id).
+        assert ">embedding.safetensors<" in html
         assert "<img" not in html
         assert "<video" not in html
 

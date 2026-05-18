@@ -1386,6 +1386,48 @@ def _safe_rel(base: Path, target: Path) -> str | None:
     return str(rel).replace("\\", "/")
 
 
+def _refresh_outputs_from_disk(report: Any, base_dir: Path) -> None:
+    """Rewrite each workflow's ``outputs`` field from on-disk files.
+
+    The downloader saves workflow outputs to
+    ``<base_dir>/<workflow>/<node_id>/<file>``. Older report.json files
+    (written before this layout was reflected in ``build_report``) hold
+    bare filenames in ``WorkflowReport.outputs`` and produce broken
+    ``<img>`` srcs when rendered. We re-derive the list from disk so
+    the renderer always reflects ground truth — relative POSIX paths
+    rooted at ``<base_dir>/<workflow>/``. Workflows whose dir is
+    missing or empty are left untouched. Workflows that have
+    comparisons are skipped because their rendering is driven by the
+    comparison entries, not by ``outputs``.
+    """
+    try:
+        base = Path(base_dir)
+    except (TypeError, ValueError):
+        return
+    if not base.is_dir():
+        return
+    for wf in getattr(report, "workflows", []):
+        if getattr(wf, "comparisons", None):
+            continue
+        name = getattr(wf, "name", None)
+        if not name:
+            continue
+        wf_dir = base / name
+        if not wf_dir.is_dir():
+            continue
+        rels: list[str] = []
+        for path in sorted(wf_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(wf_dir).as_posix()
+            except ValueError:
+                continue
+            rels.append(rel)
+        if rels:
+            wf.outputs = rels
+
+
 def _suite_report_from_dict(data: dict[str, Any]) -> Any:
     """Reconstruct a ``SuiteReport`` from its ``to_dict()`` payload.
 
@@ -6430,6 +6472,7 @@ def create_app() -> Any:
                         f"/tests/{test_id}/artifact/{rel_subdir}"
                     )
                     sub_report = _suite_report_from_dict(rdata)
+                    _refresh_outputs_from_disk(sub_report, Path(out_sub))
                     parts.append(
                         f"<h2 style='margin-top:2rem'>"
                         f"Target: {sub_report.target_info.get('name', '?')} "
@@ -6457,6 +6500,7 @@ def create_app() -> Any:
 
             data = _json.loads(single_file.read_text(encoding="utf-8"))
             report_obj = _suite_report_from_dict(data)
+            _refresh_outputs_from_disk(report_obj, out_path)
             artifact_prefix = f"/tests/{test_id}/artifact"
             html = render_html(report_obj, artifact_url_prefix=artifact_prefix)
             return Response(html, mimetype="text/html")

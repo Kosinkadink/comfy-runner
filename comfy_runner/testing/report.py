@@ -130,16 +130,18 @@ def build_report(
             if r.prompt_result and r.prompt_result.execution_time
             else None
         )
-        # Flatten output filenames in node-result order. Bare names only
-        # (no subfolder) because the run's output_dir already keeps
-        # workflow outputs in a flat ``<output_dir>/<workflow>/<file>``
-        # layout — matching how _href() builds the <img>/<video> src.
+        # Flatten output paths in node-result order. The downloader
+        # saves each output under ``<output_dir>/<workflow>/<node_id>/<file>``
+        # (see ``TestClient.download_outputs``), so we prefix the
+        # filename with the node id here. This matches the on-disk
+        # layout used by ``_href()`` when building ``<img>``/``<video>``
+        # srcs in the HTML report.
         output_files: list[str] = []
         if r.prompt_result:
-            for files in r.prompt_result.outputs.values():
+            for node_id, files in r.prompt_result.outputs.items():
                 for of in files:
                     if of.filename:
-                        output_files.append(of.filename)
+                        output_files.append(f"{node_id}/{of.filename}")
         workflows.append(WorkflowReport(
             name=r.workflow_name,
             passed=r.passed,
@@ -530,18 +532,22 @@ def render_html(
                 is_video = _looks_like_video(fname)
                 rel = f"{wf.name}/{fname}"
                 href = _href(rel)
+                # ``fname`` may carry a ``<node_id>/`` prefix matching
+                # the on-disk layout; display only the basename in the
+                # label so the report stays readable.
+                display_name = Path(fname).name
                 if is_image or is_video:
                     output_tiles.append(_render_media_tile(
                         css="img-tile test",
                         label_prefix="output",
-                        filename=fname,
+                        filename=display_name,
                         href=href,
                         is_video=is_video,
                     ))
                 else:
                     other_links.append(
                         f'<li><a href="{href}" target="_blank">'
-                        f'{_html_escape(fname)}</a></li>'
+                        f'{_html_escape(display_name)}</a></li>'
                     )
             if output_tiles:
                 comparisons_html += (
