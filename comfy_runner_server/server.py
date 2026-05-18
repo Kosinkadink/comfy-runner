@@ -329,29 +329,38 @@ _MAX_TEST_RUNS = 1000
 _MAX_TEST_RUN_AGE_S = 30 * 24 * 3600  # 30 days
 
 
+_saver_instance: Any = None
+# Guards construction of ``_saver_instance``.  Without it concurrent
+# first-time callers from different request threads could each see
+# ``_saver_instance is None`` and spin up parallel DebouncedSaver
+# instances (and orphan background timer threads).
+_saver_instance_lock = threading.Lock()
+
+
 def _persistence_saver() -> Any:
     """Return the lazily-constructed DebouncedSaver for ``_test_runs``.
 
     Defined as a function (not a module-global) so test code that
-    monkey-patches the saver via ``persistence.DebouncedSaver`` lands on
-    the next call.  Cached on the module after first use.
+    resets the cached instance via ``srv._saver_instance = None`` lands
+    on the next call.  Double-checked locking keeps the fast path
+    lock-free after the saver is built.
     """
     global _saver_instance
-    if _saver_instance is None:
-        from comfy_runner_server import persistence
+    if _saver_instance is not None:
+        return _saver_instance
+    with _saver_instance_lock:
+        if _saver_instance is None:
+            from comfy_runner_server import persistence
 
-        def _snapshot() -> dict[str, dict[str, Any]]:
-            with _test_runs_lock:
-                # Deep-copy the inner dicts so the background save thread
-                # cannot observe a mutation mid-serialize.
-                import copy as _copy
-                return {k: _copy.deepcopy(v) for k, v in _test_runs.items()}
+            def _snapshot() -> dict[str, dict[str, Any]]:
+                with _test_runs_lock:
+                    # Deep-copy the inner dicts so the background save
+                    # thread cannot observe a mutation mid-serialize.
+                    import copy as _copy
+                    return {k: _copy.deepcopy(v) for k, v in _test_runs.items()}
 
-        _saver_instance = persistence.DebouncedSaver(snapshot=_snapshot)
+            _saver_instance = persistence.DebouncedSaver(snapshot=_snapshot)
     return _saver_instance
-
-
-_saver_instance: Any = None
 
 
 def _schedule_test_runs_save() -> None:
@@ -2046,11 +2055,16 @@ discovery disabled.</p>
   <td>{{ "%.2f"|format(p.cost_per_hr) }}</td>
   <td>{% if p.server_url %}<a href="{{ p.server_url }}">{{ p.server_url }}</a>{% else %}-{% endif %}</td>
   <td class="row-actions">
-    <button class="action" onclick="podAction('{{ p.name }}', 'start')"
+    {# Pass pod name via ``data-pod`` on the parent row + ``this`` rather
+       than interpolating into the JS string literal. ``|tojson`` keeps
+       Jinja autoescape from breaking the JS syntax if a pod name ever
+       contains a quote/backslash (defence-in-depth — _validate_pod_name
+       restricts the character set today). #}
+    <button class="action" onclick="podAction(this, 'start')"
       {% if p.status == 'RUNNING' %}disabled{% endif %}>Start</button>
-    <button class="action" onclick="podAction('{{ p.name }}', 'stop')"
+    <button class="action" onclick="podAction(this, 'stop')"
       {% if p.status in ('EXITED', 'TERMINATED', 'STOPPED', 'UNKNOWN') %}disabled{% endif %}>Stop</button>
-    <button class="action" onclick="prefillReview('{{ p.name }}')">Review</button>
+    <button class="action" onclick="prefillReview(this)">Review</button>
   </td>
 </tr>
 {% endfor %}
@@ -2174,7 +2188,16 @@ async function submitReview(e) {
   return false;
 }
 
-async function podAction(name, action) {
+// Pod name is read from the parent <tr data-pod="..."> rather than
+// being interpolated into the JS string at template time, so an exotic
+// pod name (quote, backslash) can never break the script.
+function _podNameFor(btn) {
+  return btn.closest('tr[data-pod]')?.dataset?.pod || '';
+}
+
+async function podAction(btn, action) {
+  const name = _podNameFor(btn);
+  if (!name) { alert('Could not determine pod name'); return; }
   const url = '/pods/' + encodeURIComponent(name) + '/' + action;
   if (!confirm(`POST ${url} ?`)) return;
   try {
@@ -2192,9 +2215,11 @@ async function podAction(name, action) {
   }
 }
 
-function prefillReview(podName) {
+function prefillReview(btn) {
+  const name = _podNameFor(btn);
+  if (!name) return;
   const sel = document.getElementById('pod-select');
-  sel.value = podName;
+  sel.value = name;
   sel.focus();
   document.getElementById('pr-review-form').scrollIntoView({behavior: 'smooth'});
 }
