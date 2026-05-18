@@ -49,6 +49,40 @@ _DEVICES_TTL = 30.0
 _DEVICES_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Discovery-result cache — stabilises the dashboard against transient blips
+# ---------------------------------------------------------------------------
+#
+# ``list_devices`` only caches the *raw* device list, but the dashboard
+# refreshes every 15 s and a single dropped /system-info probe (2 s
+# timeout, slow tailnet hop, etc.) was enough to flicker the
+# "Comfy-Runners" section between "5 responders" and "no runners" every
+# few renders.  We add a second cache layer at the discovery-result
+# level so:
+#
+# 1. Repeated dashboard renders within ``_RUNNERS_CACHE_TTL`` reuse the
+#    last computed result and don't re-probe at all.
+# 2. When a fresh computation does happen and returns 0 runners but the
+#    prior cached result had runners (and the Tailscale API itself did
+#    not error), we treat that as a transient probe failure and serve
+#    the prior result — provided it's younger than
+#    ``_RUNNERS_STICKY_MAX_AGE`` so a real fleet-wide outage still
+#    surfaces eventually.
+#
+# Pass ``force_refresh=True`` to bypass both layers.
+_RUNNERS_CACHE: dict[str, Any] = {"at": 0.0, "result": None}
+_RUNNERS_LOCK = threading.Lock()
+_RUNNERS_CACHE_TTL = 20.0
+_RUNNERS_STICKY_MAX_AGE = 300.0
+
+
+def _clear_runners_cache() -> None:
+    """Reset the discovery-result cache. Test helper."""
+    with _RUNNERS_LOCK:
+        _RUNNERS_CACHE["at"] = 0.0
+        _RUNNERS_CACHE["result"] = None
+
+
 def list_devices(force: bool = False) -> list[dict[str, Any]]:
     """Return the cached Tailscale device list, refreshing if stale.
 
@@ -434,7 +468,72 @@ def discover_comfy_runners(
     Only runners that respond to ``GET /system-info`` are included.
     Devices that fail to probe are silently dropped (the operator's
     cue is the ``device_count`` vs ``len(runners)`` gap).
+
+    Results are cached for ``_RUNNERS_CACHE_TTL`` seconds (with a
+    sticky fallback for transient probe failures) — see the cache
+    block at the top of this module.  Pass ``force_refresh=True`` to
+    bypass.
     """
+    # ── Layer 1: serve a fresh cached result if available ────────────
+    if not force_refresh:
+        with _RUNNERS_LOCK:
+            cached = _RUNNERS_CACHE.get("result")
+            cached_at = _RUNNERS_CACHE.get("at", 0.0)
+            if (
+                cached is not None
+                and time.monotonic() - cached_at < _RUNNERS_CACHE_TTL
+            ):
+                return dict(cached)
+
+    fresh = _discover_comfy_runners_uncached(
+        port=port,
+        probe_timeout=probe_timeout,
+        scheme=scheme,
+        force_refresh=force_refresh,
+    )
+
+    # ── Layer 2: sticky fallback for transient probe blips ───────────
+    # If a fresh computation drops the runner count to 0 while the
+    # Tailscale device-list call itself succeeded, treat it as a
+    # transient probe failure and serve the prior cached result —
+    # unless it's stale enough that we should let the empty state
+    # through (real outages should not be hidden indefinitely).
+    with _RUNNERS_LOCK:
+        prev = _RUNNERS_CACHE.get("result")
+        prev_at = _RUNNERS_CACHE.get("at", 0.0)
+        prev_age = time.monotonic() - prev_at
+        is_regression = (
+            prev is not None
+            and len(prev.get("runners", []) or []) > 0
+            and len(fresh.get("runners", []) or []) == 0
+            and not fresh.get("error")
+            and prev_age < _RUNNERS_STICKY_MAX_AGE
+        )
+        if is_regression:
+            log.warning(
+                "Tailnet discovery returned 0 runners (was %d %.0fs ago); "
+                "treating as transient probe failure and reusing prior result.",
+                len(prev["runners"]), prev_age,
+            )
+            # Refresh the timestamp so subsequent hits within TTL still
+            # serve from cache without re-probing — without this we'd
+            # re-run the failed probe on every dashboard render.
+            _RUNNERS_CACHE["at"] = time.monotonic()
+            return dict(prev)
+
+        _RUNNERS_CACHE["at"] = time.monotonic()
+        _RUNNERS_CACHE["result"] = dict(fresh)
+        return fresh
+
+
+def _discover_comfy_runners_uncached(
+    *,
+    port: int,
+    probe_timeout: float,
+    scheme: str,
+    force_refresh: bool,
+) -> dict[str, Any]:
+    """Inner uncached body of :func:`discover_comfy_runners`."""
     devices = list_devices(force=force_refresh)
     error = get_last_devices_error()
     api_key = get_tailscale_api_key()
