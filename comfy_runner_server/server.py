@@ -1895,6 +1895,99 @@ def _resolve_suite(suite: str) -> tuple[Path, str | None]:
     return suite_path, None
 
 
+def _rehydrate_test_run_from_dir(
+    run_dir_str: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Reconstruct a minimal test-run dict from an on-disk run directory.
+
+    Used by ``POST /tests/<id>/promote-baselines`` to support promoting
+    baselines from runs that pre-date in-memory persistence, or that
+    have aged out of the registry.
+
+    Two layouts are recognized:
+
+    * **Fleet** — ``<suites_dir>/../fleet-ci-runs/fleet-<run_id>/``
+      with a ``fleet-report.json`` file produced by
+      ``_write_fleet_summary``.
+    * **Single** — ``<suites_dir>/<suite>/runs/<run_id>/`` with a
+      ``report.json`` produced by ``write_report``.
+
+    Both paths must resolve under the managed suites tree (defense in
+    depth — we never read from arbitrary filesystem locations).
+
+    Returns ``(run_dict, error_message)`` where exactly one is None.
+    """
+    import json as _json
+
+    if not run_dir_str or not isinstance(run_dir_str, str):
+        return None, "'run_dir' must be a non-empty string"
+
+    try:
+        p = Path(run_dir_str).resolve()
+    except (OSError, ValueError) as e:
+        return None, f"Invalid run_dir: {e}"
+    if not p.is_dir():
+        return None, f"run_dir not found or not a directory: {run_dir_str}"
+
+    suites_dir = _get_suites_dir()
+    fleet_root = (suites_dir.parent / "fleet-ci-runs").resolve()
+
+    is_under_fleet = p.is_relative_to(fleet_root) if fleet_root.exists() else False
+    is_under_suite = p.is_relative_to(suites_dir)
+    if not (is_under_fleet or is_under_suite):
+        return None, (
+            "run_dir must be under the managed fleet-ci-runs or "
+            "suites directory"
+        )
+
+    fleet_report = p / "fleet-report.json"
+    single_report = p / "report.json"
+
+    if fleet_report.is_file():
+        try:
+            summary = _json.loads(fleet_report.read_text(encoding="utf-8"))
+        except (OSError, _json.JSONDecodeError) as e:
+            return None, f"Could not read fleet-report.json: {e}"
+        return {
+            "kind": "fleet",
+            "status": "done",
+            "output_dir": str(p),
+            "summary": summary,
+            "rehydrated": True,
+        }, None
+
+    if single_report.is_file():
+        try:
+            report = _json.loads(single_report.read_text(encoding="utf-8"))
+        except (OSError, _json.JSONDecodeError) as e:
+            return None, f"Could not read report.json: {e}"
+        # Derive the suite name from either the report or the
+        # ``<suite>/runs/<run_id>`` directory layout.
+        suite_name = ""
+        if p.parent.name == "runs":
+            suite_name = p.parent.parent.name
+        if not suite_name:
+            suite_name = report.get("suite_name") or ""
+        if not suite_name:
+            return None, (
+                "Could not determine suite name from run_dir "
+                "(expected <suite>/runs/<id> layout or 'suite_name' "
+                "field in report.json)"
+            )
+        return {
+            "kind": "single",
+            "status": "done",
+            "output_dir": str(p),
+            "suite": suite_name,
+            "report": report,
+            "rehydrated": True,
+        }, None
+
+    return None, (
+        "No fleet-report.json or report.json found in run_dir"
+    )
+
+
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -6298,17 +6391,32 @@ def create_app() -> Any:
     def route_tests_promote_baselines(test_id: str) -> Any:
         import shutil
 
-        with _test_runs_lock:
-            run = _test_runs.get(test_id)
-        if not run:
-            return _err(f"Test run '{test_id}' not found", 404)
-
         # We only promote from successful runs by default.  Pass
         # ``allow_failed=true`` to ignore the per-target pass flag (rare
         # — usually only useful when promoting one workflow that
         # happened to pass inside a partially-failed run).
         body = request.get_json(silent=True) or {}
         allow_failed = bool(body.get("allow_failed", False))
+        rehydrate_run_dir = body.get("run_dir")
+
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+
+        # Rehydration path: runs that occurred before persistence was
+        # rolled out (or that have aged out of memory) can still be
+        # promoted by pointing at their on-disk output directory.  We
+        # read ``fleet-report.json`` (fleet) or ``report.json`` (single)
+        # to reconstruct just enough of the run dict to drive the
+        # promotion loop below.
+        if not run and rehydrate_run_dir:
+            run, rehydrate_err = _rehydrate_test_run_from_dir(
+                rehydrate_run_dir,
+            )
+            if rehydrate_err:
+                return _err(rehydrate_err)
+
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
 
         # Collect (suite_name, output_dir) tuples for each suite that
         # produced outputs. For fleet runs we walk the per-target
@@ -6432,6 +6540,7 @@ def create_app() -> Any:
             "suites": per_suite,
             "total_workflows_approved": total_approved,
             "errors": any_error,
+            "rehydrated": bool(run.get("rehydrated")),
         })
 
     # ------------------------------------------------------------------

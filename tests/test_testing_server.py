@@ -514,3 +514,85 @@ class TestPromoteBaselines:
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["total_workflows_approved"] == 1
+
+    def test_promote_rehydrate_fleet_from_run_dir(
+        self, client, tmp_path, clean_test_runs, monkeypatch,
+    ):
+        """Unknown test_id + run_dir → reconstruct fleet run from disk."""
+        import comfy_runner_server.server as srv
+        suites_dir = tmp_path / "test-suites"
+        suites_dir.mkdir()
+        monkeypatch.setattr(srv, "_SUITES_DIR", suites_dir)
+        suite_dir = self._make_managed_suite(suites_dir, "rehydrate-smoke")
+
+        # Fleet output layout — must live under sibling fleet-ci-runs/.
+        fleet_root = suites_dir.parent / "fleet-ci-runs"
+        run_root = fleet_root / "fleet-20260517-225847"
+        target_out = run_root / "0-pod" / "rehydrate-smoke"
+        wf_out = target_out / "smoke"
+        wf_out.mkdir(parents=True)
+        (wf_out / "out_0.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+        # Write the on-disk summary that rehydration reads.
+        (run_root / "fleet-report.json").write_text(json.dumps({
+            "suite_name": "fleet-ci",
+            "results": [{
+                "target_name": "pod/rehydrate-smoke",
+                "target_kind": "remote",
+                "passed": True,
+                "output_dir": str(target_out),
+            }],
+        }), encoding="utf-8")
+
+        # test_id is NOT in memory — rehydration via run_dir succeeds.
+        resp = client.post(
+            "/tests/T-not-in-memory/promote-baselines",
+            json={"run_dir": str(run_root)},
+        )
+        assert resp.status_code == 200, resp.get_json()
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["rehydrated"] is True
+        assert data["total_workflows_approved"] == 1
+        bl = suite_dir / "baselines" / "smoke" / "out_0.png"
+        assert bl.is_file()
+
+    def test_promote_rehydrate_rejects_paths_outside_managed_roots(
+        self, client, tmp_path, clean_test_runs, monkeypatch,
+    ):
+        import comfy_runner_server.server as srv
+        suites_dir = tmp_path / "test-suites"
+        suites_dir.mkdir()
+        monkeypatch.setattr(srv, "_SUITES_DIR", suites_dir)
+
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        (outside / "fleet-report.json").write_text("{}", encoding="utf-8")
+
+        resp = client.post(
+            "/tests/T-x/promote-baselines",
+            json={"run_dir": str(outside)},
+        )
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert data["ok"] is False
+        assert "managed" in data["error"].lower()
+
+    def test_promote_rehydrate_missing_report_returns_error(
+        self, client, tmp_path, clean_test_runs, monkeypatch,
+    ):
+        import comfy_runner_server.server as srv
+        suites_dir = tmp_path / "test-suites"
+        suites_dir.mkdir()
+        monkeypatch.setattr(srv, "_SUITES_DIR", suites_dir)
+
+        fleet_root = suites_dir.parent / "fleet-ci-runs"
+        run_root = fleet_root / "fleet-empty"
+        run_root.mkdir(parents=True)
+
+        resp = client.post(
+            "/tests/T-x/promote-baselines",
+            json={"run_dir": str(run_root)},
+        )
+        assert resp.status_code == 400
+        assert "report" in resp.get_json()["error"].lower()
