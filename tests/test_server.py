@@ -1240,13 +1240,16 @@ class TestTailnetRunners:
         from unittest.mock import patch
         from comfy_runner_server import server as srv
         # Seed one fleet run so the template renders the new columns.
+        import time as _time
         with srv._test_runs_lock:
             srv._test_runs["fleet-xyz"] = {
                 "id": "fleet-xyz",
                 "kind": "fleet",
                 "suite": "a,b,c",
                 "status": "done",
-                "created_at": 1.0,
+                # Use a fresh timestamp so the age-cap GC in _list_test_runs
+                # doesn't immediately evict the seeded record.
+                "created_at": _time.time(),
                 "targets": [{"kind": "remote", "pod_name": "p"}],
                 "summary": {
                     "targets_passed": 3,

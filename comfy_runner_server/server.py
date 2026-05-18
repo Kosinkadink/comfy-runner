@@ -311,11 +311,58 @@ def _force_release_lock(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Test run index — tracks test runs separately from generic jobs
+# Test run index — tracks test runs separately from generic jobs.
+#
+# Persisted to disk via comfy_runner_server.persistence so the dashboard
+# "Recent Test Runs" section survives server restart, self-update, and
+# crashes.  Writes are debounced (default 2 s trailing) to coalesce
+# bursty fleet-CI updates.
 # ---------------------------------------------------------------------------
 
 _test_runs_lock = threading.Lock()
 _test_runs: dict[str, dict[str, Any]] = {}
+
+# Bumped from 200 → 1000 now that the registry persists. Beyond size
+# also evict anything older than _MAX_TEST_RUN_AGE_S so the file does
+# not grow unboundedly when a long-lived server keeps churning runs.
+_MAX_TEST_RUNS = 1000
+_MAX_TEST_RUN_AGE_S = 30 * 24 * 3600  # 30 days
+
+
+def _persistence_saver() -> Any:
+    """Return the lazily-constructed DebouncedSaver for ``_test_runs``.
+
+    Defined as a function (not a module-global) so test code that
+    monkey-patches the saver via ``persistence.DebouncedSaver`` lands on
+    the next call.  Cached on the module after first use.
+    """
+    global _saver_instance
+    if _saver_instance is None:
+        from comfy_runner_server import persistence
+
+        def _snapshot() -> dict[str, dict[str, Any]]:
+            with _test_runs_lock:
+                # Deep-copy the inner dicts so the background save thread
+                # cannot observe a mutation mid-serialize.
+                import copy as _copy
+                return {k: _copy.deepcopy(v) for k, v in _test_runs.items()}
+
+        _saver_instance = persistence.DebouncedSaver(snapshot=_snapshot)
+    return _saver_instance
+
+
+_saver_instance: Any = None
+
+
+def _schedule_test_runs_save() -> None:
+    """Schedule a debounced persistence write (no-op if disabled)."""
+    import os
+    if os.environ.get("COMFY_RUNNER_DISABLE_TEST_RUN_PERSISTENCE"):
+        return
+    try:
+        _persistence_saver().schedule()
+    except Exception as e:  # noqa: BLE001
+        log.debug("test-run persistence schedule failed: %s", e)
 
 
 def _register_test_run(job_id: str, meta: dict[str, Any]) -> None:
@@ -326,29 +373,74 @@ def _register_test_run(job_id: str, meta: dict[str, Any]) -> None:
             "created_at": time.time(),
             **meta,
         }
+    _schedule_test_runs_save()
 
 
 def _finish_test_run(job_id: str, updates: dict[str, Any], status: str = "done") -> None:
     """Update a test run with final results and persist status."""
+    changed = False
     with _test_runs_lock:
         run = _test_runs.get(job_id)
         if run:
             run.update(updates)
             run["status"] = status
             run["finished_at"] = time.time()
-
-
-_MAX_TEST_RUNS = 200
+            changed = True
+    if changed:
+        _schedule_test_runs_save()
 
 
 def _gc_test_runs() -> None:
-    """Evict oldest test runs beyond the limit (caller must hold lock)."""
-    if len(_test_runs) <= _MAX_TEST_RUNS:
-        return
-    by_time = sorted(_test_runs.keys(), key=lambda k: _test_runs[k].get("created_at", 0))
-    to_remove = len(_test_runs) - _MAX_TEST_RUNS
-    for k in by_time[:to_remove]:
+    """Evict expired and over-cap test runs (caller must hold lock).
+
+    Eviction order:
+    1. Drop entries older than ``_MAX_TEST_RUN_AGE_S`` regardless of count.
+    2. If still over ``_MAX_TEST_RUNS``, drop the oldest by ``created_at``.
+
+    Triggers a debounced persistence save only if something was removed.
+    """
+    removed = False
+    now = time.time()
+    # Age-based expiry first.
+    expired = [
+        k for k, v in _test_runs.items()
+        if now - v.get("created_at", 0) > _MAX_TEST_RUN_AGE_S
+    ]
+    for k in expired:
         del _test_runs[k]
+        removed = True
+    # Size-based cap.
+    if len(_test_runs) > _MAX_TEST_RUNS:
+        by_time = sorted(_test_runs.keys(), key=lambda k: _test_runs[k].get("created_at", 0))
+        to_remove = len(_test_runs) - _MAX_TEST_RUNS
+        for k in by_time[:to_remove]:
+            del _test_runs[k]
+            removed = True
+    if removed:
+        # Caller holds _test_runs_lock; schedule is lock-free so it's safe.
+        _schedule_test_runs_save()
+
+
+def _load_persisted_test_runs() -> None:
+    """Populate ``_test_runs`` from disk.  Called once at server startup."""
+    import os
+    if os.environ.get("COMFY_RUNNER_DISABLE_TEST_RUN_PERSISTENCE"):
+        return
+    try:
+        from comfy_runner_server import persistence
+        persisted = persistence.load_test_runs()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Failed to load persisted test runs: %s", e)
+        return
+    if not persisted:
+        return
+    with _test_runs_lock:
+        # Existing in-memory entries (rare — only if a test seeded data
+        # before startup ran) win over persisted ones.
+        for k, v in persisted.items():
+            _test_runs.setdefault(k, v)
+        _gc_test_runs()
+    log.info("Loaded %d persisted test run(s) from disk", len(persisted))
 
 
 def _list_test_runs(limit: int = 50) -> list[dict[str, Any]]:
@@ -1936,6 +2028,10 @@ discovery disabled.</p>
 def create_app() -> Any:
     """Create and return a Flask app that manages all installations."""
     from flask import Flask, request, jsonify
+
+    # Restore persisted test-run history before serving any request.
+    # Best-effort: a corrupt or missing file just leaves _test_runs empty.
+    _load_persisted_test_runs()
 
     app = Flask(__name__)
 
