@@ -1417,6 +1417,14 @@ def _suite_report_from_dict(data: dict[str, Any]) -> Any:
                 test_file=comp.get("test_file", ""),
                 result=cr,
             ))
+        # ``outputs`` is the bare-filename list ``build_report``
+        # populates so ``render_html`` can render thumbnails for
+        # baseline-less runs. Older report.json files (pre-PR #63)
+        # won't have it; default to ``[]`` so the renderer just shows
+        # no thumbnails for those.
+        outputs = wf.get("outputs") or []
+        if not isinstance(outputs, list):
+            outputs = []
         workflows.append(WorkflowReport(
             name=wf.get("name", ""),
             passed=bool(wf.get("passed", False)),
@@ -1425,6 +1433,7 @@ def _suite_report_from_dict(data: dict[str, Any]) -> Any:
             output_count=int(wf.get("output_count", 0) or 0),
             has_baseline=bool(wf.get("has_baseline", False)),
             comparisons=comparisons,
+            outputs=[str(o) for o in outputs if isinstance(o, str)],
         ))
     return SuiteReport(
         suite_name=data.get("suite_name", ""),
