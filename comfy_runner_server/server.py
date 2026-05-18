@@ -1877,14 +1877,29 @@ discovery disabled.</p>
 <h2>Recent Test Runs</h2>
 {% if test_runs %}
 <table>
-<tr><th>ID</th><th>Kind</th><th>Suite</th><th>Status</th><th>Targets</th></tr>
+<tr>
+  <th>ID</th><th>Kind</th><th>Suite</th><th>Status</th>
+  <th>Results</th><th>Report</th><th>Raw</th>
+</tr>
 {% for t in test_runs %}
 <tr>
-  <td><a href="/tests/{{ t.id }}">{{ t.id }}</a></td>
+  <td>{{ t.id }}</td>
   <td>{{ t.kind }}</td>
-  <td>{{ t.suite }}</td>
+  <td>{% set s = t.suite or "" %}{% if s|length > 60 %}{{ s[:60] }}…{% else %}{{ s }}{% endif %}</td>
   <td class="{{ t.status }}">{{ t.status }}</td>
-  <td>{{ t.targets|length }}</td>
+  <td>
+    {% if t.summary and t.summary.total_targets is defined %}
+      {% set tp = t.summary.targets_passed|default(0) %}
+      {% set tt = t.summary.total_targets|default(0) %}
+      {% set tf = t.summary.targets_failed|default(0) %}
+      <span class="{% if tf == 0 and tt > 0 %}running{% elif tf > 0 %}failed{% endif %}">{{ tp }}/{{ tt }}{% if tf > 0 %} ({{ tf }} failed){% endif %}</span>
+    {% else %}
+      -
+    {% endif %}
+  </td>
+  <td><a href="/tests/{{ t.id }}/report?format=html">HTML</a> ·
+      <a href="/tests/{{ t.id }}/report?format=markdown">MD</a></td>
+  <td><a href="/tests/{{ t.id }}">JSON</a></td>
 </tr>
 {% endfor %}
 </table>
