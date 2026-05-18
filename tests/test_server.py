@@ -1233,20 +1233,21 @@ class TestTailnetRunners:
         assert "runpod" in body
         assert "#1234" in body
 
-    def test_dashboard_pr_review_form_renders_with_pods(
+    def test_dashboard_does_not_render_pr_review_form_or_pod_actions(
         self, client, tmp_config_dir, monkeypatch,
     ):
-        """The PR review form shows a pod option per registered pod."""
+        """The dashboard is read-only — no PR review launcher and no
+        per-pod Start/Stop/Review buttons (these were removed because
+        they didn't work reliably). Pods are still listed in a table
+        with their status, purpose, GPU, cost, and server URL."""
         from unittest.mock import patch
         from comfy_runner_server import server as srv
-        # Fake list_pod_records and the provider so a pod shows up.
         monkeypatch.setattr(
             "comfy_runner.hosted.config.list_pod_records",
             lambda _provider: {"ci-runner": {
                 "id": "abc", "purpose": "ci-runner", "gpu_type": "L40S",
             }},
         )
-        # Stub _get_runpod_provider to return a fake provider with empty pods.
         class _FakeProv:
             def list_pods(self):
                 return []
@@ -1261,19 +1262,17 @@ class TestTailnetRunners:
             resp = client.get("/dashboard")
         assert resp.status_code == 200
         body = resp.data.decode("utf-8")
-        assert 'id="pr-review-form"' in body
-        assert 'name="pod"' in body
-        # The pod is rendered as an option with its purpose badge.
-        assert 'value="ci-runner"' in body
-        assert 'ci-runner' in body
-        # JS handlers are present.
-        assert "submitReview" in body
-        assert "podAction" in body
-        assert "prefillReview" in body
-        # Per-pod Review button passes ``this`` (no interpolated pod name)
-        # and the row carries the name via data-pod.
-        assert "prefillReview(this)" in body
-        assert 'data-pod="ci-runner"' in body
+        # Pod row is still rendered (read-only).
+        assert "ci-runner" in body
+        # Launch PR Review form and all its JS handlers are gone.
+        assert 'id="pr-review-form"' not in body
+        assert "Launch PR Review" not in body
+        assert "submitReview" not in body
+        assert "podAction" not in body
+        assert "prefillReview" not in body
+        # No data-pod attribute, no row-actions buttons.
+        assert "data-pod=" not in body
+        assert "row-actions" not in body
 
     def test_dashboard_pod_purpose_badge_renders(
         self, client, tmp_config_dir, monkeypatch,

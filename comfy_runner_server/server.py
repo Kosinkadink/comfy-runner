@@ -1918,42 +1918,6 @@ _DASHBOARD_HTML = """\
   a { color: #00d9ff; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .refresh { color: #555; font-size: 0.85rem; }
-  /* PR review form */
-  .card {
-    background: #20203a; border: 1px solid #2a2a4e; border-radius: 6px;
-    padding: 1rem 1.2rem; margin: 0 0 2rem 0;
-  }
-  .card h2 { border: none; margin-top: 0; }
-  .form-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; margin-bottom: 0.5rem; }
-  .form-row label { display: flex; flex-direction: column; gap: 0.25rem;
-                    color: #7c8db5; font-size: 0.85rem; }
-  .form-row input[type=text], .form-row input[type=number], .form-row select {
-    background: #1a1a2e; color: #e0e0e0;
-    border: 1px solid #3a3a5e; border-radius: 4px;
-    padding: 0.4rem 0.6rem; font-family: inherit; font-size: 0.9rem; min-width: 8rem;
-  }
-  .form-row input[type=number] { width: 6rem; }
-  .form-row .checks { flex-direction: row; align-items: center; gap: 0.4rem;
-                      color: #e0e0e0; font-size: 0.9rem; }
-  button.action {
-    background: #00d9ff22; color: #00d9ff; border: 1px solid #00d9ff66;
-    border-radius: 4px; padding: 0.35rem 0.85rem;
-    font-family: inherit; font-size: 0.85rem; cursor: pointer;
-  }
-  button.action:hover { background: #00d9ff33; }
-  button.action.primary { background: #00d9ff; color: #1a1a2e; font-weight: 600; }
-  button.action.primary:hover { background: #00b8d4; }
-  button.action.danger { color: #f44336; border-color: #f4433666; background: #f4433611; }
-  button.action.danger:hover { background: #f4433622; }
-  button.action:disabled { opacity: 0.4; cursor: not-allowed; }
-  .row-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-  .result {
-    margin-top: 0.8rem; padding: 0.6rem 0.8rem; border-radius: 4px;
-    border: 1px solid #2a2a4e; background: #1a1a2e; font-size: 0.85rem;
-    white-space: pre-wrap; word-break: break-word;
-  }
-  .result.ok { border-color: #4caf5066; color: #4caf50; }
-  .result.err { border-color: #f4433666; color: #f44336; }
   .badge { display: inline-block; padding: 0.1rem 0.45rem; border-radius: 3px;
            font-size: 0.7rem; background: #2a2a4e; color: #94a3b8; margin-left: 0.4rem; }
   .badge.pr { background: #00d9ff22; color: #00d9ff; }
@@ -1963,50 +1927,7 @@ _DASHBOARD_HTML = """\
 </head>
 <body>
 <h1>comfy-runner Dashboard</h1>
-<p class="refresh">Auto-refreshes every 15s. Focusing any form input pauses refresh until reload.</p>
-
-<!-- ====================================================== -->
-<!-- Launch PR Review (this is the interactive entry point) -->
-<!-- ====================================================== -->
-<div class="card">
-<h2>Launch PR Review</h2>
-<p class="refresh">
-  Deploys the requested PR to the chosen pod and runs review prep:
-  fetches the PR-body <code>comfyrunner</code> manifest, pulls workflows,
-  and provisions any declared models.
-</p>
-<form id="pr-review-form" onsubmit="return submitReview(event)">
-  <div class="form-row">
-    <label>Target pod
-      <select name="pod" id="pod-select" required>
-        <option value="">-- choose --</option>
-        {% for p in pods %}
-        <option value="{{ p.name }}" data-purpose="{{ p.purpose or 'persistent' }}" data-status="{{ p.status }}">
-          {{ p.name }} ({{ p.status }}, purpose={{ p.purpose or 'persistent' }})
-        </option>
-        {% endfor %}
-      </select>
-    </label>
-    <label>Repo
-      <input type="text" name="repo" placeholder="owner/name" required>
-    </label>
-    <label>PR #
-      <input type="number" name="pr" min="1" required>
-    </label>
-    <label>Install
-      <input type="text" name="install" value="main" required>
-    </label>
-    <label class="checks">
-      <input type="checkbox" name="force_deploy"> Force redeploy
-    </label>
-    <label class="checks">
-      <input type="checkbox" name="force_purpose"> Override purpose gate
-    </label>
-    <button type="submit" class="action primary">Launch Review</button>
-  </div>
-</form>
-<div id="pr-review-result" class="result" style="display:none"></div>
-</div>
+<p class="refresh">Auto-refreshes every 15s.</p>
 
 <h2>Comfy-Runners (Tailnet)</h2>
 {% if tailnet.error %}
@@ -2045,27 +1966,15 @@ discovery disabled.</p>
 <h2>Pods (RunPod registry)</h2>
 {% if pods %}
 <table>
-<tr><th>Name</th><th>Status</th><th>Purpose</th><th>GPU</th><th>$/hr</th><th>Server URL</th><th>Actions</th></tr>
+<tr><th>Name</th><th>Status</th><th>Purpose</th><th>GPU</th><th>$/hr</th><th>Server URL</th></tr>
 {% for p in pods %}
-<tr data-pod="{{ p.name }}">
+<tr>
   <td>{{ p.name }}</td>
   <td class="{{ p.status|lower }}">{{ p.status }}</td>
   <td>{% if p.purpose %}<span class="badge {{ p.purpose }}">{{ p.purpose }}</span>{% else %}-{% endif %}</td>
   <td>{{ p.gpu_type }}</td>
   <td>{{ "%.2f"|format(p.cost_per_hr) }}</td>
   <td>{% if p.server_url %}<a href="{{ p.server_url }}">{{ p.server_url }}</a>{% else %}-{% endif %}</td>
-  <td class="row-actions">
-    {# Pass pod name via ``data-pod`` on the parent row + ``this`` rather
-       than interpolating into the JS string literal. ``|tojson`` keeps
-       Jinja autoescape from breaking the JS syntax if a pod name ever
-       contains a quote/backslash (defence-in-depth — _validate_pod_name
-       restricts the character set today). #}
-    <button class="action" onclick="podAction(this, 'start')"
-      {% if p.status == 'RUNNING' %}disabled{% endif %}>Start</button>
-    <button class="action" onclick="podAction(this, 'stop')"
-      {% if p.status in ('EXITED', 'TERMINATED', 'STOPPED', 'UNKNOWN') %}disabled{% endif %}>Stop</button>
-    <button class="action" onclick="prefillReview(this)">Review</button>
-  </td>
 </tr>
 {% endfor %}
 </table>
@@ -2122,108 +2031,6 @@ discovery disabled.</p>
 {% else %}
 <p>No active jobs.</p>
 {% endif %}
-
-<script>
-// Pause the meta-refresh while the user is interacting with any form
-// input — otherwise typing into the PR review form would be wiped out
-// every 15 seconds.
-document.querySelectorAll('input, select, textarea').forEach(el => {
-  el.addEventListener('focus', () => {
-    document.querySelector('meta[http-equiv="refresh"]')?.remove();
-  });
-});
-
-function showResult(elId, text, ok) {
-  const el = document.getElementById(elId);
-  el.style.display = 'block';
-  el.className = 'result ' + (ok ? 'ok' : 'err');
-  el.textContent = text;
-}
-
-async function submitReview(e) {
-  e.preventDefault();
-  const form = document.getElementById('pr-review-form');
-  const data = new FormData(form);
-  const pod = data.get('pod');
-  const repo = (data.get('repo') || '').trim();
-  if (!pod || !repo.includes('/')) {
-    showResult('pr-review-result', "Repo must be 'owner/name'.", false);
-    return false;
-  }
-  const [owner, repoName] = repo.split('/', 2);
-  const body = {
-    owner: owner.trim(),
-    repo: repoName.trim(),
-    pr: parseInt(data.get('pr'), 10),
-    install: (data.get('install') || 'main').trim(),
-    force_deploy: !!data.get('force_deploy'),
-    force_purpose: !!data.get('force_purpose'),
-  };
-  const btn = form.querySelector('button[type=submit]');
-  btn.disabled = true;
-  btn.textContent = 'Launching...';
-  try {
-    const resp = await fetch('/pods/' + encodeURIComponent(pod) + '/review', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    const j = await resp.json();
-    if (resp.ok && j.ok) {
-      const jobUrl = '/job/' + j.job_id;
-      showResult('pr-review-result',
-        `Launched. Job ID: ${j.job_id}\nFollow it: ${window.location.origin}${jobUrl}`,
-        true);
-    } else {
-      showResult('pr-review-result',
-        `HTTP ${resp.status}: ${j.error || JSON.stringify(j)}`,
-        false);
-    }
-  } catch (err) {
-    showResult('pr-review-result', `Network error: ${err}`, false);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Launch Review';
-  }
-  return false;
-}
-
-// Pod name is read from the parent <tr data-pod="..."> rather than
-// being interpolated into the JS string at template time, so an exotic
-// pod name (quote, backslash) can never break the script.
-function _podNameFor(btn) {
-  return btn.closest('tr[data-pod]')?.dataset?.pod || '';
-}
-
-async function podAction(btn, action) {
-  const name = _podNameFor(btn);
-  if (!name) { alert('Could not determine pod name'); return; }
-  const url = '/pods/' + encodeURIComponent(name) + '/' + action;
-  if (!confirm(`POST ${url} ?`)) return;
-  try {
-    const resp = await fetch(url, {method: 'POST'});
-    const j = await resp.json();
-    if (resp.ok && j.ok) {
-      // Quick visual feedback then reload to pick up the new status.
-      alert(`${action} OK${j.job_id ? '\nJob: ' + j.job_id : ''}`);
-      window.location.reload();
-    } else {
-      alert(`Failed: HTTP ${resp.status}\n${j.error || JSON.stringify(j)}`);
-    }
-  } catch (err) {
-    alert(`Network error: ${err}`);
-  }
-}
-
-function prefillReview(btn) {
-  const name = _podNameFor(btn);
-  if (!name) return;
-  const sel = document.getElementById('pod-select');
-  sel.value = name;
-  sel.focus();
-  document.getElementById('pr-review-form').scrollIntoView({behavior: 'smooth'});
-}
-</script>
 
 </body>
 </html>
