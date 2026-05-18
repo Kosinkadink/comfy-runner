@@ -408,3 +408,109 @@ class TestTestsReportHtml:
         assert "<img" in html
         # Mimetype is text/html.
         assert resp.mimetype == "text/html"
+
+
+class TestPromoteBaselines:
+    """POST /tests/<test_id>/promote-baselines — bulk-approve fleet outputs."""
+
+    def _make_managed_suite(self, root: Path, name: str) -> Path:
+        suite_dir = root / name
+        suite_dir.mkdir(parents=True)
+        (suite_dir / "suite.json").write_text(json.dumps({
+            "name": name, "description": "x",
+        }))
+        wf_dir = suite_dir / "workflows"
+        wf_dir.mkdir()
+        (wf_dir / "smoke.json").write_text(json.dumps({
+            "1": {"class_type": "KSampler", "inputs": {"seed": 0}},
+        }))
+        return suite_dir
+
+    def test_promote_fleet_run_copies_outputs_to_baselines(
+        self, client, tmp_path, clean_test_runs, monkeypatch,
+    ):
+        # Managed suites dir + one suite registered there.
+        import comfy_runner_server.server as srv
+        suites_dir = tmp_path / "test-suites"
+        suites_dir.mkdir()
+        monkeypatch.setattr(srv, "_SUITES_DIR", suites_dir)
+        suite_dir = self._make_managed_suite(suites_dir, "my-smoke")
+
+        # Fleet output: tmp_path/run/0-pod/my-smoke/smoke/out_0.png
+        run_root = tmp_path / "run"
+        target_out = run_root / "0-pod" / "my-smoke"
+        wf_out = target_out / "smoke"
+        wf_out.mkdir(parents=True)
+        (wf_out / "out_0.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        (wf_out / "out_1.png").write_bytes(b"\x89PNG\r\n\x1a\nfake2")
+
+        test_id = "T-fleet-promote-1"
+        clean_test_runs._test_runs[test_id] = {
+            "id": test_id,
+            "kind": "fleet",
+            "status": "done",
+            "created_at": 1.0,
+            "output_dir": str(run_root),
+            "summary": {
+                "results": [{
+                    "passed": True,
+                    "output_dir": str(target_out),
+                    "target_name": "pod/my-smoke",
+                    "target_kind": "remote",
+                }],
+            },
+        }
+
+        resp = client.post(f"/tests/{test_id}/promote-baselines", json={})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["total_workflows_approved"] == 1
+        assert data["errors"] is False
+        assert data["suites"][0]["approved"] == ["smoke"]
+        # Files actually landed in the suite's baselines dir.
+        bl_dir = suite_dir / "baselines" / "smoke"
+        assert (bl_dir / "out_0.png").is_file()
+        assert (bl_dir / "out_1.png").is_file()
+
+    def test_promote_unknown_test_id_returns_404(self, client, clean_test_runs):
+        resp = client.post("/tests/T-nope/promote-baselines", json={})
+        assert resp.status_code == 404
+        assert resp.get_json()["ok"] is False
+
+    def test_promote_skips_failed_targets_by_default(
+        self, client, tmp_path, clean_test_runs, monkeypatch,
+    ):
+        import comfy_runner_server.server as srv
+        suites_dir = tmp_path / "test-suites"
+        suites_dir.mkdir()
+        monkeypatch.setattr(srv, "_SUITES_DIR", suites_dir)
+        self._make_managed_suite(suites_dir, "failed-smoke")
+
+        run_root = tmp_path / "run"
+        target_out = run_root / "0-pod" / "failed-smoke"
+        wf_out = target_out / "smoke"
+        wf_out.mkdir(parents=True)
+        (wf_out / "out_0.png").write_bytes(b"\x89PNG")
+
+        test_id = "T-fleet-failed"
+        clean_test_runs._test_runs[test_id] = {
+            "id": test_id, "kind": "fleet", "status": "done", "created_at": 1.0,
+            "output_dir": str(run_root),
+            "summary": {"results": [{
+                "passed": False, "output_dir": str(target_out),
+                "target_name": "pod/failed-smoke", "target_kind": "remote",
+            }]},
+        }
+
+        # Default: failed target is skipped → no promotable targets → 400.
+        resp = client.post(f"/tests/{test_id}/promote-baselines", json={})
+        assert resp.status_code == 400
+
+        # allow_failed=true promotes anyway.
+        resp = client.post(
+            f"/tests/{test_id}/promote-baselines", json={"allow_failed": True},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["total_workflows_approved"] == 1
