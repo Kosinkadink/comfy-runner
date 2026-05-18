@@ -6286,6 +6286,155 @@ def create_app() -> Any:
         return jsonify({"ok": True, **entry})
 
     # ------------------------------------------------------------------
+    # POST /tests/<test_id>/promote-baselines —
+    #     mirror the CLI ``test baseline --approve-all`` flow across
+    #     every suite in a (single or fleet) test run.
+    #
+    # This is the missing link between "ran tests, got outputs" and
+    # "now those outputs are the expected results so the next run can
+    # be graded against them via SSIM / video_frame_ssim / etc".
+    # ------------------------------------------------------------------
+    @app.route("/tests/<test_id>/promote-baselines", methods=["POST"])
+    def route_tests_promote_baselines(test_id: str) -> Any:
+        import shutil
+
+        with _test_runs_lock:
+            run = _test_runs.get(test_id)
+        if not run:
+            return _err(f"Test run '{test_id}' not found", 404)
+
+        # We only promote from successful runs by default.  Pass
+        # ``allow_failed=true`` to ignore the per-target pass flag (rare
+        # — usually only useful when promoting one workflow that
+        # happened to pass inside a partially-failed run).
+        body = request.get_json(silent=True) or {}
+        allow_failed = bool(body.get("allow_failed", False))
+
+        # Collect (suite_name, output_dir) tuples for each suite that
+        # produced outputs. For fleet runs we walk the per-target
+        # results recorded in ``summary``; for single runs we use the
+        # run's top-level output_dir + suite name.
+        targets: list[tuple[str, Path]] = []
+        is_fleet = run.get("kind") == "fleet"
+        if is_fleet:
+            results = (run.get("summary") or {}).get("results") or []
+            for r in results:
+                if not allow_failed and not r.get("passed", False):
+                    continue
+                out_sub = r.get("output_dir")
+                target_name = r.get("target_name") or ""
+                # ``target_name`` is ``pod/suite`` for fleet-CI; fall back
+                # to the leaf directory name if the format ever changes.
+                if "/" in target_name:
+                    suite_name = target_name.rsplit("/", 1)[-1]
+                elif out_sub:
+                    suite_name = Path(out_sub).name
+                else:
+                    continue
+                if not out_sub:
+                    continue
+                targets.append((suite_name, Path(out_sub)))
+        else:
+            out_dir = run.get("output_dir")
+            if not out_dir:
+                return _err("Test run has no output directory yet")
+            if not allow_failed and run.get("status") != "done":
+                return _err(
+                    "Refusing to promote: run is not done. "
+                    "Pass allow_failed=true to override.",
+                )
+            suite_name = run.get("suite") or ""
+            if not suite_name:
+                return _err("Could not determine suite name for this run")
+            targets.append((suite_name, Path(out_dir)))
+
+        if not targets:
+            return _err(
+                "No promotable targets found (all targets failed?). "
+                "Pass allow_failed=true to promote anyway.",
+            )
+
+        # Promote each suite. Per-suite errors are accumulated into the
+        # response instead of aborting so a single broken suite cannot
+        # prevent the rest from getting baselines.
+        from comfy_runner.testing.suite import load_suite
+
+        per_suite: list[dict[str, Any]] = []
+        total_approved = 0
+        any_error = False
+        for suite_name, output_dir in targets:
+            entry: dict[str, Any] = {"suite": suite_name, "output_dir": str(output_dir)}
+            try:
+                suite_path, err = _resolve_suite(suite_name)
+                if err:
+                    entry["error"] = err
+                    any_error = True
+                    per_suite.append(entry)
+                    continue
+                suite = load_suite(suite_path)
+            except Exception as e:  # noqa: BLE001
+                entry["error"] = f"Could not load suite: {e}"
+                any_error = True
+                per_suite.append(entry)
+                continue
+
+            if not output_dir.is_dir():
+                entry["error"] = f"Output dir missing: {output_dir}"
+                any_error = True
+                per_suite.append(entry)
+                continue
+
+            baselines_dir = suite.baselines_dir
+            approved: list[str] = []
+            skipped: list[str] = []
+            collisions: list[str] = []
+
+            # Mirror the CLI's ``_test_baseline`` logic exactly so the
+            # dashboard route + the CLI converge on identical layouts.
+            for wf in suite.workflows:
+                wf_name = wf.stem
+                wf_run_dir = output_dir / wf_name
+                if not wf_run_dir.is_dir():
+                    skipped.append(wf_name)
+                    continue
+                output_files = [
+                    f for f in wf_run_dir.rglob("*") if f.is_file()
+                ]
+                if not output_files:
+                    skipped.append(wf_name)
+                    continue
+                bl_dir = baselines_dir / wf_name
+                bl_dir.mkdir(parents=True, exist_ok=True)
+                seen: set[str] = set()
+                for src in output_files:
+                    if src.name in seen:
+                        collisions.append(f"{wf_name}/{src.name}")
+                    seen.add(src.name)
+                    try:
+                        shutil.copy2(str(src), str(bl_dir / src.name))
+                    except OSError as e:
+                        entry.setdefault("copy_errors", []).append(
+                            f"{wf_name}/{src.name}: {e}"
+                        )
+                        any_error = True
+                approved.append(wf_name)
+                total_approved += 1
+
+            entry["approved"] = approved
+            entry["skipped"] = skipped
+            if collisions:
+                entry["collisions"] = collisions
+            per_suite.append(entry)
+
+        return jsonify({
+            "ok": True,
+            "test_id": test_id,
+            "suites": per_suite,
+            "total_workflows_approved": total_approved,
+            "errors": any_error,
+        })
+
+    # ------------------------------------------------------------------
     # GET /tests/<test_id>/report — retrieve test report
     # ------------------------------------------------------------------
     @app.route("/tests/<test_id>/report", methods=["GET"])
