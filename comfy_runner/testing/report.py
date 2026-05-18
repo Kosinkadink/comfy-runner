@@ -345,7 +345,7 @@ _HTML_TEMPLATE = """\
   .img-tile {{ background: #0b1220; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }}
   .img-tile a {{ display: block; }}
   .img-tile img,
-  .img-tile video {{ width: 100%; height: auto; display: block; border-radius: 4px; background: #000; }}
+  .img-tile video {{ width: 100%; height: auto; max-height: 360px; object-fit: contain; display: block; border-radius: 4px; background: #000; }}
   .img-tile .label {{ color: #94a3b8; font-size: 0.75rem; margin-top: 6px; word-break: break-all; }}
   .img-tile.baseline {{ border-color: var(--pass); }}
   .img-tile.test {{ border-color: var(--border); }}
