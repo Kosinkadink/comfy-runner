@@ -387,7 +387,14 @@ class TestRenderHTML:
                 ),
             ],
         }
-        report = build_report(_make_suite_run(), comparisons=comparisons)
+        # Use a single-workflow run with a non-image output so the
+        # comparison branch is exercised and there is no other workflow
+        # falling back to the "no-baseline outputs" rendering path.
+        run = _make_suite_run(passed_count=1, failed_count=0)
+        run.results[0].prompt_result.outputs = {
+            "9": [OutputFile("9", "data.txt", "", "output")],
+        }
+        report = build_report(run, comparisons=comparisons)
         html = render_html(report)
         # Only the comparison table -- no <img> tile for .txt.
         assert "<img" not in html
@@ -447,6 +454,58 @@ class TestRenderHTML:
         assert "wf_pass_0/clip.mp4" in html
         # The frame-strip PNG diff still renders as <img>.
         assert "wf_pass_0/clip_frame_diff.png" in html
+
+    def test_outputs_rendered_when_no_baseline(self):
+        """Workflows without baselines still show every output as an
+        <img> / <video> tile so the operator can eyeball the run without
+        a baseline to compare against."""
+        # _make_suite_run produces wf_pass_0 and wf_pass_1 each with one
+        # output_X.png. Without comparisons (the default for build_report
+        # called below) there are no three-up rows — output tiles take
+        # over instead.
+        run = _make_suite_run(passed_count=2, failed_count=0)
+        # Flip has_baseline=False so the markdown row reads "—" and the
+        # behavior matches a true baseline-less run end-to-end.
+        for r in run.results:
+            r.has_baseline = False
+        report = build_report(run)
+        html = render_html(report)
+        # Every workflow's output appears as an inline tile.
+        assert "wf_pass_0/out_0.png" in html
+        assert "wf_pass_1/out_1.png" in html
+        # Labels say "output: …" rather than "baseline: …" / "test: …".
+        assert "output: out_0.png" in html
+        # Comparison table is suppressed (no comparisons ran).
+        assert "<th>Method</th>" not in html
+
+    def test_outputs_renders_video_tag_for_video_outputs(self):
+        run = _make_suite_run(passed_count=1, failed_count=0)
+        # Replace the .png output with a video file.
+        run.results[0].prompt_result.outputs = {
+            "9": [OutputFile("9", "clip.mp4", "", "output")],
+        }
+        run.results[0].has_baseline = False
+        report = build_report(run)
+        html = render_html(report)
+        assert "<video" in html
+        assert "wf_pass_0/clip.mp4" in html
+
+    def test_outputs_non_media_rendered_as_download_links(self):
+        run = _make_suite_run(passed_count=1, failed_count=0)
+        run.results[0].prompt_result.outputs = {
+            "9": [
+                OutputFile("9", "embedding.safetensors", "", "output"),
+                OutputFile("9", "metadata.json", "", "output"),
+            ],
+        }
+        run.results[0].has_baseline = False
+        report = build_report(run)
+        html = render_html(report)
+        # Non-media outputs are linked but never embedded as <img>/<video>.
+        assert 'href="wf_pass_0/embedding.safetensors"' in html
+        assert 'href="wf_pass_0/metadata.json"' in html
+        assert "<img" not in html
+        assert "<video" not in html
 
 
 # ---------------------------------------------------------------------------
