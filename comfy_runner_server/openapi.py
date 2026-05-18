@@ -2232,6 +2232,86 @@ _ROUTES: list[dict[str, Any]] = [
             "404": {"description": "Test run or artifact not found"},
         },
     },
+    {
+        "path": "/tests/{test_id}/promote-baselines",
+        "method": "post",
+        "tags": ["Tests"],
+        "summary": "Bulk-approve a test run's outputs as new baselines",
+        "description": (
+            "Mirror the CLI ``test baseline --approve-all`` flow across "
+            "every suite in a (single or fleet) test run. Copies each "
+            "workflow's output files into the suite's ``baselines/`` "
+            "directory so subsequent runs are graded against them via "
+            "SSIM / video_frame_ssim / etc.\n\n"
+            "By default only successful per-target results are promoted. "
+            "Pass ``allow_failed: true`` to ignore the pass flag and "
+            "promote anyway (useful when a partially-failed run still "
+            "produced acceptable outputs for some workflows).\n\n"
+            "Pass ``run_dir`` (absolute path under the managed "
+            "``fleet-ci-runs/`` or suites directory) to rehydrate a run "
+            "from disk when ``test_id`` is no longer in memory — useful "
+            "for runs that pre-date in-memory persistence or have aged "
+            "out. Fleet rehydration reads ``fleet-report.json``; single "
+            "rehydration reads ``report.json`` and derives the suite "
+            "name from the ``<suite>/runs/<id>`` path layout."
+        ),
+        "parameters": [_TEST_ID_PARAM],
+        "requestBody": {
+            "required": False,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "allow_failed": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": (
+                                    "Promote outputs even from targets "
+                                    "that did not pass."
+                                ),
+                            },
+                            "run_dir": {
+                                "type": "string",
+                                "description": (
+                                    "Absolute path to the run's output "
+                                    "directory. Used to rehydrate a run "
+                                    "from disk when ``test_id`` is not "
+                                    "in the in-memory registry."
+                                ),
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "responses": _ok_response("Promotion result", {
+            "test_id": {"type": "string"},
+            "total_workflows_approved": {"type": "integer"},
+            "errors": {"type": "boolean"},
+            "rehydrated": {
+                "type": "boolean",
+                "description": (
+                    "True if the run was reconstructed from ``run_dir`` "
+                    "rather than the in-memory registry."
+                ),
+            },
+            "suites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "suite": {"type": "string"},
+                        "output_dir": {"type": "string"},
+                        "approved": {"type": "array", "items": {"type": "string"}},
+                        "skipped": {"type": "array", "items": {"type": "string"}},
+                        "collisions": {"type": "array", "items": {"type": "string"}},
+                        "error": {"type": "string"},
+                    },
+                },
+            },
+        }),
+    },
 
     # ── Tailnet ───────────────────────────────────────────────────────
     {
