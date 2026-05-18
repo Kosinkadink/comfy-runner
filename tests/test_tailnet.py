@@ -18,10 +18,12 @@ from comfy_runner.hosted import tailnet as tn  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    """Each test starts with a clean device cache."""
+    """Each test starts with a clean device + discovery-result cache."""
     tn._clear_devices_cache()
+    tn._clear_runners_cache()
     yield
     tn._clear_devices_cache()
+    tn._clear_runners_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -796,3 +798,157 @@ class TestDiscoverComfyRunners:
         assert result["ok"] is False
         assert result["error"] == "boom"
         assert len(result["runners"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# discover_comfy_runners — result-level cache + sticky fallback
+# ---------------------------------------------------------------------------
+
+class TestDiscoverComfyRunnersCache:
+    """The discovery-result cache stabilises the dashboard against
+    transient /system-info probe failures (no more flickering between
+    "5 runners" and "no runners" every 15 s refresh)."""
+
+    _DEVICE = {
+        "hostname": "comfy-pr-1234",
+        "name": "comfy-pr-1234.tn.ts.net",
+        "addresses": ["100.64.0.10"],
+        "online": True,
+    }
+    _PROBE_OK = {
+        "info": {"platform": "linux", "gpu_label": "X", "gpus": [{
+            "vendor": "nvidia", "model": "RTX 4090", "vram_mb": 24576,
+        }]},
+        "scheme": "http",
+        "host": "100.64.0.10",
+    }
+
+    def _patch(self, *, probe_returns):
+        """Stack the usual module patches with a configurable probe map."""
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch.object(
+            tn, "list_devices", return_value=[dict(self._DEVICE)],
+        ))
+        stack.enter_context(patch.object(
+            tn, "list_pod_records", return_value={},
+        ))
+        stack.enter_context(patch.object(
+            tn, "probe_system_info",
+            side_effect=lambda host, *a, **kw: probe_returns.get(host),
+        ))
+        stack.enter_context(patch.object(
+            tn, "get_tailscale_api_key", return_value="k",
+        ))
+        stack.enter_context(patch.object(
+            tn, "get_tailscale_tailnet", return_value="ex",
+        ))
+        stack.enter_context(patch.object(
+            tn, "get_last_devices_error", return_value=None,
+        ))
+        return stack
+
+    def test_repeated_calls_within_ttl_serve_cached_result(self):
+        # First call probes; second call within TTL returns cached
+        # result without re-probing.
+        probe_calls = {"n": 0}
+        def _probe(host, *a, **kw):
+            probe_calls["n"] += 1
+            return self._PROBE_OK
+        with patch.object(tn, "list_devices", return_value=[dict(self._DEVICE)]), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "probe_system_info", side_effect=_probe), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"):
+            r1 = tn.discover_comfy_runners()
+            r2 = tn.discover_comfy_runners()
+        assert len(r1["runners"]) == 1
+        assert len(r2["runners"]) == 1
+        # Only one probe round — the second call hit the cache.
+        assert probe_calls["n"] == 1
+
+    def test_force_refresh_bypasses_result_cache(self):
+        probe_calls = {"n": 0}
+        def _probe(host, *a, **kw):
+            probe_calls["n"] += 1
+            return self._PROBE_OK
+        with patch.object(tn, "list_devices", return_value=[dict(self._DEVICE)]), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "probe_system_info", side_effect=_probe), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"):
+            tn.discover_comfy_runners()
+            tn.discover_comfy_runners(force_refresh=True)
+        assert probe_calls["n"] == 2
+
+    def test_transient_zero_runners_serves_prior_cached_result(self):
+        # First fresh call → 1 runner cached.
+        # Second forced refresh → probe drops out (transient blip) →
+        # the sticky-fallback returns the prior result.
+        responses = [self._PROBE_OK, None]  # First OK, then fail.
+        def _probe(host, *a, **kw):
+            return responses.pop(0) if responses else None
+        with patch.object(tn, "list_devices", return_value=[dict(self._DEVICE)]), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "probe_system_info", side_effect=_probe), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+             patch.object(tn, "get_last_devices_error", return_value=None):
+            first = tn.discover_comfy_runners()
+            # ``force_refresh=True`` skips the result cache, forcing a
+            # fresh probe; the sticky fallback then kicks in because
+            # the new result has 0 runners while the prior had >0.
+            second = tn.discover_comfy_runners(force_refresh=True)
+        assert len(first["runners"]) == 1
+        # Sticky-fallback served the prior cached result instead of
+        # the blank fresh one.
+        assert len(second["runners"]) == 1
+        assert second["runners"][0]["hostname"] == "comfy-pr-1234"
+
+    def test_sticky_fallback_not_applied_when_devices_api_errored(self):
+        # If the Tailscale API itself errored on the fresh call, we
+        # should NOT mask that with stale data — the sticky fallback
+        # only handles transient *probe* failures, not API outages.
+        responses = [self._PROBE_OK, None]
+        errors = [None, "HTTP 503"]
+        def _probe(host, *a, **kw):
+            return responses.pop(0) if responses else None
+        def _err():
+            return errors.pop(0) if errors else None
+        with patch.object(tn, "list_devices", return_value=[dict(self._DEVICE)]), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "probe_system_info", side_effect=_probe), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+             patch.object(tn, "get_last_devices_error", side_effect=_err):
+            tn.discover_comfy_runners()
+            second = tn.discover_comfy_runners(force_refresh=True)
+        # API error → caller sees the real outage, not stale data.
+        assert second["ok"] is False
+        assert second["error"] == "HTTP 503"
+        assert second["runners"] == []
+
+    def test_sticky_fallback_expires_after_max_age(self):
+        # Once the prior cached result is older than
+        # _RUNNERS_STICKY_MAX_AGE, an empty fresh result is returned
+        # as-is so a sustained outage eventually surfaces.
+        import time as _time
+        responses = [self._PROBE_OK, None]
+        def _probe(host, *a, **kw):
+            return responses.pop(0) if responses else None
+        real_monotonic = _time.monotonic
+        t = {"now": real_monotonic()}
+        def _fake_monotonic():
+            return t["now"]
+        with patch.object(tn, "list_devices", return_value=[dict(self._DEVICE)]), \
+             patch.object(tn, "list_pod_records", return_value={}), \
+             patch.object(tn, "probe_system_info", side_effect=_probe), \
+             patch.object(tn, "get_tailscale_api_key", return_value="k"), \
+             patch.object(tn, "get_tailscale_tailnet", return_value="ex"), \
+             patch.object(tn, "get_last_devices_error", return_value=None), \
+             patch.object(tn.time, "monotonic", side_effect=_fake_monotonic):
+            tn.discover_comfy_runners()
+            # Advance the clock past the sticky-fallback grace period.
+            t["now"] += tn._RUNNERS_STICKY_MAX_AGE + 1
+            second = tn.discover_comfy_runners(force_refresh=True)
+        assert second["runners"] == []
