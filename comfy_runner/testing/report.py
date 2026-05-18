@@ -39,6 +39,13 @@ class WorkflowReport:
     output_count: int = 0
     has_baseline: bool = False
     comparisons: list[ComparisonEntry] = field(default_factory=list)
+    # Bare filenames (no subfolder) of the workflow's output artifacts,
+    # in the order ComfyUI returned them. Used by ``render_html`` to
+    # show output thumbnails even when there is no baseline to compare
+    # against — without this the HTML report has no visual content for
+    # baseline-less runs and the operator has to dig through the file
+    # tree to eyeball the outputs.
+    outputs: list[str] = field(default_factory=list)
 
     @property
     def comparison_passed(self) -> bool:
@@ -123,6 +130,16 @@ def build_report(
             if r.prompt_result and r.prompt_result.execution_time
             else None
         )
+        # Flatten output filenames in node-result order. Bare names only
+        # (no subfolder) because the run's output_dir already keeps
+        # workflow outputs in a flat ``<output_dir>/<workflow>/<file>``
+        # layout — matching how _href() builds the <img>/<video> src.
+        output_files: list[str] = []
+        if r.prompt_result:
+            for files in r.prompt_result.outputs.values():
+                for of in files:
+                    if of.filename:
+                        output_files.append(of.filename)
         workflows.append(WorkflowReport(
             name=r.workflow_name,
             passed=r.passed,
@@ -131,6 +148,7 @@ def build_report(
             output_count=output_count,
             has_baseline=r.has_baseline,
             comparisons=wf_comparisons,
+            outputs=output_files,
         ))
 
     resolved_suite_path = suite_path if suite_path is not None else getattr(
@@ -499,11 +517,45 @@ def render_html(
                 comparisons_html += (
                     '<div class="img-grid">' + "\n".join(rows_html) + "</div>"
                 )
-        elif wf.passed and wf.output_count > 0:
-            # Even without baselines, surface a thumbnail of the
-            # first output per workflow so the operator can eyeball
-            # the run.
-            pass
+        elif wf.outputs:
+            # No baseline → no comparisons. Still surface every output
+            # so the operator can eyeball the run without digging
+            # through the file tree. Images render inline, videos get
+            # ``<video>`` players, anything else (audio, .safetensors,
+            # …) shows up as a download link.
+            output_tiles: list[str] = []
+            other_links: list[str] = []
+            for fname in wf.outputs:
+                is_image = _looks_like_image(fname)
+                is_video = _looks_like_video(fname)
+                rel = f"{wf.name}/{fname}"
+                href = _href(rel)
+                if is_image or is_video:
+                    output_tiles.append(_render_media_tile(
+                        css="img-tile test",
+                        label_prefix="output",
+                        filename=fname,
+                        href=href,
+                        is_video=is_video,
+                    ))
+                else:
+                    other_links.append(
+                        f'<li><a href="{href}" target="_blank">'
+                        f'{_html_escape(fname)}</a></li>'
+                    )
+            if output_tiles:
+                comparisons_html += (
+                    '<div class="img-grid">'
+                    '<div class="img-row">'
+                    + "\n".join(output_tiles)
+                    + '</div></div>'
+                )
+            if other_links:
+                comparisons_html += (
+                    "<ul class=\"outputs\">"
+                    + "\n".join(other_links)
+                    + "</ul>"
+                )
 
         cards.append(_CARD_TEMPLATE.format(
             card_class=card_class,
