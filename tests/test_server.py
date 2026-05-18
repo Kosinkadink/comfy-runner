@@ -1233,6 +1233,71 @@ class TestTailnetRunners:
         assert "runpod" in body
         assert "#1234" in body
 
+    def test_dashboard_pr_review_form_renders_with_pods(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        """The PR review form shows a pod option per registered pod."""
+        from unittest.mock import patch
+        from comfy_runner_server import server as srv
+        # Fake list_pod_records and the provider so a pod shows up.
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.list_pod_records",
+            lambda _provider: {"ci-runner": {
+                "id": "abc", "purpose": "ci-runner", "gpu_type": "L40S",
+            }},
+        )
+        # Stub _get_runpod_provider to return a fake provider with empty pods.
+        class _FakeProv:
+            def list_pods(self):
+                return []
+        monkeypatch.setattr(srv, "_get_runpod_provider", lambda: _FakeProv())
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True, "runners": [], "tailnet_configured": False,
+                "device_count": 0, "online_count": 0,
+            },
+        ):
+            resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert 'id="pr-review-form"' in body
+        assert 'name="pod"' in body
+        # The pod is rendered as an option with its purpose badge.
+        assert 'value="ci-runner"' in body
+        assert 'ci-runner' in body
+        # JS handlers are present.
+        assert "submitReview" in body
+        assert "podAction" in body
+        assert "prefillReview" in body
+        # Per-pod Review button is wired.
+        assert "prefillReview('ci-runner')" in body
+
+    def test_dashboard_pod_purpose_badge_renders(
+        self, client, tmp_config_dir, monkeypatch,
+    ):
+        """Pods table shows the purpose badge for each pod."""
+        from unittest.mock import patch
+        from comfy_runner_server import server as srv
+        monkeypatch.setattr(
+            "comfy_runner.hosted.config.list_pod_records",
+            lambda _provider: {"dev-pod": {"id": "abc", "purpose": "persistent"}},
+        )
+        class _FakeProv:
+            def list_pods(self):
+                return []
+        monkeypatch.setattr(srv, "_get_runpod_provider", lambda: _FakeProv())
+        with patch(
+            "comfy_runner.hosted.tailnet.discover_comfy_runners",
+            return_value={
+                "ok": True, "runners": [], "tailnet_configured": False,
+                "device_count": 0, "online_count": 0,
+            },
+        ):
+            resp = client.get("/dashboard")
+        body = resp.data.decode("utf-8")
+        assert 'class="badge persistent"' in body
+
     def test_dashboard_test_runs_links_to_report_and_shows_results(
         self, client, tmp_config_dir,
     ):
