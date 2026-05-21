@@ -472,10 +472,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     """Deploy a PR, branch, tag, commit, latest release, or pull current tracking."""
     from comfy_runner.config import get_installation, set_installation
     from comfy_runner.deployments import execute_deploy
-    from comfy_runner.pip_utils import (
-        DEPLOY_REQUIREMENT_FILES,
-        install_changed_requirements,
-    )
+    from comfy_runner.pip_utils import install_deploy_requirements
     from comfy_runner.process import get_status, start_installation, stop_installation
 
     name = args.name
@@ -529,17 +526,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
             send_output=out,
         )
 
-        # Install any deploy-tracked requirements files that changed.
-        changed_files = result.get("changed_files", [])
-        result["requirements_installed"] = install_changed_requirements(
-            install_path, changed_files, send_output=out
+        # Reconcile deploy requirements against the on-disk files
+        # (idempotent for unchanged pins; catches venv/file drift).
+        result["requirements_installed"] = install_deploy_requirements(
+            install_path, send_output=out
         )
-        if (
-            out
-            and changed_files
-            and not any(f in DEPLOY_REQUIREMENT_FILES for f in changed_files)
-        ):
-            out("Requirements unchanged — skipping pip install.\n")
 
         # Apply record updates
         for k, v in updates.items():

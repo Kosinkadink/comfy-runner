@@ -2447,7 +2447,7 @@ def create_app() -> Any:
             from comfy_runner.config import get_installation, set_installation
             from comfy_runner.deployments import execute_deploy
             from comfy_runner.installations import init_installation
-            from comfy_runner.pip_utils import install_changed_requirements
+            from comfy_runner.pip_utils import install_deploy_requirements
             from comfy_runner.process import get_status, start_installation, stop_installation
 
             out, lines = _make_collector(job_id)
@@ -2518,10 +2518,10 @@ def create_app() -> Any:
                     send_output=out,
                 )
 
-                # Install any deploy-tracked requirements files that changed.
-                changed_files = result.get("changed_files", [])
-                result["requirements_installed"] = install_changed_requirements(
-                    install_path, changed_files, send_output=out
+                # Reconcile deploy requirements against the on-disk files
+                # (idempotent for unchanged pins; catches venv/file drift).
+                result["requirements_installed"] = install_deploy_requirements(
+                    install_path, send_output=out
                 )
 
                 # Apply record updates from shared helper

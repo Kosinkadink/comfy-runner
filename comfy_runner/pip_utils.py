@@ -128,30 +128,28 @@ DEPLOY_REQUIREMENT_FILES: tuple[str, ...] = (
 )
 
 
-def install_changed_requirements(
+def install_deploy_requirements(
     install_path: str | Path,
-    changed_files: list[str],
     send_output: Callable[[str], None] | None = None,
 ) -> bool:
-    """Install any of `DEPLOY_REQUIREMENT_FILES` that changed during deploy.
+    """Install every `DEPLOY_REQUIREMENT_FILES` file present in the ComfyUI repo.
 
-    Each file is installed independently so a `manager_requirements.txt`-only
-    change is not silently skipped. Returns True iff at least one file was
-    installed and every install succeeded.
+    Run unconditionally on every deploy: `uv pip install` is idempotent for
+    already-satisfied pins, and reconciling against the on-disk files (instead
+    of a git diff) prevents venv/file drift caused by bundle skew, prior
+    failed installs, or deploys whose previous_head already contains the
+    requirements change. Returns True iff at least one file was installed and
+    every install succeeded.
     """
     install_path = Path(install_path)
     comfyui_dir = install_path / "ComfyUI"
 
-    changed_req_files = [f for f in DEPLOY_REQUIREMENT_FILES if f in changed_files]
-    if not changed_req_files:
-        return False
-
     if send_output:
-        send_output("\nRequirements changed — installing dependencies...\n")
+        send_output("\nReconciling deploy requirements...\n")
 
     installed_any = False
     install_ok = True
-    for req_filename in changed_req_files:
+    for req_filename in DEPLOY_REQUIREMENT_FILES:
         req_path = comfyui_dir / req_filename
         if not req_path.exists():
             continue
