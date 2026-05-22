@@ -203,7 +203,7 @@ $body = @{ latest = $true; build = $false; python_version = "3.12" } | ConvertTo
    Invoke-RestMethod -Uri "https://mybox.tailnet.ts.net:9189/job/$($resp.job_id)"
    ```
 
-   Repeat until `status` is `"completed"` or `"failed"`.
+   Repeat until `status` is one of the terminal values: `"done"`, `"error"`, or `"cancelled"`. The only non-terminal value is `"running"`. Do **not** poll for `"completed"` or `"failed"` — those values are never returned and your loop will spin forever.
 
 ### Installing pip packages remotely
 
