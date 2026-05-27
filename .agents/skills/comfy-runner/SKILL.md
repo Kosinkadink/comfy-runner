@@ -235,7 +235,15 @@ Pip packages can be installed on remote installations via the **snapshot import 
 
 ### ComfyUI proxy and queue management
 
-All ComfyUI API endpoints are accessible via the `/{name}/comfyui/{path}` proxy on the runner server. This lets you interact with ComfyUI without exposing its port directly.
+All ComfyUI **API** endpoints are accessible via the `/{name}/comfyui/{path}` proxy on the runner server. This lets you call ComfyUI's HTTP API without exposing its port directly.
+
+> **DO NOT give this proxy URL to a user as a "ComfyUI link" for their browser.** The ComfyUI frontend is a single-page app that requests its JS/CSS/API assets from **absolute root paths** (`/assets/...`, `/api/...`). Behind the `/{name}/comfyui/` path prefix the initial HTML loads (the Comfy logo briefly appears) but **every asset and API call 404s** — the UI never renders. The proxy is API-only.
+>
+> For a browser-accessible URL, use the **direct ComfyUI port** instead:
+> - **Local installs**: `http://localhost:<port>/` (port is in the `start` output).
+> - **Remote installs**: `start` auto-registers a tailscale serve for the instance port; use the `serve_url` field from `GET /{name}/status` (e.g. `https://mybox.tailnet.ts.net:8196`). No extra `tunnel` / `tailscale-serve` call is needed — the port is already on the tailnet.
+>
+> Never use the `/{name}/comfyui/` URL for a browser, never start a tailscale **funnel** (that's public-internet exposure), and never create a tunnel when the instance port is already served on the tailnet.
 
 | Operation | Method | Endpoint |
 |-----------|--------|----------|
@@ -489,6 +497,10 @@ Always update `comfy_runner_server/openapi.py` — add or update the `_ROUTES` l
 10. **Station commands need `station.json`.** The `station` subcommand requires a `station.json` file in the working directory or a parent. Clone [comfy-runner-station](https://github.com/Comfy-Org/comfy-runner-station) for the pre-configured setup.
 
 11. **Station vs hosted.** `station` commands talk to the central server for pod provisioning and fleet tests. `hosted` commands talk directly to individual pods (need API keys). Once a pod is on the tailnet, use `hosted` for direct interaction.
+
+12. **`start` auto-exposes the instance port on the tailnet.** The runner server registers a tailscale serve for the ComfyUI port automatically as part of `start` (CLI and HTTP API). The browser-accessible URL is reported in the `start` output and in `GET /{name}/status` as `serve_url`. Do NOT call `tunnel start` or `tailscale-serve` afterwards — that's redundant, and `tunnel start --provider tailscale` defaults to a public **funnel** (disabled by default and not what you want for tailnet-only access).
+
+13. **Never give the `/{name}/comfyui/` proxy URL to a user for browser access.** It is API-only; the ComfyUI SPA breaks behind a path prefix. See "ComfyUI proxy and queue management" above. For a browser link, use the direct `serve_url` from `/status` (tailnet) or `http://localhost:<port>/` (local).
 
 ## Windows PowerShell Notes
 
